@@ -1,0 +1,210 @@
+// 主进程通用纯工具 —— 从 runtime.ts 拆出的第一层地基（见
+// docs/plan/2026-06-04-runtime-split-execution.md）。全部为无副作用纯函数，
+// 便于单独测试与被 tasks/catalog/assets 等后续拆出的模块复用。
+
+export type JsonRecord = Record<string, unknown>;
+
+export function nowIso(): string {
+  return new Date().toISOString();
+}
+
+export function trim(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/** 返回第一个 trim 后非空的字符串；都为空则 ""。 */
+export function firstString(...values: unknown[]): string {
+  for (const value of values) {
+    const text = trim(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+export function isJsonRecord(value: unknown): value is JsonRecord {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+/**
+ * 从 LLM 输出里抠出 JSON 对象。
+ *
+ * 为什么需要它：即使 prompt 里写死「只返回 JSON、不要 markdown」，模型仍会时不时
+ * 裹上 ```json 围栏或在前后加一句寒暄——**这不是模型坏了，是普遍行为**，必须在解析层容忍，
+ * 不能靠祈祷。取第一个 `{` 到最后一个 `}` 之间的片段（对象内部的 } 不受影响，因为取的是最后一个）。
+ *
+ * 解不出返回 null（调用方据此走「这一镜没拆出来」的降级，而不是整批炸掉）。
+ */
+export function parseLooseJsonObject(text: unknown): JsonRecord | null {
+  const raw = trim(text);
+  if (!raw) return null;
+  const withoutFence = raw.replace(/^\s*```[a-zA-Z]*\s*/u, "").replace(/\s*```\s*$/u, "").trim();
+  const start = withoutFence.indexOf("{");
+  const end = withoutFence.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    const parsed: unknown = JSON.parse(withoutFence.slice(start, end + 1));
+    return isJsonRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ComfyUI /prompt 校验失败的按节点错误摊平成一句人话（形状实查 ComfyUI server.py:1124-1136）：
+ * { node_errors: { <id>: { class_type, errors:[{ message, details }] } } }。
+ * 有用的信息全在 details（如 "ckpt_name: 'x.safetensors' not in (list of length 3)"）——顶层
+ * error.message 只有笼统的 "Prompt outputs failed validation"。取前 2 条、标总数，防列表爆炸。
+ */
+function comfyNodeErrorsMessage(record: JsonRecord, sanitize: (message: string) => string): string {
+  const nodeErrors = record.node_errors;
+  if (!isJsonRecord(nodeErrors)) return "";
+  const lines: string[] = [];
+  let total = 0;
+  for (const entry of Object.values(nodeErrors)) {
+    if (!isJsonRecord(entry) || !Array.isArray(entry.errors)) continue;
+    const classType = trim(entry.class_type);
+    for (const err of entry.errors) {
+      if (!isJsonRecord(err)) continue;
+      total += 1;
+      if (lines.length >= 2) continue;
+      const detail = firstString(err.details, err.message);
+      if (!detail) continue;
+      lines.push(`${classType ? `${sanitize(classType)}: ` : ""}${sanitize(detail).slice(0, 160)}`);
+    }
+  }
+  if (lines.length === 0) return "";
+  return total > lines.length ? `${lines.join("；")}（共 ${total} 处校验错误）` : lines.join("；");
+}
+
+/** error 是 { message, details } 记录时拼成 "message — details"（如 ComfyUI invalid_prompt 带缺节点名）。 */
+function errorMessageWithDetails(record: JsonRecord, sanitize: (message: string) => string): string {
+  const error = record.error;
+  if (!isJsonRecord(error)) return "";
+  const message = trim(error.message);
+  const details = trim(error.details);
+  if (!message || !details) return "";
+  return `${sanitize(message)} — ${sanitize(details).slice(0, 200)}`;
+}
+
+/**
+ * 从上游失败响应体里挑出「那句人话」。各家把原因塞在不同键上，这里是**唯一**的键优先级表：
+ * 谁要说清一次上游失败（vendorHttp 的生成请求、onboarding 的拉模型/测连接）都读这一份，
+ * 免得各处平行猜形状漂移（P1）。挑不出来返回 ""，调用方自己兜底（HTTP 状态等）。
+ */
+export function pickUpstreamMessage(record: JsonRecord, sanitize: (message: string) => string = (message) => message): string {
+  // Sanitization must precede every formatter's slice, or a truncated secret cannot be matched later.
+  return sanitize(firstString(
+    // ComfyUI /prompt 校验错误：按节点 details 最具体，优先（键只在 ComfyUI 形状出现，别家零影响）。
+    comfyNodeErrorsMessage(record, sanitize),
+    record.msg,
+    record.message,
+    record.error,
+    // RunningHub：业务错误在 errorMessage（如「标准模型API仅限企业级-共享API Key调用」）。
+    record.errorMessage,
+    errorMessageWithDetails(record, sanitize),
+    readNestedRecord(record, ["error", "message"]),
+    readNestedRecord(record, ["data", "msg"]),
+    // ModelScope（及同类）失败体是复数 `errors`：{ "errors": { "message": "..." } }。
+    readNestedRecord(record, ["errors", "message"]),
+    readNestedRecord(record, ["errors", "detail"]),
+    record.errors,
+  ));
+}
+
+/**
+ * 从上游失败响应体里挑出**它自己给的错误码**（不是那句人话）：`{ error: { code: "model_not_found" } }` /
+ * `{ code: "model_not_found" }`。与 `pickUpstreamMessage` 同住一处、同一个「全仓唯一键优先级表」的纪律——
+ * 谁要把上游失败的原因带过 IPC（vendorHttp 的媒体请求、runtimeVendorError 的模型调用）都读这一份。
+ *
+ * 为什么要带码：状态码（400/422）只说「请求有问题」，从不说**为什么**——把它当成「参数不被接受」就是猜
+ * （2026-09-29：供应商说模型已下线，界面却叫用户去改比例）。上游的错误码才是它自己说的原因。
+ *
+ * 只收**字符串形的标识码**（`[A-Za-z0-9_.:-]`，≤64）；纯数字的业务码走 `logicalCode`，
+ * 自由文本走 `pickUpstreamMessage`。挑不出返回 ""。
+ */
+export function pickUpstreamCode(record: JsonRecord): string {
+  const candidate = firstString(readNestedRecord(record, ["error", "code"]), readNestedRecord(record, ["errors", "code"]), record.code);
+  return /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/.test(candidate) ? candidate : "";
+}
+
+/**
+ * 找出字符串里第一个无法安全放进 HTTP 头/凭证的字符，返回 null 表示安全。
+ * 治本于一个真坑（kie createTask 报「Cannot convert argument to a ByteString
+ * because the character at index 7 has a value of 34915」）：API 密钥里混进中文/
+ * 全角字符 → 拼进 `Authorization: Bearer …` 后，fetch 同步抛 ByteString 错，
+ * 被 vendorHttp 误判成「网络超时」，让用户去查网络（永远修不好）。
+ * 判据对齐 HTTP 头的硬约束：码点 > 0xFF（fetch ByteString 拒收）、或控制字符
+ * （< 0x20 除 \t、或 0x7F，含 \r\n = 头注入风险）。两处共用：密钥存入前校验
+ * （applyApiKeyUpsert）+ 发送前请求头守卫（requestJson）。
+ */
+export function findNonHeaderSafeChar(value: string): { index: number; code: number; char: string } | null {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code > 0xff || (code < 0x20 && code !== 0x09) || code === 0x7f) {
+      return { index: i, code, char: value[i] };
+    }
+  }
+  return null;
+}
+
+/** 扫描请求头名与值，返回第一个含非 HTTP-safe 字符的头（含哪个字符/位置），null = 全安全。 */
+export function findIllegalHeader(
+  headers: Record<string, string>,
+): { name: string; index: number; code: number; char: string } | null {
+  for (const [name, value] of Object.entries(headers)) {
+    const inName = findNonHeaderSafeChar(name);
+    if (inName) return { name, ...inName };
+    const inValue = findNonHeaderSafeChar(String(value ?? ""));
+    if (inValue) return { name, ...inValue };
+  }
+  return null;
+}
+
+/** HTTP header names are case-insensitive. Later layers replace, never append, the same header. */
+export function mergeHeadersCaseInsensitive(...layers: Record<string, string>[]): Record<string, string> {
+  const headers = new Map<string, [string, string]>();
+  for (const layer of layers) {
+    for (const [name, value] of Object.entries(layer)) headers.set(name.toLowerCase(), [name, value]);
+  }
+  return Object.fromEntries(headers.values());
+}
+
+/**
+ * 把「头里有非法字符」翻成人话（单一措辞，三处共用防漂移）：
+ * 发送闸 vendorHttp.requestJson + onboarding 的 test-connection / list-models 两条裸 fetch。
+ * 鉴权类头（密钥）→ 指向「重新粘贴密钥」（最常见 = 误粘中文/全角）；其余头 → 标位置即可。
+ */
+export function describeIllegalHeader(problem: {
+  name: string;
+  index: number;
+  code: number;
+  char: string;
+}): { isAuth: boolean; message: string } {
+  const isAuth = /authorization|api[-_ ]?key|token|secret/i.test(problem.name);
+  const where = `第 ${problem.index + 1} 位「${problem.char}」，码点 ${problem.code}`;
+  const message = isAuth
+    ? `API 密钥含非法字符（${where}）。密钥应为纯英文/数字，常见原因是误粘了中文或全角字符——请重新粘贴密钥。`
+    : `请求头 ${problem.name} ${where}：含非法字符，无法作为 HTTP 头发送。`;
+  return { isAuth, message };
+}
+
+/** 沿 pathParts 逐层取值；任一层非对象即返回 undefined。 */
+export function readNestedRecord(input: unknown, pathParts: string[]): unknown {
+  let current = input;
+  for (const part of pathParts) {
+    if (!current || typeof current !== "object") return undefined;
+    current = (current as JsonRecord)[part];
+  }
+  return current;
+}
+
+/**
+ * 就地深冻结一棵纯数据树并原样返回（已冻结的子树跳过）。调用方负责先拷贝，
+ * 冻结的是「交出去之后谁都不许改」的那一份：改了在严格模式下当场抛，而不是静默污染共享状态。
+ */
+export function deepFreeze<T>(value: T): T {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  return value;
+}

@@ -1,0 +1,206 @@
+/**
+ * 生成 Run 的「观察与调度驱动」——从 appIntegration 的装配里整块搬出来的一个关注点（R9 分层）。
+ *
+ * 这里住的是同一件事的两半，它们共享同一批 per-instance 状态（在飞的 drive、重踢定时器、
+ * 单镜观察 epoch），所以必须待在一起：
+ *   · 多镜：kickSchedulerForRun / driveScheduler —— 把一个 Run 推到静止点，没静止就定时重踢。
+ *   · 单镜：observeSingleShotRun —— 提交后把轮询/落地放到 MCP 回合之外，按 Run 去重。
+ * 两半的结果都只写进同一个 durable ProductionRun 仓储（settleSingleShot* 三个落状态的口子）。
+ *
+ * 为什么是工厂而不是模块级单例：这些状态归**某一次** capability-core 实例所有。核重启/替换时
+ * 旧实例的 epoch 必须作废，不能让上一代的 worker 把过期状态写进新运行时（stop()）。
+ */
+import { logWarn } from '../logging/logger'
+import { hasWorkToWatch, runWantsDriver } from '../productionRun/productionRunLifecycle'
+import type { MultiShotBatchScheduler } from '../productionRun/multiShotBatchScheduler'
+import type { ProductionRun } from '../productionRun/productionRunTypes'
+import type { createProductionGenerationSubmission } from '../productionRun/productionGenerationSubmission'
+import type { ProductionRunRepository } from '../productionRun/productionRunRepository'
+import { observeSingleShotGeneration } from '../productionRun/singleShotGenerationObserver'
+import { createSingleShotObservationLifecycle } from '../productionRun/singleShotObservationLifecycle'
+import {
+  markSingleShotAttention,
+  markSingleShotCompleted,
+} from '../productionRun/singleShotRunLifecycle'
+
+// 慢供应商未到静止点时定时重踢；Run lock、intent log 与 commandId 保证重启/并发幂等。
+const REKICK_DELAY_MS = 15_000
+
+export type RunObservationDrivers = {
+  settleSingleShotCompleted: (projectId: string, runId: string, options?: { jobId?: string; artifactId?: string }) => void;
+  settleSingleShotAttention: (projectId: string, runId: string, jobId?: string) => void;
+  driveScheduler: (projectId: string, runId: string, scheduler: Pick<MultiShotBatchScheduler, 'runToQuiescence'>, label: string) => void;
+  kickSchedulerForRun: (projectId: string, runId: string) => void;
+  observeSingleShotRun: (
+    submission: ReturnType<typeof createProductionGenerationSubmission>,
+    projectId: string,
+    runId: string,
+  ) => void;
+  /** 作废本实例的 epoch：中止在飞的单镜等待，清掉未触发的重踢定时器。 */
+  stop: () => void;
+};
+
+export function createRunObservationDrivers(deps: {
+  repository: ProductionRunRepository;
+  buildSchedulerForRun: (projectId: string, runId: string, run: ProductionRun) => Pick<MultiShotBatchScheduler, 'runToQuiescence'> | null;
+}): RunObservationDrivers {
+  const { repository, buildSchedulerForRun } = deps
+  // 单镜与多镜共用的「过一会儿再来问一次」定时器。**两半必须是同一条规则**：
+  // 供应商在观察窗（默认 300s）内没给结论，就歇一歇再接着问，直到它给出终态。
+  // 2026-09-25 之前只有多镜这一半——单镜观察窗一过就静静退出、没有人再问，
+  // 一段要跑 6 分钟的 15 秒视频在供应商那边早就出好了，节点却永远停在「生成中」，
+  // 任务卡还说「Nomi 仍会查询已有任务」（其实已经没人在查）。
+  const rekickTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  // Single-shot submissions intentionally return the durable provider receipt
+  // immediately. Keep observation outside the MCP turn, but dedupe it by Run
+  // so a replay/reconnect can never start two poll/materialize loops. The
+  // lifecycle advances an epoch on core shutdown/restart and aborts stale
+  // provider waits before they can materialize or touch the renderer.
+  const singleShotObservationLifecycle = createSingleShotObservationLifecycle()
+  // Single-shot lifecycle status is owned by the same durable ProductionRun
+  // repository as the provider submission.  Keep these callbacks local to
+  // the capability-core instance so a stopped/replaced instance cannot write
+  // a stale status after its epoch is invalidated.
+  const settleSingleShotCompleted = (projectId: string, runId: string, options: { jobId?: string; artifactId?: string } = {}): void => {
+    try {
+      markSingleShotCompleted(repository, projectId, runId, options)
+    } catch (error) {
+      logWarn('production-run', 'single-shot-completion-status-failed', undefined, error)
+    }
+  }
+  const settleSingleShotAttention = (projectId: string, runId: string, jobId?: string): void => {
+    try {
+      markSingleShotAttention(repository, projectId, runId, jobId)
+    } catch (error) {
+      logWarn('production-run', 'single-shot-attention-status-failed', undefined, error)
+    }
+  }
+  const activeSingleShotJobId = (projectId: string, runId: string): string | undefined => {
+    try {
+      const run = repository.read(projectId, runId)
+      return run?.jobs.find((job) => Boolean(job.providerTaskId) && !['adopted', 'cancelled_remote', 'detached', 'too_late'].includes(job.status))?.jobId
+    } catch {
+      return undefined
+    }
+  }
+  const scheduleRekick = (key: string, kick: () => void): void => {
+    if (rekickTimers.has(key)) return
+    const timer = setTimeout(() => {
+      rekickTimers.delete(key)
+      kick()
+    }, REKICK_DELAY_MS)
+    timer.unref?.()
+    rekickTimers.set(key, timer)
+  }
+  const scheduleBatchRekick = (projectId: string, runId: string): void => {
+    scheduleRekick(`batch:${projectId}:${runId}`, () => kickSchedulerForRun(projectId, runId))
+  }
+  /**
+   * 这个单镜 Run 还有没有一个「交给了供应商、还没结论」的任务——只有它才值得再问。不看 Run 状态：取消了，
+   * 钱也已经花出去了，出片照样要落进项目（2026-10-07 以前取消了就没人再问）。
+   */
+  const singleShotStillInFlight = (projectId: string, runId: string): boolean => {
+    try {
+      const run = repository.read(projectId, runId)
+      return Boolean(run && hasWorkToWatch(run))
+    } catch {
+      return false
+    }
+  }
+  const driveScheduler = (
+    projectId: string,
+    runId: string,
+    scheduler: Pick<MultiShotBatchScheduler, 'runToQuiescence'>,
+    label: string,
+  ): void => {
+    // 一个 Run 一趟驱动由调度器自己保证（`multiShotBatchScheduler` 的 drivesInFlight）：已经在跑就并进去，
+    // 它歇下前按最新的 Run 再走一遍——这里不另记「谁在跑」。#1139 以前只有重踢先查在不在跑，开拍那条直接起新的一趟，每批下一镜就多一趟抢锁。
+    void scheduler.runToQuiescence()
+      .then((outcome) => {
+        if (!outcome.quiescent) scheduleBatchRekick(projectId, runId)
+      })
+      .catch((error) => {
+        logWarn('production-run', 'observation-step-failed', { step: label }, error)
+      })
+  }
+  const kickSchedulerForRun = (projectId: string, runId: string): void => {
+    let run
+    try {
+      run = repository.read(projectId, runId)
+    } catch {
+      return
+    }
+    if (!run || !run.generationPlan?.shots || run.generationPlan.shots.length === 0) return
+    if (run.generationPlan.state !== 'submitted') return // 还没确认过的草稿不驱动
+    // 要不要驱动只问生命周期 owner：停稳了（已暂停 / 已取消 / 已完成）而手上没有交给供应商的活就不驱动；
+    // 还有就只盯不派（派生对停着的 Run 不派新活）。以前按状态挑：先是连 pausing 也跳过（2026-09-29「暂停后还一直在转」），
+    // 后来只放开了 pausing——取消后的慢镜头、已暂停里点「重新取回」的那一镜仍没人去取（2026-10-07）。
+    if (!runWantsDriver(run)) return
+    const scheduler = buildSchedulerForRun(projectId, runId, run)
+    if (!scheduler) return
+    driveScheduler(projectId, runId, scheduler, 'batch resume tick')
+  }
+  const observeSingleShotRun = (
+    submission: ReturnType<typeof createProductionGenerationSubmission>,
+    projectId: string,
+    runId: string,
+  ): void => {
+    const key = `${projectId}:${runId}`
+    void singleShotObservationLifecycle.run(key, async ({ signal, isCurrent }) => {
+      try {
+        const result = await observeSingleShotGeneration({
+          submission,
+          input: { projectId, operationId: runId },
+          signal,
+          isCurrent,
+          // 出片落盘之后画布怎么跟上，不归观察者管：物化写进 Run 的那一下经过仓库 execute 的事件旁路，
+          // 画布落地的跟随者（canvasLandingHost.followRunChange）据此把结果投到节点上——多镜、单镜、
+          // 恢复、返工都走那一条，这里不再另投一次。
+        })
+        // An owner stop is expected lifecycle control, not a provider failure;
+        // leave the durable Run untouched for the next restart/open recovery.
+        if (result.aborted) return
+        if (result.nextAction === 'observe') {
+          // 观察窗到了、供应商还没给结论：歇一歇再接着问（与多镜 quiescent:false 同一条规则）。
+          // 只查不交——这条路永远不调 start，不会多扣一次钱。
+          scheduleRekick(`single:${key}`, () => {
+            if (singleShotStillInFlight(projectId, runId)) observeSingleShotRun(submission, projectId, runId)
+          })
+          return
+        }
+        if (result.nextAction === 'completed') {
+          settleSingleShotCompleted(projectId, runId, {
+            ...(result.materialized?.jobId ? { jobId: result.materialized.jobId } : {}),
+            ...(result.materialized?.artifactId ? { artifactId: result.materialized.artifactId } : {}),
+          })
+        } else if (result.nextAction === 'attention') {
+          settleSingleShotAttention(projectId, runId, result.lastPoll?.jobId ?? activeSingleShotJobId(projectId, runId))
+        }
+      } catch (error) {
+        // Poll/materialization failures are durable attention, not a silent
+        // promise rejection that causes the same provider task to be retried
+        // forever on the next project reopen. Never submit from this path.
+        if (isCurrent()) settleSingleShotAttention(projectId, runId, activeSingleShotJobId(projectId, runId))
+        logWarn('production-run', 'single-shot-observation-failed', undefined, error)
+      }
+    }).catch((error) => {
+      // The inner try/catch handles provider/materialization errors. A final
+      // lifecycle rejection (for example, a duplicate observer) must not
+      // write attention: by this point the worker may belong to an older
+      // capability-core epoch and the current Run could be unrelated.
+      logWarn('production-run', 'single-shot-observation-failed', undefined, error)
+    })
+  }
+  return {
+    settleSingleShotCompleted,
+    settleSingleShotAttention,
+    driveScheduler,
+    kickSchedulerForRun,
+    observeSingleShotRun,
+    stop: () => {
+      singleShotObservationLifecycle.stop()
+      for (const timer of rekickTimers.values()) clearTimeout(timer)
+      rekickTimers.clear()
+    },
+  }
+}

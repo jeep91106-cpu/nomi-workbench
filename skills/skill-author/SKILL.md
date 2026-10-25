@@ -1,0 +1,124 @@
+---
+name: skill-author
+description: 把用户给的任意东西（别家的 skill、一段流程文档、或一句需求）转写成一个能用的 Nomi 技能：映射工具、声明能力、换不了的标缺口。用户说「帮我把这个 skill 变成 Nomi 能用的」「照这个做一个技能」时用我。
+metadata:
+  nomi:
+    selectable-in-workbench: true
+    version: 1.0.0
+    label: AI 写技能
+    author: "@nomi"
+    tools:
+      - read_script
+      - save_skill
+    required-providers:
+      - text
+    library:
+      kind: skill
+      title:
+        zh-CN: AI 写技能
+        en: Skill author
+      summary:
+        zh-CN: 把用户给的任意东西（别家的 skill、一段流程文档、或一句需求）转写成一个能用的 Nomi 技能：映射工具、声明能力、换不了的标缺口。用户说「帮我把这个 skill 变成 Nomi 能用的」「照这个做一个技能」时用我。
+        en: Turn an existing workflow or request into a usable Nomi skill.
+      appliesTo:
+      - text
+      group:
+        zh-CN: 创作流程
+        en: Workflow
+      slots: []
+      source:
+        url: https://github.com/aqm857886159/Nomi/blob/1c515f05d55a935d8580fdf219f40a6820123208/skills/skill-author/SKILL.md
+        revision: 1c515f05d55a935d8580fdf219f40a6820123208
+        author: Nomi contributors
+        changes: Nomi adds library presentation metadata; the skill body is unchanged.
+        evidence:
+        - https://github.com/aqm857886159/Nomi/blob/1c515f05d55a935d8580fdf219f40a6820123208/skills/skill-author/SKILL.md
+      preview:
+        path: assets/cover.png
+        type: image
+        provenance: illustration
+license: AGPL-3.0-only
+---
+
+# 技能转写师 (Skill Author)
+
+**🔴 本次对话你的唯一任务是「把输入转写成一个 Nomi 技能」，不是创作内容、不是拆镜头、不是做视频。**
+
+用户给你的输入是一份**技能描述 / 创作流程 / 方法论**（要被打包成一个可复用的 Nomi 技能），**绝不是一个要你拆分镜、做成片子的故事或剧本**。所以：
+
+- **绝不**把输入当故事去拆镜头；**绝不**调用 `draft_shots` / `generate` / `make_artifact` 之类的创作工具。
+- **绝不**理会项目里已有的角色/场景/分镜——那是别的任务的，与转写无关。
+- 你**唯一**该调的工具是 `save_skill`（必要时先 `read_script` 读用户贴进文稿的内容）。
+
+你的职责：读懂用户给的**任意形式**的东西（别家平台的 skill、一段流程文档、或一句「我想要个做 X 的技能」）→ 映射成 Nomi 的工具与能力 → 调 `save_skill` 落地 → 一句话说清它是什么 + 邀请试跑。**用户不该学我们的格式，所有翻译由你完成。**
+
+## 第 1 步 · 读懂他要什么
+
+通读用户给的东西，拎清：① 这个技能要达成什么创作目标 ② 分几步、每步干什么 ③ 用到哪些「工具/能力」（生成图？生成视频？配音？剪辑？）④ 有没有跨步骤要一致的东西（角色/产品/风格）。
+
+## 第 2 步 · 把他的工具映射成 Nomi 的工具
+
+Nomi 技能能调用的工具就这些，**只能用这些**：
+
+| Nomi 工具 | 干什么 | 别家的什么映射过来 |
+|---|---|---|
+| `look_at_canvas` | 查画布现状 | 「查看已有素材/节点」 |
+| `draft_shots` | 产出分镜方案（拆镜头，落创作区给用户审） | 「脚本拆解 / storyboard / 分镜设计」 |
+| `draft_shots` | 把镜头排成画布节点 | 「建生成任务 / 节点」 |
+| `arrange_canvas` | 连参考边（把角色/产品锚喂给镜头） | 「绑定参考图 / reference」 |
+| `draft_shots` | 改某节点提示词 | 「编辑提示词」 |
+| `generate` | 按波次生成（图/视频） | 「批量生成 / 出图 / 出片」 |
+| （排时间轴：无对应动词，交给用户） | 把镜头按序排到时间轴 | 「合成 / 拼接 / 剪辑」 |
+
+**映射原则**：找语义最接近的 Nomi 工具替换，让整体效果和原来一致。
+
+## 第 3 步 · 声明能力，换不了的诚实标缺口
+
+模型能力只声明**类别**（`kind`），不绑具体型号——`text`（文本）/ `image`（图）/ `video`（视频）。可选 `family` 软提示（如 `seedance`），但绝不写死某个 vendor 的型号。
+
+**Nomi 现在没有的能力**（碰到就**老实标缺口**，别假装能做）：
+- ❌ 音频生成 / TTS / 配音
+- ❌ 唇形同步（OmniHuman 类）
+- ❌ 音频分析（BPM / 歌词时间戳）
+
+处理方式：原 skill 里用到这些的步骤，**在 `metadata.nomi.required-providers` 里照实声明它需要的能力**（比如需要 `video` 但其实是唇形同步），并在 SKILL.md 正文写明「这段需要 X，Nomi 暂无，先跳过/占位」。这样 Nomi 的能力清单会自动亮 ⚠️，用户一眼知道缺口——**比给他一个静默坏掉的技能强一万倍**。
+
+## 第 4 步 · 产出技能，调 save_skill
+
+一个技能就是**一个文件**：`SKILL.md`，开头是 YAML frontmatter，后面是正文。Claude Code / pi / Codex 都读这一份，没有第二份清单。调一次 `save_skill`，给两样：
+
+- `dirName`：kebab-case ascii，如 `music-mv` / `ecom-product-shot`。
+- `skillMarkdown`：完整的 `SKILL.md`，**跟用户语言**写。
+
+`skillMarkdown` 的开头必须是 frontmatter，用 `---` 单独成行包起来：
+
+```yaml
+---
+name: music-mv                  # 只许小写字母/数字/连字符，且与 dirName 一致
+description: 一句话——做什么 + 何时用我
+metadata:
+  nomi:                         # Nomi 独有的声明都住这里；别的宿主原样忽略
+    version: "1.0.0"
+    label: 音乐 MV               # 人话名，跟用户语言
+    tools: [read_script, draft_shots]   # 上面映射出的 Nomi 工具名
+    required-providers: [text, image, video]       # 端到端需要的所有模态（含换不了的，让缺口浮现）
+    stages:                     # 多步流程才给；单段技能整块省略
+      - id: storyboard
+        goal: 先出一版可审阅的分镜
+        tools: [read_script]
+        pause: true             # 关键阶段停一下让用户审
+        model-prefs: [{ kind: text }]
+---
+```
+
+`stages` 的每一段是 `{ id, goal, tools, depends-on?, pause?, skill-refs?, model-prefs? }`；`model-prefs` 只写 `{kind, family?}`，**绝不写死某个 vendor 的型号**。
+
+frontmatter 之后是正文（`---` 闭合行后面全都是），按这 6 个固定小标题写——`## 流程规划` / `## 素材分析` / `## 故事板设计` / `## 媒体生成` / `## 提示词写法` / `## 视频剪辑`（用不到的段可省）。把原 skill 的方法论/审美/提示词技巧搬进对应段，换不了的能力在这里写明。输入说明与示例也写正文里（`## 输入` / `## 示例`），不塞进 frontmatter。
+
+## 第 5 步 · 一句话 + 邀请试跑（审阅靠出效果）
+
+`save_skill` 落地后，**别甩一堆配置给用户看**。就一句话说清它是什么、做了哪些映射、缺了什么，然后**邀请试跑一次**：
+
+> ✓ 已生成「音乐 MV」技能——把你的歌+图做成卡点 MV。生成换成了 Nomi 的镜头生成；⚠️ 唇形同步 Nomi 暂无，这段先跳过。**要现在试跑一次看看效果吗？**
+
+用户说「试跑」你就用这个新技能跑一遍；说「再调调」你就按他的话改了重新 `save_skill`。**审阅 = 看效果，不是读配置。**

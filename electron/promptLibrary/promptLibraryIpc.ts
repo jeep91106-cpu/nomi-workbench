@@ -1,0 +1,84 @@
+// 提示词库 IPC(仿 memory/memoryIpc.ts)。renderer 一次取全量(缓存),过滤/分页在渲染层做。
+// public 库只读;user(我的库)用户级 CRUD(跨项目)。
+import { ipcMain } from "electron";
+import { assertTrustedSender } from "../ipcSenderGuard";
+import { getPromptLibrary } from "./promptLibraryStore";
+import { addUserPrompt, deleteUserPrompt, listUserPrompts, restoreUserPrompt, updateUserPrompt } from "./userPromptStore";
+
+export function registerPromptLibraryIpc(): void {
+  ipcMain.handle("nomi:prompt-library:list", async (event) => {
+    // 守卫放在 try 外：不能被下面的 catch 洗成 { ok:false }，必须真的 reject。
+    assertTrustedSender(event);
+    try {
+      const prompts = await getPromptLibrary();
+      return { ok: true, prompts };
+    } catch (error) {
+      return { ok: false, prompts: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  // —— 我的库(用户级) ——
+  ipcMain.handle("nomi:prompt-library:user-list", async (event) => {
+    assertTrustedSender(event);
+    try {
+      return { ok: true, prompts: listUserPrompts() };
+    } catch (error) {
+      return { ok: false, prompts: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle("nomi:prompt-library:user-add", async (event, input: { title?: string; prompt: string; promptType: "image" | "video"; tags?: string[]; referenceImages?: { url: string; title?: string; sourceUrl?: string }[] }) => {
+    assertTrustedSender(event);
+    try {
+      addUserPrompt(input);
+      return { ok: true, prompts: listUserPrompts() };
+    } catch (error) {
+      return { ok: false, prompts: listUserPrompts(), error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle("nomi:prompt-library:user-restore", async (event, snapshot: unknown) => {
+    assertTrustedSender(event);
+    try {
+      return { ok: true, prompts: restoreUserPrompt(snapshot) };
+    } catch (error) {
+      return { ok: false, prompts: listUserPrompts(), error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle("nomi:prompt-library:user-update", async (event, payload: { id: string; patch: { title?: string; prompt?: string; promptType?: "image" | "video" } }) => {
+    assertTrustedSender(event);
+    try {
+      return { ok: true, prompts: updateUserPrompt(payload.id, payload.patch) };
+    } catch (error) {
+      return { ok: false, prompts: listUserPrompts(), error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle("nomi:prompt-library:user-delete", async (event, payload: { id: string }) => {
+    assertTrustedSender(event);
+    try {
+      const result = deleteUserPrompt(payload.id);
+      return { ok: true, prompts: result.prompts, deleted: result.deleted };
+    } catch (error) {
+      return { ok: false, prompts: listUserPrompts(), error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+
+  // 节点提示词优化用的文本大脑(vendor/modelKey,不含 apiKey)。这里只回答 catalog 是否已配置，
+  // 不为首屏 readiness 解密；locked 由首次真实文本请求以结构化错误报告。
+  ipcMain.handle("nomi:prompt-library:text-brain", async (event, preference?: { vendorKey?: unknown; modelKey?: unknown; strict?: unknown }) => {
+    assertTrustedSender(event);
+    const { resolveTextBrainStatus } = await import("../ai/textBrainResolver");
+    const resolved = resolveTextBrainStatus(
+      typeof preference?.vendorKey === "string" && typeof preference.modelKey === "string"
+        ? { vendorKey: preference.vendorKey, modelKey: preference.modelKey }
+        : undefined,
+      { strict: preference?.strict === true },
+    );
+    return resolved.status === "ok"
+      ? { ok: true, brain: resolved.brain, status: "ok" as const }
+      : { ok: false, brain: null, status: resolved.status, ...(resolved.preferredUnavailable ? { preferredUnavailable: true as const } : {}) };
+  });
+}

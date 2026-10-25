@@ -1,0 +1,794 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+let homeDir = ''
+const originalExecPath = process.execPath
+let isPackaged = false
+/** 「真实用户主目录」（passwd 那份）。默认取本机真值——临时 HOME 不在它下面，写盘不受隔离守卫影响。 */
+let realHome: string | null = null
+
+vi.mock('electron', () => ({
+  app: { getAppPath: () => path.join(homeDir, 'repo'), getPath: () => homeDir, get isPackaged() { return isPackaged } },
+}))
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>()
+  const userInfo = () => ({ ...actual.userInfo(), homedir: realHome ?? actual.userInfo().homedir })
+  return { ...actual, default: { ...actual, homedir: () => homeDir, userInfo }, homedir: () => homeDir, userInfo }
+})
+
+import {
+  MCP_CONFIG_KIND_ENV,
+  MCP_CONFIG_VERSION,
+  MCP_CONFIG_VERSION_ENV,
+  classifyMcpEntry,
+  installMcp,
+  listCustomMcpProfiles,
+  mcpServerEntry,
+  packagedMcpLauncherAvailable,
+  readMcpInfo,
+  registerCustomMcpProfile,
+  repairStaleMcpConfigs,
+  removeCustomMcpProfile,
+  uninstallMcp,
+} from './mcpConfig'
+import { recordDetectedMcpClient } from './mcpDetectedClients'
+import { BUILTIN_MCP_CLIENTS } from '../shared/mcpClientRegistry'
+import {
+  CAPABILITY_DIR_ENV,
+  MCP_CLIENT_ENV,
+  MCP_CLIENT_PROOF_ENV,
+  ensureToken,
+  signMcpClient,
+  verifyMcpClient,
+} from './security'
+
+const roots: string[] = []
+function tempHome(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nomi-mcpcfg-'))
+  roots.push(dir)
+  return dir
+}
+function claudeJson(): string {
+  return path.join(homeDir, '.claude.json')
+}
+/** 宿主「已安装」= 注册表登记的安装痕迹存在；测试先把痕迹摆出来，没装的客户端本来就不许写。 */
+/**
+ * 在隔离 HOME 里造一个**真的装过**的宿主。
+ *
+ * 2026-09-17（W-15）之前这里只 `mkdirSync` 一个空目录——那正好是当时的判据：
+ * 「配置目录在不在」。走查用 5 个空目录让 5 个客户端全都显示成可一键接入，
+ * 判据于是收紧成「痕迹要非空」，这个夹具也必须跟着变成真的痕迹，
+ * 否则它测的是一个产品里已经不存在的状态（夹具不跟判据走，就是在给自己发通行证）。
+ */
+function installHost(dir: string): void {
+  const root = path.join(homeDir, dir)
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(path.join(root, 'installed-marker'), '1')
+}
+
+beforeEach(() => {
+  homeDir = tempHome()
+  const appCommand = process.platform === 'darwin'
+    ? path.join(homeDir, 'Current Nomi.app', 'Contents', 'MacOS', 'Nomi')
+    : path.join(homeDir, process.platform === 'win32' ? 'Nomi.exe' : 'Nomi')
+  Object.defineProperty(process, 'execPath', { value: appCommand, configurable: true })
+  const runtime = process.platform === 'darwin'
+    ? path.join(homeDir, 'Current Nomi.app', 'Contents', 'Frameworks', 'Nomi Helper.app', 'Contents', 'MacOS', 'Nomi Helper')
+    : appCommand
+  const script = process.platform === 'darwin'
+    ? path.join(homeDir, 'Current Nomi.app', 'Contents', 'Resources', 'app.asar', 'dist-electron', 'capabilityCore', 'mcpNodeLauncher.js')
+    : path.join(homeDir, 'resources', 'app.asar', 'dist-electron', 'capabilityCore', 'mcpNodeLauncher.js')
+  for (const file of [appCommand, runtime, script, path.join(homeDir, 'repo', 'dist-electron', 'capabilityCore', 'mcpNodeLauncher.js')]) {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, '', { mode: 0o755 })
+  }
+  // 隔离 capability-core 目录（security.ts 的 capabilityCoreDir() 用这个 env）。
+  vi.stubEnv(CAPABILITY_DIR_ENV, path.join(homeDir, '.nomi-cap'))
+  isPackaged = false
+  realHome = null
+  installHost('.claude')
+  installHost('.codex')
+  ensureToken()
+})
+afterEach(() => {
+  Object.defineProperty(process, 'execPath', { value: originalExecPath, configurable: true })
+  vi.restoreAllMocks()
+  vi.stubEnv(CAPABILITY_DIR_ENV, undefined)
+  vi.stubEnv("NOMI_E2E", undefined)
+  vi.stubEnv("NOMI_SETTINGS_DIR", undefined)
+  for (const r of roots.splice(0)) fs.rmSync(r, { recursive: true, force: true })
+})
+
+describe('capabilityCore/mcpConfig', () => {
+  it('does not treat an older installed app without the v3 Helper script as reusable', () => {
+    const appRoot = path.join(homeDir, 'Old Nomi.app')
+    const appCommand = process.platform === 'darwin'
+      ? path.join(appRoot, 'Contents', 'MacOS', 'Nomi')
+      : path.join(appRoot, process.platform === 'win32' ? 'Nomi.exe' : 'Nomi')
+    const runtime = process.platform === 'darwin'
+      ? path.join(appRoot, 'Contents', 'Frameworks', 'Nomi Helper.app', 'Contents', 'MacOS', 'Nomi Helper')
+      : appCommand
+    const launcher = process.platform === 'darwin'
+      ? path.join(appRoot, 'Contents', 'Resources', 'app.asar', 'dist-electron', 'capabilityCore', 'mcpNodeLauncher.js')
+      : path.join(appRoot, 'resources', 'app.asar', 'dist-electron', 'capabilityCore', 'mcpNodeLauncher.js')
+    fs.mkdirSync(path.dirname(appCommand), { recursive: true })
+    fs.mkdirSync(path.dirname(runtime), { recursive: true })
+    fs.writeFileSync(appCommand, '')
+    if (runtime !== appCommand) fs.writeFileSync(runtime, '')
+
+    expect(packagedMcpLauncherAvailable(appCommand)).toBe(false)
+    fs.mkdirSync(path.dirname(launcher), { recursive: true })
+    fs.writeFileSync(launcher, '')
+    expect(packagedMcpLauncherAvailable(appCommand)).toBe(true)
+  })
+
+  it('install 合并进已有 mcpServers——保留 cocos-creator，不覆盖整个文件', () => {
+    fs.writeFileSync(
+      claudeJson(),
+      JSON.stringify({ theme: 'dark', mcpServers: { 'cocos-creator': { command: 'x' } } }, null, 2),
+    )
+    const result = installMcp()
+    expect(result.ok).toBe(true)
+    expect(result.backupPath).toBeTruthy()
+    expect(fs.existsSync(result.backupPath!)).toBe(true)
+
+    const after = JSON.parse(fs.readFileSync(claudeJson(), 'utf8'))
+    expect(after.theme).toBe('dark') // 其它字段原样保留
+    expect(after.mcpServers['cocos-creator']).toEqual({ command: 'x' }) // 别人的 server 没被动
+    // 启动条目 = Electron 自带 Node runtime + 纯 Node MCP 桥；不注册第二个 NSApplication。
+    expect(after.mcpServers.nomi.command).toBe(process.execPath)
+    expect(after.mcpServers.nomi.env.ELECTRON_RUN_AS_NODE).toBe('1')
+    expect(after.mcpServers.nomi.env.NOMI_MCP_STDIO).toBe('1')
+    expect(after.mcpServers.nomi.env.NOMI_MCP_APP_COMMAND).toBe(process.execPath)
+    expect(JSON.parse(after.mcpServers.nomi.env.NOMI_MCP_APP_ARGS)).toEqual([path.join(homeDir, 'repo')])
+    expect(after.mcpServers.nomi.env.NOMI_SETTINGS_DIR).toBe(homeDir)
+    expect(after.mcpServers.nomi.env[MCP_CONFIG_VERSION_ENV]).toBe(MCP_CONFIG_VERSION)
+    expect(after.mcpServers.nomi.env[MCP_CONFIG_KIND_ENV]).toBe('development')
+    expect(after.mcpServers.nomi.env[MCP_CLIENT_ENV]).toBe('claude')
+    expect(verifyMcpClient(
+      after.mcpServers.nomi.env[MCP_CLIENT_ENV],
+      after.mcpServers.nomi.env[MCP_CLIENT_PROOF_ENV],
+    )).toBe('claude')
+    expect(after.mcpServers.nomi.args[0]).toBe(path.join(homeDir, 'repo', 'dist-electron', 'capabilityCore', 'mcpNodeLauncher.js'))
+  })
+
+  it('install 在 ~/.claude.json 不存在时也能建出来', () => {
+    expect(fs.existsSync(claudeJson())).toBe(false)
+    const result = installMcp()
+    expect(result.ok).toBe(true)
+    expect(result.backupPath).toBeNull() // 原文件不存在 → 无备份
+    const after = JSON.parse(fs.readFileSync(claudeJson(), 'utf8'))
+    expect(after.mcpServers.nomi).toBeTruthy()
+  })
+
+  it('uninstall 只删 nomi，保留 cocos-creator', () => {
+    fs.writeFileSync(claudeJson(), JSON.stringify({ mcpServers: { 'cocos-creator': { command: 'x' } } }))
+    installMcp()
+    uninstallMcp()
+    const after = JSON.parse(fs.readFileSync(claudeJson(), 'utf8'))
+    expect(after.mcpServers.nomi).toBeUndefined()
+    expect(after.mcpServers['cocos-creator']).toEqual({ command: 'x' })
+  })
+
+  it('readMcpInfo 反映 installed 状态 + 给出可复制片段', () => {
+    expect(readMcpInfo(0).clients.claude.installed).toBe(false)
+    installMcp()
+    const info = readMcpInfo(17371)
+    expect(info.clients.claude.installed).toBe(true)
+    expect(info.rpcRunning).toBe(true)
+    expect(info.clients.claude.snippet).toContain('"nomi"')
+    expect(info.clients.claude.snippet).toContain('NOMI_MCP_STDIO')
+  })
+
+  it('codex：install 写 TOML [mcp_servers.nomi]，保留已有表；uninstall 只删本块', () => {
+    const codexPath = path.join(homeDir, '.codex', 'config.toml')
+    fs.mkdirSync(path.dirname(codexPath), { recursive: true })
+    fs.writeFileSync(codexPath, '[mcp_servers.other]\ncommand = "x"\n')
+    installMcp('codex')
+    let text = fs.readFileSync(codexPath, 'utf8')
+    expect(text).toContain('[mcp_servers.nomi]')
+    expect(text).toContain('NOMI_MCP_STDIO = "1"')
+    expect(text).toContain(`${MCP_CLIENT_ENV} = "codex"`)
+    expect(text).toContain(`${MCP_CLIENT_PROOF_ENV} = "`)
+    expect(text).toContain('[mcp_servers.other]') // 别人的块没被动
+    expect(readMcpInfo(0).clients.codex.installed).toBe(true)
+    uninstallMcp('codex')
+    text = fs.readFileSync(codexPath, 'utf8')
+    expect(text).not.toContain('[mcp_servers.nomi]')
+    expect(text).toContain('[mcp_servers.other]')
+    expect(readMcpInfo(0).clients.codex.installed).toBe(false)
+  })
+
+  it('codex：升级旧 env 子表时删净整个 nomi 表族，避免生成不可解析的重复 env 键', () => {
+    const codexPath = path.join(homeDir, '.codex', 'config.toml')
+    fs.mkdirSync(path.dirname(codexPath), { recursive: true })
+    fs.writeFileSync(
+      codexPath,
+      [
+        '[mcp_servers.nomi]',
+        'command = "/Applications/Old Nomi.app/Contents/MacOS/Nomi"',
+        '',
+        '[mcp_servers.nomi.env]',
+        'NOMI_MCP_STDIO = "1"',
+        '',
+        '[[notifications]]',
+        'kind = "desktop"',
+        '',
+        '[projects."/Users/example"]',
+        'trust_level = "trusted"',
+        '',
+      ].join('\n'),
+    )
+
+    installMcp('codex')
+    let text = fs.readFileSync(codexPath, 'utf8')
+    expect(text.match(/^\s*\[\s*mcp_servers\.nomi\s*\]\s*$/gm)).toHaveLength(1)
+    expect(text).not.toContain('[mcp_servers.nomi.env]')
+    expect(text.match(/^env\s*=/gm)).toHaveLength(1)
+    expect(text).toContain('[[notifications]]\nkind = "desktop"')
+    expect(text).toContain('[projects."/Users/example"]')
+
+    uninstallMcp('codex')
+    text = fs.readFileSync(codexPath, 'utf8')
+    expect(text).not.toContain('[mcp_servers.nomi')
+    expect(text).toContain('[[notifications]]\nkind = "desktop"')
+    expect(text).toContain('[projects."/Users/example"]')
+  })
+
+  // Codex 的三个默认值对 Nomi 都不成立，漏写任何一个 = 一种「看着接上了其实用不了」：
+  // startup 10s 兜不住 Electron 冷启（server 被静默丢弃）｜tool 60s 兜不住真出视频（发消息没反应）｜
+  // approval 不写则连「列一下项目」都要人点一次同意。删掉其中任何一行这条测试必红。
+  it('codex：必须写足 startup/tool 超时与审批模式（缺任一都会让接入形同虚设）', () => {
+    const codexPath = path.join(homeDir, '.codex', 'config.toml')
+    installMcp('codex')
+    const text = fs.readFileSync(codexPath, 'utf8')
+    expect(Number(text.match(/^startup_timeout_sec = (\d+)$/m)![1])).toBeGreaterThan(10)
+    expect(Number(text.match(/^tool_timeout_sec = (\d+)$/m)![1])).toBeGreaterThan(60)
+    // "writes" = 只对没标 readOnlyHint 的工具弹确认；不可改成 "auto" 绕过写入确认。
+    expect(text).toContain('default_tools_approval_mode = "writes"')
+  })
+
+  it('cursor：install 写 ~/.cursor/mcp.json 的 mcpServers.nomi（文件自动建），互不影响 claude', () => {
+    installHost('.cursor')
+    const cursorPath = path.join(homeDir, '.cursor', 'mcp.json')
+    expect(fs.existsSync(cursorPath)).toBe(false)
+    installMcp('cursor')
+    const after = JSON.parse(fs.readFileSync(cursorPath, 'utf8'))
+    expect(after.mcpServers.nomi.command).toBe(process.execPath)
+    expect(after.mcpServers.nomi.env.NOMI_MCP_STDIO).toBe('1')
+    expect(after.mcpServers.nomi.env[MCP_CLIENT_ENV]).toBe('cursor')
+    expect(verifyMcpClient(
+      after.mcpServers.nomi.env[MCP_CLIENT_ENV],
+      after.mcpServers.nomi.env[MCP_CLIENT_PROOF_ENV],
+    )).toBe('cursor')
+    expect(readMcpInfo(0).clients.cursor.installed).toBe(true)
+    expect(readMcpInfo(0).clients.claude.installed).toBe(false) // 各客户端独立
+  })
+
+  it('workbuddy preserves existing servers and official fields through install and uninstall', () => {
+    const fixture = JSON.parse(fs.readFileSync('tests/fixtures/standard-formats/mcp/workbuddy.json', 'utf8'))
+    const configPath = path.join(homeDir, '.workbuddy', 'mcp.json')
+    const internalPath = path.join(homeDir, '.workbuddy', '.mcp.json')
+    expect(readMcpInfo(0).clients.workbuddy.appInstalled).toBe(false)
+    fs.mkdirSync(path.dirname(configPath), { recursive: true })
+    const before = {
+      ...fixture,
+      preferences: { keep: true },
+      mcpServers: {
+        ...fixture.mcpServers,
+        chatcut_desktop: { command: '/fixture/chatcut', env: { CHATCUT_FIXTURE: 'preserve-me' } },
+      },
+    }
+    fs.writeFileSync(configPath, JSON.stringify(before))
+    fs.writeFileSync(internalPath, '{"internal":"do-not-touch"}')
+    expect(readMcpInfo(0).clients.workbuddy.appInstalled).toBe(true)
+    expect(readMcpInfo(0).clients.workbuddy.installed).toBe(false)
+    installMcp('workbuddy')
+    const after = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+    const { nomi, ...others } = after.mcpServers
+    expect(others).toEqual(before.mcpServers)
+    expect(after.preferences).toEqual(before.preferences)
+    expect(JSON.parse(fs.readFileSync(`${configPath}.nomi-backup`, 'utf8'))).toEqual(before)
+    const info = readMcpInfo(0).clients.workbuddy
+    expect(info.installed).toBe(true)
+    expect(info.configPath).toBe(configPath)
+    expect(nomi).toEqual(JSON.parse(info.snippet).mcpServers.nomi)
+    expect(verifyMcpClient(nomi.env[MCP_CLIENT_ENV], nomi.env[MCP_CLIENT_PROOF_ENV])).toBe('workbuddy')
+    expect(verifyMcpClient('claude', nomi.env[MCP_CLIENT_PROOF_ENV])).toBeNull()
+    expect(readMcpInfo(0).clients.claude.installed).toBe(false)
+    uninstallMcp('workbuddy')
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8'))).toEqual(before)
+    expect(fs.readFileSync(internalPath, 'utf8')).toBe('{"internal":"do-not-touch"}')
+    expect(readMcpInfo(0).clients.workbuddy.installed).toBe(false)
+  })
+
+  it('binds each installed entry to its client instead of trusting a renamed label', () => {
+    installHost('.cursor')
+    installMcp('cursor')
+    const cursorPath = path.join(homeDir, '.cursor', 'mcp.json')
+    const entry = JSON.parse(fs.readFileSync(cursorPath, 'utf8')).mcpServers.nomi
+    expect(verifyMcpClient('cursor', entry.env[MCP_CLIENT_PROOF_ENV])).toBe('cursor')
+    expect(verifyMcpClient('codex', entry.env[MCP_CLIENT_PROOF_ENV])).toBeNull()
+  })
+
+  it('known legacy Claude entry is reported as-is by the read path and upgraded only by the explicit repair', () => {
+    isPackaged = true
+    const original = JSON.stringify({
+      theme: 'dark',
+      mcpServers: {
+        other: { command: 'other-server' },
+        nomi: { command: 'node', args: ['/old/Nomi/scripts/nomi-mcp.mjs'], env: {} },
+      },
+    }, null, 2)
+    fs.writeFileSync(claudeJson(), original)
+
+    // 读路径零写盘：读两次，字节不变、没有备份文件冒出来。
+    expect(readMcpInfo(0).clients.claude).toMatchObject({ installed: true, configState: 'legacy-launcher', launcherKind: 'packaged' })
+    expect(readMcpInfo(0).clients.claude.configState).toBe('legacy-launcher')
+    expect(fs.readFileSync(claudeJson(), 'utf8')).toBe(original)
+    expect(fs.existsSync(`${claudeJson()}.nomi-backup`)).toBe(false)
+
+    expect(repairStaleMcpConfigs()).toEqual({ changed: true, repaired: [{ client: 'claude', label: 'Claude Code', from: 'legacy-launcher' }] })
+    const backup = JSON.parse(fs.readFileSync(`${claudeJson()}.nomi-backup`, 'utf8'))
+    expect(backup.mcpServers.nomi.args[0]).toContain('scripts/nomi-mcp.mjs')
+    const after = JSON.parse(fs.readFileSync(claudeJson(), 'utf8'))
+    expect(after.theme).toBe('dark')
+    expect(after.mcpServers.other).toEqual({ command: 'other-server' })
+    expect(after.mcpServers.nomi.env[MCP_CONFIG_VERSION_ENV]).toBe(MCP_CONFIG_VERSION)
+    expect(readMcpInfo(0).clients.claude.configState).toBe('current')
+  })
+
+  it('repairs a missing direct packaged launcher written by the previous Nomi release', () => {
+    isPackaged = true
+    fs.writeFileSync(claudeJson(), JSON.stringify({
+      mcpServers: {
+        nomi: {
+          command: path.join(homeDir, 'Deleted Nomi.app', 'Contents', 'MacOS', 'Nomi'),
+          args: [],
+          env: {
+            NOMI_MCP_STDIO: '1',
+            [MCP_CLIENT_ENV]: 'claude',
+            [MCP_CLIENT_PROOF_ENV]: 'previous-release-proof',
+          },
+        },
+      },
+    }, null, 2))
+
+    expect(readMcpInfo(0).clients.claude.configState).toBe('launcher-broken')
+    expect(repairStaleMcpConfigs().changed).toBe(true)
+    const info = readMcpInfo(0)
+    expect(info.clients.claude.configState).toBe('current')
+    const after = JSON.parse(fs.readFileSync(claudeJson(), 'utf8')).mcpServers.nomi
+    expect(after.command).toBe(info.server.command)
+    expect(after.args).toEqual(info.server.args)
+    expect(after.args[0]).toContain('mcpNodeLauncher.js')
+  })
+
+  it('known legacy Codex entry auto-upgrades only the nomi table family', () => {
+    isPackaged = true
+    const target = path.join(homeDir, '.codex', 'config.toml')
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, [
+      '[mcp_servers.other]',
+      'command = "keep-me"',
+      '',
+      '[mcp_servers.nomi]',
+      'command = "node"',
+      'args = ["/old/Nomi/scripts/nomi-mcp.mjs"]',
+      '',
+    ].join('\n'))
+
+    expect(readMcpInfo(0).clients.codex.configState).toBe('legacy-launcher')
+    expect(repairStaleMcpConfigs().repaired.map((item) => item.client)).toEqual(['codex'])
+    expect(readMcpInfo(0).clients.codex.configState).toBe('current')
+    const after = fs.readFileSync(target, 'utf8')
+    expect(after).toContain('[mcp_servers.other]\ncommand = "keep-me"')
+    expect(after).toContain(`${MCP_CONFIG_VERSION_ENV} = "${MCP_CONFIG_VERSION}"`)
+    expect(fs.readFileSync(`${target}.nomi-backup`, 'utf8')).toContain('/old/Nomi/scripts/nomi-mcp.mjs')
+  })
+
+  it('repairs a missing previous packaged Codex entry that uses an env subtable', () => {
+    isPackaged = true
+    const target = path.join(homeDir, '.codex', 'config.toml')
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, [
+      '[mcp_servers.nomi]',
+      `command = ${JSON.stringify(path.join(homeDir, 'Deleted Nomi.app', 'Contents', 'MacOS', 'Nomi'))}`,
+      'args = []',
+      '',
+      '[mcp_servers.nomi.env]',
+      'NOMI_MCP_STDIO = "1"',
+      '',
+      '[projects."/Users/example"]',
+      'trust_level = "trusted"',
+      '',
+    ].join('\n'))
+
+    expect(readMcpInfo(0).clients.codex.configState).toBe('launcher-broken')
+    expect(repairStaleMcpConfigs().changed).toBe(true)
+    expect(readMcpInfo(0).clients.codex.configState).toBe('current')
+    const after = fs.readFileSync(target, 'utf8')
+    expect(after).not.toContain('[mcp_servers.nomi.env]')
+    expect(after).toContain('[projects."/Users/example"]\ntrust_level = "trusted"')
+    expect(after).toContain('NOMI_MCP_CONFIG_VERSION = "3"')
+  })
+
+  it('unknown custom nomi entry is classified but never silently overwritten', () => {
+    isPackaged = true
+    const original = JSON.stringify({ mcpServers: { nomi: { command: 'custom-nomi-proxy', args: ['serve'] } } }, null, 2)
+    fs.writeFileSync(claudeJson(), original)
+
+    const info = readMcpInfo(0)
+    expect(info.clients.claude).toMatchObject({ installed: true, configState: 'custom' })
+    expect(repairStaleMcpConfigs()).toEqual({ changed: false, repaired: [] })
+    expect(fs.readFileSync(claudeJson(), 'utf8')).toBe(original)
+    expect(fs.existsSync(`${claudeJson()}.nomi-backup`)).toBe(false)
+  })
+
+  it('repairs a stale host config at boot, without waiting for anyone to open the panel', () => {
+    // The user-visible failure this guards: a config still naming the retired scripts/nomi-mcp.mjs
+    // entry makes the coding assistant print CONNECTION_CLOSED, which says nothing about Nomi. The
+    // repair existed but only ran as a side effect of rendering 模型接入, so it never reached anyone
+    // who did not already suspect Nomi.
+    isPackaged = true
+    fs.writeFileSync(claudeJson(), JSON.stringify({
+      mcpServers: { nomi: { command: 'node', args: ['/old/Nomi/scripts/nomi-mcp.mjs'], env: {} } },
+    }, null, 2))
+
+    const repaired = repairStaleMcpConfigs()
+
+    expect(repaired).toEqual({ changed: true, repaired: [{ client: 'claude', label: 'Claude Code', from: 'legacy-launcher' }] })
+    const after = JSON.parse(fs.readFileSync(claudeJson(), 'utf8'))
+    expect(after.mcpServers.nomi.env[MCP_CONFIG_VERSION_ENV]).toBe(MCP_CONFIG_VERSION)
+    expect(after.mcpServers.nomi.args[0]).not.toContain('scripts/nomi-mcp.mjs')
+    // Idempotent: a healthy config is not rewritten again on the next launch.
+    expect(repairStaleMcpConfigs()).toEqual({ changed: false, repaired: [] })
+  })
+
+  describe('startup preserves another viable launcher', () => {
+    function otherLauncher() {
+      const command = path.join(homeDir, 'Other Nomi', process.platform === 'win32' ? 'Nomi.exe' : 'Nomi')
+      fs.mkdirSync(path.dirname(command), { recursive: true })
+      fs.writeFileSync(command, '', { mode: 0o755 })
+      return { command, args: [], env: { NOMI_SETTINGS_DIR: homeDir, NOMI_MCP_STDIO: '1' } }
+    }
+
+    it.each(['claude', 'codex', 'sample-assistant'])('preserves %s byte for byte despite another owner authentication', (client) => {
+      isPackaged = true
+      const entry = otherLauncher()
+      const target = client === 'codex' ? path.join(homeDir, '.codex', 'config.toml')
+        : client === 'claude' ? claudeJson() : path.join(homeDir, 'sample.json')
+      if (client === 'sample-assistant') registerCustomMcpProfile({ key: client, label: 'Sample', format: 'json', configPath: target })
+      const before = client === 'codex'
+        ? `[mcp_servers.nomi]\ncommand = ${JSON.stringify(entry.command)}\nargs = []\nenv = { NOMI_SETTINGS_DIR = ${JSON.stringify(homeDir)}, NOMI_MCP_STDIO = "1" }\n`
+        : JSON.stringify({ untouched: true, mcpServers: { nomi: entry } }, null, 2)
+      fs.writeFileSync(target, before)
+      expect(repairStaleMcpConfigs()).toEqual({ changed: false, repaired: [] })
+      expect(fs.readFileSync(target, 'utf8')).toBe(before)
+      expect(readMcpInfo(0).clients[client]).toMatchObject({ configState: 'launcher-elsewhere', configuredCommand: entry.command })
+      expect(fs.existsSync(`${target}.nomi-backup`)).toBe(false)
+      expect(installMcp(client).ok).toBe(true)
+      expect(readMcpInfo(0).clients[client].configState).toBe('current')
+      expect(fs.readFileSync(`${target}.nomi-backup`, 'utf8')).toBe(before)
+    })
+
+    it('preserves the same executable with a different existing profile', () => {
+      isPackaged = true
+      installMcp('claude')
+      const written = JSON.parse(fs.readFileSync(claudeJson(), 'utf8'))
+      const profile = path.join(homeDir, 'another-profile')
+      fs.mkdirSync(profile)
+      written.mcpServers.nomi.env.NOMI_SETTINGS_DIR = profile
+      written.mcpServers.nomi.env[MCP_CLIENT_PROOF_ENV] = 'another-profile-proof'
+      const before = JSON.stringify(written)
+      fs.writeFileSync(claudeJson(), before)
+      expect(repairStaleMcpConfigs()).toEqual({ changed: false, repaired: [] })
+      expect(fs.readFileSync(claudeJson(), 'utf8')).toBe(before)
+      expect(readMcpInfo(0).clients.claude.configState).toBe('launcher-elsewhere')
+    })
+
+    it.each(['healthy', 'missing-script', 'missing-app'])('checks every resource of a %s Helper launcher', (state) => {
+      isPackaged = true
+      const command = path.join(homeDir, 'Other', process.platform === 'win32' ? 'Nomi.exe' : 'Nomi Helper')
+      const appCommand = path.join(homeDir, 'Other', 'Nomi')
+      const script = path.join(homeDir, 'Other', 'dist-electron', 'capabilityCore', 'mcpNodeLauncher.js')
+      for (const file of [command, appCommand, script]) {
+        fs.mkdirSync(path.dirname(file), { recursive: true })
+        fs.writeFileSync(file, '', { mode: 0o755 })
+      }
+      const entry = { command, args: [script], env: {
+        NOMI_MCP_STDIO: '1', ELECTRON_RUN_AS_NODE: '1', NOMI_MCP_APP_COMMAND: appCommand,
+        NOMI_SETTINGS_DIR: homeDir, [MCP_CLIENT_PROOF_ENV]: 'another-token',
+      } }
+      if (state === 'missing-script') fs.unlinkSync(script)
+      if (state === 'missing-app') fs.unlinkSync(appCommand)
+      const before = JSON.stringify({ mcpServers: { nomi: entry } })
+      fs.writeFileSync(claudeJson(), before)
+      expect(classifyMcpEntry('claude', entry)).toBe(state === 'healthy' ? 'launcher-elsewhere' : 'launcher-broken')
+      expect(repairStaleMcpConfigs().changed).toBe(state !== 'healthy')
+      if (state === 'healthy') expect(fs.readFileSync(claudeJson(), 'utf8')).toBe(before)
+    })
+
+    it('still repairs authentication for the current installation', () => {
+      isPackaged = true
+      const entry = mcpServerEntry('claude')
+      entry.env![MCP_CLIENT_PROOF_ENV] = 'expired-proof'
+      fs.writeFileSync(claudeJson(), JSON.stringify({ mcpServers: { nomi: entry } }))
+      expect(readMcpInfo(0).clients.claude.configState).toBe('auth-stale')
+      expect(repairStaleMcpConfigs().repaired).toMatchObject([{ client: 'claude', from: 'auth-stale' }])
+      expect(readMcpInfo(0).clients.claude.configState).toBe('current')
+    })
+
+    it.each(['missing', 'directory', 'not-executable'])('repairs a %s launcher', (failure) => {
+      isPackaged = true
+      const entry = otherLauncher()
+      if (failure === 'missing' || failure === 'directory') fs.unlinkSync(entry.command)
+      if (failure === 'directory') fs.mkdirSync(entry.command)
+      if (failure === 'not-executable') {
+        fs.chmodSync(entry.command, 0o644)
+        // Windows access(X_OK) only checks existence; exercise denial without assuming POSIX modes.
+        if (process.platform === 'win32') {
+          const access = fs.accessSync.bind(fs)
+          vi.spyOn(fs, 'accessSync').mockImplementation((target, mode) => {
+            if (target === entry.command) throw Object.assign(new Error('denied'), { code: 'EACCES' })
+            return access(target, mode)
+          })
+        }
+      }
+      fs.writeFileSync(claudeJson(), JSON.stringify({ mcpServers: { nomi: entry } }))
+      expect(classifyMcpEntry('claude', entry)).toBe('launcher-broken')
+      expect(repairStaleMcpConfigs()).toMatchObject({ changed: true, repaired: [{ from: 'launcher-broken' }] })
+      expect(readMcpInfo(0).clients.claude.configState).toBe('current')
+      vi.restoreAllMocks()
+    })
+
+    it('repairs an existing retired script rather than treating existence as viability', () => {
+      isPackaged = true
+      const script = path.join(homeDir, 'scripts', 'nomi-mcp.mjs')
+      fs.mkdirSync(path.dirname(script))
+      fs.writeFileSync(script, 'process.exit(2)')
+      fs.writeFileSync(claudeJson(), JSON.stringify({ mcpServers: { nomi: { command: process.execPath, args: [script] } } }))
+      expect(repairStaleMcpConfigs()).toMatchObject({ changed: true, repaired: [{ from: 'legacy-launcher' }] })
+      expect(readMcpInfo(0).clients.claude.configState).toBe('current')
+    })
+  })
+
+  // 2026-09-13 现场：只是打开设置页，本机 5 个客户端配置全被改成指向一个跑完就删的 /tmp profile。
+  // 守卫住在唯一的写盘门（atomicWrite）上：repair / install / uninstall 三条路都从这扇门过，谁也绕不开。
+  describe('an isolated instance never rewrites host configs in the real user home', () => {
+    const stale = JSON.stringify({
+      mcpServers: { nomi: { command: 'node', args: ['/old/Nomi/scripts/nomi-mcp.mjs'], env: {} } },
+    }, null, 2)
+
+    it.each([
+      ['NOMI_E2E=1', () => { vi.stubEnv("NOMI_E2E", '1') }],
+      ['NOMI_SETTINGS_DIR ≠ userData', () => { vi.stubEnv("NOMI_SETTINGS_DIR", path.join(homeDir, 'isolated-settings')) }],
+    ])('refuses repair, install and uninstall under %s', (_label, isolate) => {
+      isPackaged = true
+      realHome = homeDir // 这台机器的真实主目录就是测试 HOME → 目标文件在真实主目录里
+      fs.writeFileSync(claudeJson(), stale)
+      isolate()
+      expect(repairStaleMcpConfigs()).toEqual({ changed: false, repaired: [] })
+      expect(installMcp('claude')).toMatchObject({ ok: false, reason: 'isolated-instance' })
+      expect(uninstallMcp('claude')).toMatchObject({ ok: false, reason: 'isolated-instance' })
+      expect(fs.readFileSync(claudeJson(), 'utf8')).toBe(stale)
+      expect(fs.existsSync(`${claudeJson()}.nomi-backup`)).toBe(false)
+    })
+
+    it('still writes when the walkthrough also moved HOME to a throwaway directory', () => {
+      isPackaged = true
+      // 「真实主目录」显式给一个和临时 HOME 不重叠的位置：本机真值在 Windows 上恰好是临时目录的祖先
+      // （C:\Users\<名>\AppData\Local\Temp 在 C:\Users\<名> 下面），用真值会把临时 HOME 误判成真实主目录。
+      realHome = path.join(path.dirname(homeDir), 'unrelated-real-home')
+      vi.stubEnv("NOMI_E2E", '1') // 临时 HOME 不在真实主目录下面 → 写的是临时文件，无害
+      fs.writeFileSync(claudeJson(), stale)
+      expect(repairStaleMcpConfigs().changed).toBe(true)
+      expect(installMcp('claude').ok).toBe(true)
+    })
+  })
+
+  // R5.5（2026-10-24）：宿主自己的配置位置变量。设了它，宿主只读那个位置——Nomi 写到主目录等于没接上；
+  // 隔离起的走查也正是因为不认它，才读到了真机的 ~/.claude.json。没设就照旧。
+  describe('reads and writes where the host itself looks (CLAUDE_CONFIG_DIR / CODEX_HOME)', () => {
+    function hostVarDir(name: string): string {
+      const dir = path.join(homeDir, 'elsewhere', name)
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(path.join(dir, 'installed-marker'), '1') // 宿主在那个目录里真用过（痕迹要非空）
+      return dir
+    }
+
+    it('Claude Code: install / read / uninstall all go to $CLAUDE_CONFIG_DIR/.claude.json, and ~/.claude.json is never touched', () => {
+      const dir = hostVarDir('claude')
+      vi.stubEnv('CLAUDE_CONFIG_DIR', dir)
+      const target = path.join(dir, '.claude.json')
+      expect(readMcpInfo(0).clients.claude).toMatchObject({ configPath: target, installed: false, appInstalled: true })
+      expect(installMcp('claude').ok).toBe(true)
+      expect(JSON.parse(fs.readFileSync(target, 'utf8')).mcpServers.nomi).toBeTruthy()
+      expect(fs.existsSync(claudeJson())).toBe(false)
+      expect(readMcpInfo(0).clients.claude.installed).toBe(true)
+      uninstallMcp('claude')
+      expect(JSON.parse(fs.readFileSync(target, 'utf8')).mcpServers?.nomi).toBeUndefined()
+      expect(fs.existsSync(claudeJson())).toBe(false)
+    })
+
+    it('Codex: install / read go to $CODEX_HOME/config.toml, and ~/.codex/config.toml is never touched', () => {
+      const dir = hostVarDir('codex')
+      vi.stubEnv('CODEX_HOME', dir)
+      const target = path.join(dir, 'config.toml')
+      expect(installMcp('codex').ok).toBe(true)
+      expect(fs.readFileSync(target, 'utf8')).toContain('[mcp_servers.nomi]')
+      expect(fs.existsSync(path.join(homeDir, '.codex', 'config.toml'))).toBe(false)
+      expect(readMcpInfo(0).clients.codex).toMatchObject({ configPath: target, installed: true })
+    })
+
+    it('a Nomi entry in the default file does not count once the host has moved its config elsewhere', () => {
+      installMcp('claude') // 主目录那份（没设变量时写的）
+      expect(readMcpInfo(0).clients.claude.installed).toBe(true)
+      vi.stubEnv('CLAUDE_CONFIG_DIR', hostVarDir('claude'))
+      expect(readMcpInfo(0).clients.claude.installed).toBe(false) // 宿主现在读的是另一份：如实说没接上
+    })
+
+    it('unset or empty: exactly the old locations', () => {
+      for (const value of [undefined, '']) {
+        vi.stubEnv('CLAUDE_CONFIG_DIR', value)
+        vi.stubEnv('CODEX_HOME', value)
+        expect(readMcpInfo(0).clients.claude.configPath).toBe(claudeJson())
+        expect(readMcpInfo(0).clients.codex.configPath).toBe(path.join(homeDir, '.codex', 'config.toml'))
+      }
+    })
+  })
+
+  it('reports a config whose NOMI_SETTINGS_DIR points at a deleted profile as launcher-broken, and repairs it at boot', () => {
+    isPackaged = true
+    installMcp('claude')
+    const written = JSON.parse(fs.readFileSync(claudeJson(), 'utf8'))
+    expect(readMcpInfo(0).clients.claude.configState).toBe('current')
+    // 同一台机器上另一个（已删除的）隔离实例写过的样子：命令、签名全对，只有 profile 指错了。
+    written.mcpServers.nomi.env.NOMI_SETTINGS_DIR = path.join(homeDir, 'gone-profile')
+    fs.writeFileSync(claudeJson(), JSON.stringify(written, null, 2))
+    expect(readMcpInfo(0).clients.claude.configState).toBe('launcher-broken')
+    expect(classifyMcpEntry('claude', written.mcpServers.nomi)).toBe('launcher-broken')
+    expect(repairStaleMcpConfigs()).toEqual({ changed: true, repaired: [{ client: 'claude', label: 'Claude Code', from: 'launcher-broken' }] })
+    expect(JSON.parse(fs.readFileSync(claudeJson(), 'utf8')).mcpServers.nomi.env.NOMI_SETTINGS_DIR).toBe(homeDir)
+    expect(readMcpInfo(0).clients.claude.configState).toBe('current')
+  })
+
+  it('refuses to overwrite an existing host config that is not parseable JSON', () => {
+    fs.writeFileSync(claudeJson(), '{ "oauthAccount": { truncated')
+    expect(installMcp('claude')).toMatchObject({ ok: false, reason: 'config-unreadable' })
+    expect(uninstallMcp('claude')).toMatchObject({ ok: false, reason: 'config-unreadable' })
+    expect(fs.readFileSync(claudeJson(), 'utf8')).toBe('{ "oauthAccount": { truncated')
+    expect(fs.existsSync(`${claudeJson()}.nomi-backup`)).toBe(false)
+  })
+
+  it('does not fall back to Claude Code for an unknown client key', () => {
+    expect(installMcp('claud')).toMatchObject({ ok: false, reason: 'unknown-client' })
+    expect(uninstallMcp('claud')).toMatchObject({ ok: false, reason: 'unknown-client' })
+    expect(fs.existsSync(claudeJson())).toBe(false)
+  })
+
+  it('does not write, nor create directories for, a client that is not installed on this machine', () => {
+    expect(readMcpInfo(0).clients.cursor.appInstalled).toBe(false)
+    expect(installMcp('cursor')).toMatchObject({ ok: false, reason: 'client-not-installed' })
+    expect(fs.existsSync(path.join(homeDir, '.cursor'))).toBe(false)
+  })
+
+  it('lists exactly the registry clients available on this platform, in registry order', () => {
+    const expected = BUILTIN_MCP_CLIENTS.filter((key) => key !== 'claude-desktop' || process.platform !== 'linux')
+    expect(Object.keys(readMcpInfo(0).clients)).toEqual(expected)
+    expect(Object.keys(readMcpInfo(0).clients)).not.toContain('pi')
+  })
+
+  it.runIf(process.platform === 'darwin')('claude-desktop：writes the official claude_desktop_config.json under Application Support', () => {
+    const dir = path.join(homeDir, 'Library', 'Application Support', 'Claude')
+    expect(readMcpInfo(0).clients['claude-desktop'].appInstalled).toBe(false)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'claude_desktop_config.json'), JSON.stringify({ mcpServers: { filesystem: { command: 'npx' } } }))
+    expect(readMcpInfo(0).clients['claude-desktop'].appInstalled).toBe(true)
+    expect(installMcp('claude-desktop').ok).toBe(true)
+    const after = JSON.parse(fs.readFileSync(path.join(dir, 'claude_desktop_config.json'), 'utf8'))
+    expect(after.mcpServers.filesystem).toEqual({ command: 'npx' })
+    expect(verifyMcpClient(after.mcpServers.nomi.env[MCP_CLIENT_ENV], after.mcpServers.nomi.env[MCP_CLIENT_PROOF_ENV])).toBe('claude-desktop')
+  })
+
+  it('leaves a config Nomi did not write alone at boot', () => {
+    isPackaged = true
+    const original = JSON.stringify({ mcpServers: { nomi: { command: 'custom-nomi-proxy', args: ['serve'] } } }, null, 2)
+    fs.writeFileSync(claudeJson(), original)
+
+    expect(repairStaleMcpConfigs()).toEqual({ changed: false, repaired: [] })
+    expect(fs.readFileSync(claudeJson(), 'utf8')).toBe(original)
+    expect(fs.existsSync(`${claudeJson()}.nomi-backup`)).toBe(false)
+  })
+
+  it('does not claim a custom proxy merely because it forwards the old Nomi env marker', () => {
+    isPackaged = true
+    const original = JSON.stringify({
+      mcpServers: {
+        nomi: { command: 'custom-nomi-proxy', args: ['serve'], env: { NOMI_MCP_STDIO: '1' } },
+      },
+    }, null, 2)
+    fs.writeFileSync(claudeJson(), original)
+
+    const info = readMcpInfo(0)
+    expect(info.clients.claude).toMatchObject({ configState: 'custom' })
+    expect(repairStaleMcpConfigs()).toEqual({ changed: false, repaired: [] })
+    expect(fs.readFileSync(claudeJson(), 'utf8')).toBe(original)
+  })
+})
+
+describe('custom MCP client profiles', () => {
+  it('registers a new custom profile and lists it', () => {
+    const configuredPath = path.join(homeDir, 'sample-assistant', 'mcp.json')
+    fs.mkdirSync(path.dirname(configuredPath), { recursive: true })
+    const result = registerCustomMcpProfile({ key: 'sample-assistant', label: 'Sample Assistant', format: 'json', configPath: configuredPath })
+    expect(result).toMatchObject({ key: 'sample-assistant', label: 'Sample Assistant', isBuiltin: false, detected: false })
+    const profiles = listCustomMcpProfiles()
+    expect(profiles).toHaveLength(1)
+    expect(profiles[0]).toMatchObject({ key: 'sample-assistant', label: 'Sample Assistant' })
+  })
+
+  it('rejects registration of a builtin key', () => {
+    const result = registerCustomMcpProfile({ key: 'claude', label: 'My Claude', format: 'json', configPath: path.join(homeDir, 'mcp.json') })
+    expect(result).toBeNull()
+    expect(listCustomMcpProfiles()).toHaveLength(0)
+  })
+
+  it('removes a registered custom profile', () => {
+    const configuredPath = path.join(homeDir, 'wb.json')
+    registerCustomMcpProfile({ key: 'sample-assistant', label: 'Sample Assistant', format: 'json', configPath: configuredPath })
+    expect(listCustomMcpProfiles()).toHaveLength(1)
+    const removed = removeCustomMcpProfile('sample-assistant')
+    expect(removed).toBe(true)
+    expect(listCustomMcpProfiles()).toHaveLength(0)
+  })
+
+  it('does not remove a builtin client', () => {
+    const removed = removeCustomMcpProfile('claude')
+    expect(removed).toBe(false)
+  })
+
+  it('records a detected external client with a derived key and empty path', () => {
+    recordDetectedMcpClient('Sample Assistant')
+    const profiles = listCustomMcpProfiles()
+    expect(profiles).toHaveLength(1)
+    expect(profiles[0]).toMatchObject({ key: 'sample-assistant', label: 'Sample Assistant', detected: true, configPath: '' })
+  })
+
+  it('is idempotent for repeated detection of the same name', () => {
+    recordDetectedMcpClient('Sample Assistant')
+    recordDetectedMcpClient('Sample Assistant')
+    expect(listCustomMcpProfiles()).toHaveLength(1)
+  })
+
+  it('does not overwrite an already-registered profile with the same key on re-detection', () => {
+    const configuredPath = path.join(homeDir, 'wb.json')
+    registerCustomMcpProfile({ key: 'sample-assistant', label: 'Sample Assistant', format: 'json', configPath: configuredPath })
+    recordDetectedMcpClient('Sample Assistant')
+    const profiles = listCustomMcpProfiles()
+    expect(profiles).toHaveLength(1)
+    expect(profiles[0]).toMatchObject({ detected: false, configPath: configuredPath })
+  })
+
+  it('signs and verifies a custom client via HMAC (HMAC 安全模型未放松)', () => {
+    // 自定义客户端通过 signMcpClient 签名，proof 绑定到该 key，不能冒用其他 key。
+    const proof = signMcpClient('sample-assistant')
+    expect(proof).toBeTruthy()
+    expect(verifyMcpClient('sample-assistant', proof)).toBe('sample-assistant')
+    expect(verifyMcpClient('claude', proof)).toBeNull()
+    expect(verifyMcpClient('cursor', proof)).toBeNull()
+  })
+
+  it('rejects a detected client from registering over an existing profile', () => {
+    const configuredPath = path.join(homeDir, 'wb.json')
+    registerCustomMcpProfile({ key: 'sample-assistant', label: 'Sample Assistant', format: 'json', configPath: configuredPath })
+    // 再次检测同名工具，现有注册的 profile 应被保留，不被 detected=true 条目覆盖。
+    recordDetectedMcpClient('Sample Assistant')
+    const profiles = listCustomMcpProfiles()
+    expect(profiles).toHaveLength(1)
+    expect(profiles[0].detected).toBe(false)
+    expect(profiles[0].configPath).toBe(configuredPath)
+  })
+})

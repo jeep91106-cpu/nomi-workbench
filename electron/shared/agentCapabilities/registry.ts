@@ -1,0 +1,182 @@
+import { AGENT_ASK_CAPABILITY } from "./askUser";
+import { ASSET_READ_CAPABILITY } from "./assetRead";
+import { CANVAS_DELETE_CAPABILITY } from "./canvasDelete";
+import { CANVAS_READ_CAPABILITY } from "./canvasRead";
+import { CANVAS_WRITE_CAPABILITY } from "./canvasWrite";
+import { DIRECTOR_WRITE_CAPABILITY } from "./directorWrite";
+import { DOCUMENT_READ_CAPABILITY } from "./documentRead";
+import { DOCUMENT_WRITE_CAPABILITY } from "./documentWrite";
+import { EXPORT_READ_CAPABILITY, EXPORT_WRITE_CAPABILITY } from "./exportCapabilities";
+import { TIMELINE_READ_CAPABILITY } from "./timelineRead";
+import { TIMELINE_WRITE_CAPABILITY } from "./timelineWrite";
+import { LAYOUT_READ_CAPABILITY, LAYOUT_WRITE_CAPABILITY } from "./layout";
+import {
+  GENERATION_CONTEXT_READ_CAPABILITY,
+  GENERATION_PLAN_CAPABILITY,
+  GENERATION_RESOLVE_CAPABILITY,
+  GENERATION_GATE_CAPABILITY,
+  GENERATION_RUN_READ_CAPABILITY,
+  GENERATION_CONTROL_CAPABILITY,
+} from "./generation";
+import { MODEL_ONBOARDING_REMOVE_CAPABILITY, MODEL_ONBOARDING_SETUP_CAPABILITY, MODEL_ONBOARDING_TRY_CAPABILITY } from "./modelOnboarding";
+import { MODEL_SETUP_OPEN_CAPABILITY } from "./modelSetup";
+import {
+  PRODUCTION_ARTIFACT_WRITE_CAPABILITY,
+  PRODUCTION_RUN_READ_CAPABILITY,
+  PRODUCTION_RUN_WRITE_CAPABILITY,
+} from "./productionRun";
+import { SKILL_WRITE_CAPABILITY } from "./skillWrite";
+import { SKILL_READ_CAPABILITY } from "./skillRead";
+import { MCP_READ_TOOL_NAME } from "./mcpTransportNames";
+import type { CapabilityContract, CapabilityEffectClass, CapabilityProjectionSurface } from "./capabilityContract";
+
+type AnyCapabilityContract = CapabilityContract<unknown, unknown>;
+type ContractOnly<Contract extends AnyCapabilityContract> =
+  Exclude<keyof Contract, keyof AnyCapabilityContract> extends never ? Contract : never;
+export type ContractOnlyRegistry<Contracts extends readonly AnyCapabilityContract[]> = {
+  readonly [Index in keyof Contracts]: Contracts[Index] extends AnyCapabilityContract
+    ? ContractOnly<Contracts[Index]>
+    : never;
+};
+
+const REGISTERED_CONTRACTS = [
+  AGENT_ASK_CAPABILITY,
+  ASSET_READ_CAPABILITY,
+  CANVAS_DELETE_CAPABILITY,
+  CANVAS_READ_CAPABILITY,
+  CANVAS_WRITE_CAPABILITY,
+  DOCUMENT_READ_CAPABILITY,
+  DOCUMENT_WRITE_CAPABILITY,
+  EXPORT_READ_CAPABILITY,
+  EXPORT_WRITE_CAPABILITY,
+  TIMELINE_READ_CAPABILITY,
+  TIMELINE_WRITE_CAPABILITY,
+  LAYOUT_READ_CAPABILITY,
+  LAYOUT_WRITE_CAPABILITY,
+  PRODUCTION_RUN_READ_CAPABILITY,
+  PRODUCTION_RUN_WRITE_CAPABILITY,
+  PRODUCTION_ARTIFACT_WRITE_CAPABILITY,
+  SKILL_READ_CAPABILITY,
+  SKILL_WRITE_CAPABILITY,
+  GENERATION_CONTEXT_READ_CAPABILITY,
+  GENERATION_PLAN_CAPABILITY,
+  GENERATION_RESOLVE_CAPABILITY,
+  GENERATION_GATE_CAPABILITY,
+  GENERATION_RUN_READ_CAPABILITY,
+  GENERATION_CONTROL_CAPABILITY,
+  MODEL_SETUP_OPEN_CAPABILITY,
+  MODEL_ONBOARDING_SETUP_CAPABILITY,
+  MODEL_ONBOARDING_TRY_CAPABILITY,
+  MODEL_ONBOARDING_REMOVE_CAPABILITY,
+] as const satisfies readonly CapabilityContract<unknown, unknown>[];
+
+/** 全部契约。`director.write`（3D-BOX `stage_shot` 的仅内部契约）2026-10-16 起常驻（开关随切换删除）。 */
+export const CAPABILITY_CONTRACTS = [...REGISTERED_CONTRACTS, DIRECTOR_WRITE_CAPABILITY] as const satisfies readonly CapabilityContract<unknown, unknown>[];
+
+/**
+ * 对外 `tools/list` 上的全部工具名：契约自己声明的 `aliases.mcp`，加上不挂契约的那几个
+ * （`nomi_read` 是收编 10 个读工具后的统一读入口）。
+ *
+ * 动词装配期用它判「说明书里点名的工具存在吗」（`assembleVerbDeclarations` 的 `mcpToolNames`）。
+ * 生产装配与它的阳性对照测试读的是**同一个函数**——这段以前在两处各抄了一遍同样的
+ * cast + flatMap（Ponytail 2026-09-18）。
+ */
+export function mcpToolNames(): readonly string[] {
+  const fromContracts = (CAPABILITY_CONTRACTS as readonly { aliases: { mcp?: string } }[])
+    .flatMap((contract) => (contract.aliases.mcp ? [contract.aliases.mcp] : []));
+  return Object.freeze([...fromContracts, MCP_READ_TOOL_NAME]);
+}
+
+function aliasEntriesFor<Contract extends AnyCapabilityContract>(contract: Contract) {
+  const contractView: AnyCapabilityContract = contract;
+  return Object.entries(contractView.aliases).flatMap(([surface, alias]) => {
+    if (!alias) return [];
+    const additional = contractView.additionalAliases?.[surface as CapabilityProjectionSurface] ?? [];
+    return [
+      { contract, surface, alias },
+      ...additional.map((additionalAlias) => ({ contract, surface, alias: additionalAlias })),
+    ];
+  });
+}
+
+/**
+ * All public tool aliases are derived from the canonical registry, including
+ * per-surface operation aliases.
+ */
+export const CAPABILITY_ALIAS_ENTRIES = Object.freeze([...CAPABILITY_CONTRACTS.flatMap(aliasEntriesFor)]);
+
+export function resolveCapabilityAlias(
+  alias: string,
+): Readonly<{ contract: (typeof CAPABILITY_CONTRACTS)[number]; surface: string; alias: string }> | undefined {
+  return CAPABILITY_ALIAS_ENTRIES.find((entry) => entry.alias === alias);
+}
+
+/**
+ * Look a contract up by its canonical id.
+ *
+ * The alias table answers "which capability is this *name*", which is the right
+ * question for a surface whose tool names are the capability aliases. The Agent
+ * lane is not such a surface: its tool names (`nomi_storyboard_write`) are that
+ * surface's own projection of a capability, so it carries the contract id and
+ * looks the contract up here. One registry, two ways in — not two registries.
+ */
+export function capabilityContractById(contractId: string): AnyCapabilityContract | undefined {
+  return CAPABILITY_CONTRACTS.find((contract) => contract.id === contractId);
+}
+
+/** Review facts belong to the capability and operation, independently of a model-facing tool name. */
+export function capabilityPlanReviewOf(contract: AnyCapabilityContract | undefined, args?: unknown): Readonly<{
+  requiresPlanReview: boolean;
+  planReviewAllowsReuse: boolean;
+}> {
+  const operation = args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>).operation : undefined;
+  const review = typeof operation === "string" ? contract?.operationPlanReview?.[operation] : undefined;
+  // 契约既声明整体复审、又给了按 operation 的表时，认得出的 operation 只听表（表外的不复审，例如撤销）；
+  // 认不出 operation 才退回整体那一条（fail-closed）。只给表、不声明整体的契约（canvas.write）行为不变。
+  const operationKnown = typeof operation === "string" && contract?.operationPlanReview !== undefined
+    && (contract.aliases.method === operation || (contract.additionalAliases?.method ?? []).includes(operation)
+      || (contract.operationEffectClasses !== undefined && operation in contract.operationEffectClasses));
+  const requiresPlanReview = review !== undefined || (contract?.requiresPlanReview === true && !operationKnown);
+  return { requiresPlanReview, planReviewAllowsReuse: review?.allowReuse ?? true };
+}
+
+/** The single place that reads a contract's effect class, honouring its per-operation map. */
+export function capabilityEffectClassOf(
+  contract: AnyCapabilityContract | undefined,
+  args?: unknown,
+): CapabilityEffectClass | undefined {
+  if (!contract) return undefined;
+  const operation = args && typeof args === "object" && !Array.isArray(args)
+    ? (args as Record<string, unknown>).operation
+    : undefined;
+  if (typeof operation === "string") {
+    return contract.operationEffectClasses
+      ? contract.operationEffectClasses[operation]
+      : contract.effectClass;
+  }
+  return contract.effectClass;
+}
+
+export function capabilityAliasesFor(contractId: string, surface: string): readonly string[] {
+  return Object.freeze(
+    CAPABILITY_ALIAS_ENTRIES.filter((entry) => {
+      const primaryAliases = new Set<string>(Object.values(entry.contract.aliases));
+      return entry.contract.id === contractId && entry.surface === surface && primaryAliases.has(entry.alias);
+    }).map((entry) => entry.alias),
+  );
+}
+
+export function capabilityOperationAliasesFor(contractId: string, surface: string): readonly string[] {
+  return Object.freeze(
+    CAPABILITY_ALIAS_ENTRIES.filter((entry) => {
+      const primaryAliases = new Set<string>(Object.values(entry.contract.aliases));
+      return entry.contract.id === contractId && entry.surface === surface && !primaryAliases.has(entry.alias);
+    }).map((entry) => entry.alias),
+  );
+}
+
+/** Presentation capability, not permission to skip approval. Actual undo also needs a live receipt. */
+export function capabilitySupportsUndo(name: string, args?: unknown): boolean {
+  const contract: AnyCapabilityContract | undefined = resolveCapabilityAlias(name)?.contract ?? capabilityContractById(name);
+  return contract?.undoable ?? (contract?.effect === "reversible_write" && capabilityEffectClassOf(contract, args) === "reversible_local");
+}

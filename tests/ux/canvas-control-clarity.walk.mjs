@@ -1,0 +1,429 @@
+import { makeTempDir } from '../../scripts/_test-temp.mjs'
+// 生成画布控件辨识与比例连续性 R13 走查。
+//
+// 真 Electron + 真构建产物，隔离 userData / projects，不触发任何生成请求（零额度）。
+// 验证：左缘 5 常驻 + 「更多」两段（2026-09-06 第三档）、15 档比例与多供应商始终显式分段、自动比例本地化、面积守恒、
+//       composer/触发器/浮层不漂移、1–4 张显式选择、任务/辅助/配置/主动作分组，以及深浅色与紧凑宽度截图。
+//
+// 用法：pnpm run build && node tests/ux/canvas-control-clarity.walk.mjs
+import { launchNomiApp } from './_launchApp.mjs'
+import { mkdirSync, mkdtempSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { expectAbsent, expectVisible, proveProbe, screenshotSettled } from './_assert.mjs'
+import { canvasAddBar, canvasAddMoreMenu, newProjectEntry } from './_shell.mjs'
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+const shotsDir = path.join(repoRoot, 'tests/ux/shots/canvas-control-clarity')
+const tempRoot = makeTempDir('nomi-canvas-control-clarity-')
+const userDataDir = path.join(tempRoot, 'user-data')
+const projectsDir = path.join(tempRoot, 'projects')
+mkdirSync(projectsDir, { recursive: true })
+mkdirSync(shotsDir, { recursive: true })
+
+const { app, win: _initialWin } = await launchNomiApp({
+  name: 'canvas-control-clarity',
+  userDataDir,
+  settingsDir: userDataDir,
+  projectsDir,
+  syntheticCredentialStorage: true,
+  args: ['--no-proxy-server'],
+  settleMs: 0,
+})
+
+let passed = 0
+function assert(condition, label, detail = '') {
+  if (!condition) throw new Error(`WALK FAIL: ${label}${detail ? ` — ${detail}` : ''}`)
+  passed += 1
+  console.log(`  ✓ ${label}${detail ? ` — ${detail}` : ''}`)
+}
+
+function closeEnough(a, b, tolerance = 1) {
+  return Math.abs(a - b) <= tolerance
+}
+
+function stableBox(a, b, tolerance = 1) {
+  return ['x', 'y', 'width', 'height'].every((key) => closeEnough(a[key], b[key], tolerance))
+}
+
+function roundedBox(box) {
+  return Object.fromEntries(Object.entries(box).map(([key, value]) => [key, Math.round(value * 10) / 10]))
+}
+
+let win = _initialWin
+const getWin = () => {
+  const live = app.windows().filter((candidate) => !candidate.isClosed())
+  win = live.find((candidate) => /projectId=/.test(candidate.url())) || live[live.length - 1] || win
+  return win
+}
+
+async function resize(width, height) {
+  const browserWindow = await app.browserWindow(getWin())
+  await browserWindow.evaluate(
+    (target, size) => {
+      target.setBounds({ x: 0, y: 0, width: size.width, height: size.height })
+      target.center()
+    },
+    { width, height },
+  )
+  await getWin().waitForTimeout(350)
+}
+
+async function snap(name, locator) {
+  const file = path.join(shotsDir, name)
+  if (locator) await screenshotSettled(locator, { path: file })
+  else await screenshotSettled(getWin(), { path: file })
+  console.log(`  · 截图 ${name}`)
+  return file
+}
+
+async function dismissFirstRun() {
+  for (let index = 0; index < 6; index += 1) {
+    const action = getWin().locator('button, [role="button"], a', { hasText: /跳过|完成|知道了|开始创作|稍后/ }).first()
+    if (await action.isVisible().catch(() => false)) await action.click({ timeout: 900 }).catch(() => {})
+    await getWin().keyboard.press('Escape').catch(() => {})
+    await getWin().waitForTimeout(180)
+  }
+}
+
+async function ensureGenerationWorkspace() {
+  const generation = getWin().getByRole('button', { name: '生成', exact: true }).first()
+  await generation.waitFor({ timeout: 8000 })
+  await generation.click()
+  await canvasAddBar(getWin()).waitFor()
+}
+
+async function ensureParameterPanel(composer) {
+  let trigger = composer.getByRole('button', { name: '生成参数', exact: true }).first()
+  if (!(await trigger.isVisible().catch(() => false))) {
+    const model = composer.getByRole('button', { name: '模型', exact: true }).first()
+    assert(await model.isVisible().catch(() => false), '图像节点存在模型选择器')
+    await model.click()
+    const firstOption = getWin().getByRole('option').first()
+    await firstOption.waitFor({ timeout: 5000 })
+    await firstOption.click()
+    await getWin().waitForTimeout(500)
+    trigger = composer.getByRole('button', { name: '生成参数', exact: true }).first()
+  }
+  await trigger.waitFor({ timeout: 5000 })
+  const hitTest = await trigger.evaluate((element) => {
+    const box = (rect) => ({
+      x: Math.round(rect.x * 10) / 10,
+      y: Math.round(rect.y * 10) / 10,
+      width: Math.round(rect.width * 10) / 10,
+      height: Math.round(rect.height * 10) / 10,
+    })
+    const rect = element.getBoundingClientRect()
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+    const composer = element.closest('.generation-canvas-v2-node__composer')
+    const card = composer?.querySelector('.generation-canvas-v2-node__composer-card')
+    const nodeEl = composer?.parentElement
+    const viewportEl = document.querySelector('.react-flow__viewport')
+    const cardRect = card?.getBoundingClientRect()
+    const nodeRect = nodeEl?.getBoundingClientRect()
+    // 画布缩放读 React Flow 视口自己的 transform（DOMMatrix.a），与 node-composer-placement.walk.mjs 同一口径。
+    const zoom = viewportEl ? new DOMMatrixReadOnly(getComputedStyle(viewportEl).transform).a : 1
+    const handle = document.querySelector('[data-timeline-strip]')
+    const handleRect = handle?.getBoundingClientRect()
+    const overlapWidth = handleRect ? Math.min(rect.right, handleRect.right) - Math.max(rect.left, handleRect.left) : 0
+    const overlapHeight = handleRect ? Math.min(rect.bottom, handleRect.bottom) - Math.max(rect.top, handleRect.top) : 0
+    return {
+      clear: hit === element || Boolean(hit && element.contains(hit)),
+      overlapsTimeline: overlapWidth > 0 && overlapHeight > 0,
+      // 2026-09-25 起浮框钉在节点正下方（composerCanvasPlacement.ts）：顶边 = 节点底边 + 14×缩放、
+      // 中线 = 节点中线、屏幕宽恒 560；不再翻到上方、不再 clamp 进视口，所以这里不再量「在舞台内」。
+      pinned: Boolean(cardRect && nodeRect
+        && Math.abs(cardRect.top - (nodeRect.bottom + 14 * zoom)) <= 2
+        && Math.abs((cardRect.left + cardRect.right) / 2 - (nodeRect.left + nodeRect.right) / 2) <= 2
+        && Math.abs(cardRect.width - 560) <= 1),
+      card: cardRect ? box(cardRect) : null,
+      node: nodeRect ? box(nodeRect) : null,
+      zoom,
+      workspaceFound: Boolean(composer?.closest('.workbench-generation__canvas')),
+      trigger: box(rect),
+      handle: handleRect ? box(handleRect) : null,
+      hitLabel: hit?.getAttribute('aria-label') || hit?.textContent?.trim().slice(0, 24) || hit?.tagName || 'none',
+    }
+  })
+  assert(hitTest.clear, '生成参数按钮不被底部时间轴遮挡', JSON.stringify(hitTest))
+  assert(!hitTest.overlapsTimeline, '生成参数按钮与底部时间轴没有视觉重叠', JSON.stringify(hitTest))
+  assert(hitTest.pinned, '新建节点的编辑框钉在节点正下方（顶边 = 节点底边 + 14×缩放、中线对齐、宽 560）', JSON.stringify(hitTest))
+  await trigger.click()
+  const panel = getWin().getByRole('group', { name: '生成参数面板', exact: true }).first()
+  await panel.waitFor({ timeout: 5000 })
+  return { trigger, panel }
+}
+
+async function selectRatio(panel, ratio) {
+  const segmented = panel.getByRole('radiogroup', { name: '比例', exact: true }).first()
+  await expectVisible(segmented, '比例必须保持显式分段，不随模型选项数量变成下拉')
+  await segmented.getByRole('radio', { name: ratio, exact: true }).click()
+}
+
+const pageErrors = []
+getWin().on('pageerror', (error) => pageErrors.push(String(error)))
+
+try {
+  await getWin().waitForLoadState('domcontentloaded')
+  await getWin().waitForTimeout(1700)
+  await getWin().evaluate(() => {
+    localStorage.setItem('__nomiE2E', '1')
+    localStorage.setItem('nomi-color-scheme', 'dark')
+    for (const key of ['nomi:splash:v1', 'nomi:journey-tour:v1', 'nomi:canvas-gesture-hint:v1']) {
+      localStorage.setItem(key, 'seen')
+    }
+  })
+  await getWin().reload()
+  await getWin().waitForLoadState('domcontentloaded')
+  await getWin().waitForTimeout(1800)
+  await resize(1600, 1000)
+  await dismissFirstRun()
+
+  // 两家（kie + fal：都是「首次使用才验」的内置家，存 key 不发验证请求；apimart 有凭据探测端点，占位 key 会被拒）都只写占位 key：让同一个 Nano Banana 2 出现 15 档比例 + 多供应商选择；全程不点生成。
+  const keyStatuses = await getWin().evaluate(() => Promise.all([
+    window.nomiDesktop?.modelCatalog?.upsertVendorApiKey('kie', { apiKey: 'nomi-e2e-placeholder', enabled: true }),
+    window.nomiDesktop?.modelCatalog?.upsertVendorApiKey('fal', { apiKey: 'nomi-e2e-placeholder', enabled: true }),
+  ]))
+  assert(keyStatuses.every((status) => Boolean(status?.hasApiKey)), '隔离模型目录已启用两家图像供应商（不发生成请求）')
+  await getWin().reload()
+  await getWin().waitForLoadState('domcontentloaded')
+  await getWin().waitForTimeout(1500)
+  await dismissFirstRun()
+
+  const blankProject = newProjectEntry(getWin())
+  await blankProject.waitFor({ timeout: 8000 })
+  await blankProject.click()
+  await getWin().waitForTimeout(2200)
+  await dismissFirstRun()
+  await resize(1600, 1000)
+  await ensureGenerationWorkspace()
+  await expectVisible(getWin().locator('.react-flow').first(), '生产生成画布必须挂载 React Flow renderer')
+
+  // ① 左侧栏（2026-09-06 第三档）：**5 个常驻 + 一个「更多」**，常驻每颗悬浮名称完整；
+  //    收起去的 5 个必须在「更多」里、且每段有名字。原来那条「9 个平铺」的断言随设计一起退役
+  //    （P1：不留两套期望）——它当时钉的是「没有省略号」，现在钉的是「收纳之后仍然找得到」。
+  const toolbar = canvasAddBar(getWin())
+  const residentTools = [
+    ['image', '图片节点'],
+    ['video', '视频节点'],
+    ['audio', '声音节点'],
+    ['text', '文字节点'],
+    ['clip', '剪辑节点'],
+  ]
+  const moreTools = [
+    ['director', '导演台'],
+    ['model3d', '3D 模型'],
+    ['panorama', '全景图'],
+    ['whiteboard', '画板'],
+  ]
+  const residentButtons = toolbar.locator('[data-add-intent]')
+  assert(
+    (await residentButtons.count()) === residentTools.length + 1,
+    '左侧常驻恰好 6 个（五种生成 + 导入；09-10 起文字回到常驻）',
+    `实测 ${await residentButtons.count()} 个`,
+  )
+  for (const [kind, tooltipText] of residentTools) {
+    const button = toolbar.locator(`[data-add-intent="${kind}"]`)
+    assert(await button.isVisible(), `${tooltipText}常驻入口可见`)
+    await button.focus()
+    const tooltip = getWin().locator('[role="tooltip"]', { hasText: tooltipText }).last()
+    await tooltip.waitFor({ timeout: 2400 })
+    assert((await tooltip.textContent())?.trim() === tooltipText, `${tooltipText}悬浮/聚焦名称正确`)
+  }
+  const importButton = toolbar.locator('[data-add-intent="import-file"]')
+  assert(await importButton.isVisible(), '导入入口常驻可见')
+  assert(
+    (await importButton.getAttribute('aria-label')) === '导入文件',
+    '导入钮说得清按下去会发生什么',
+  )
+
+  // 「更多」：先展开、证明收进去的 4 个都在（这是基线），再收起来证明它们真的不占常驻位。
+  // 顺序不能反——没有基线的「没看到」和「探针根本没生效」在观测上一模一样。
+  const moreButton = toolbar.locator('[data-canvas-add-more="true"]')
+  await expectVisible(moreButton, '左侧栏底部必须有一颗「更多」')
+  await moreButton.click()
+  const moreMenu = canvasAddMoreMenu(getWin())
+  await expectVisible(moreMenu, '「更多」点开必须弹出菜单')
+  const moreProofs = []
+  for (const [kind, label] of moreTools) {
+    const item = moreMenu.locator(`[data-node-kind="${kind}"]`)
+    assert(await item.isVisible(), `「更多」里找得到${label}`)
+    assert((await item.textContent())?.includes(label), `「更多」里${label}写的是它自己的名字`)
+    moreProofs.push([kind, label, await proveProbe(toolbar.locator(`[data-node-kind="${kind}"]`), `展开时${label}在工具条里`)])
+  }
+  // §1.5.3「分段要有名字」：两段各自带名字，不是一条看不见的分隔线。
+  // 2026-10-08 Claude Design 拍板稿：「+」点开 = 「空间」一组（导演台 / 3D 模型 / 全景 / 白板），文字在常驻里，不再有「更多」那一段。
+  for (const sectionLabel of ['空间']) {
+    assert(
+      (await moreMenu.locator(`[role="group"][aria-label="${sectionLabel}"]`).count()) === 1,
+      `「更多」菜单里有名为「${sectionLabel}」的一段`,
+    )
+  }
+  await getWin().keyboard.press('Escape')
+  for (const [kind, label, proof] of moreProofs) {
+    await expectAbsent(toolbar.locator(`[data-node-kind="${kind}"]`), {
+      provenBy: proof,
+      message: `${label}收进了「更多」，收起后不再占常驻位`,
+    })
+    passed += 1
+    console.log(`  ✓ ${label}收起后不占常驻位（kind=${kind}）`)
+  }
+
+  // ② 新建图像节点并打开真实参数面板。
+  await toolbar.locator('[data-node-kind="image"]').click()
+  const node = getWin().locator('[data-kind="image"][data-selected="true"]').first()
+  const composer = getWin().locator('.generation-canvas-v2-node__composer-card').first()
+  await node.waitFor({ timeout: 5000 })
+  await composer.waitFor({ timeout: 5000 })
+  const modelSelect = composer.getByRole('button', { name: '模型', exact: true }).first()
+  await modelSelect.click()
+  const nanoBanana2 = getWin().getByRole('option').filter({ hasText: /^Nano Banana 2(?!\s*Lite)/ }).first()
+  await expectVisible(nanoBanana2, '模型目录必须提供跨供应商 Nano Banana 2')
+  await nanoBanana2.click()
+  await getWin().waitForTimeout(400)
+  const { trigger, panel } = await ensureParameterPanel(composer)
+  const ratioGroup = panel.getByRole('radiogroup', { name: '比例', exact: true }).first()
+  await expectVisible(ratioGroup, '15 档比例仍显示为图形分段组')
+  assert((await ratioGroup.getByRole('radio').count()) === 15, 'Nano Banana 2 的 15 档比例全部显式可见')
+  const automatic = ratioGroup.getByRole('radio', { name: '自动', exact: true }).first()
+  assert(await automatic.isVisible(), 'Auto 在中文界面显示为“自动”')
+  assert((await automatic.locator('svg').count()) === 1, '分段式自动比例项上方有自适应画幅图标')
+  assert((await ratioGroup.locator('[aria-hidden] span').count()) > 0, '比例分段保留可扫描的宽高形状')
+  const providerGroup = panel.getByRole('radiogroup', { name: '供应商', exact: true }).first()
+  await expectVisible(providerGroup, '多供应商选择保持显式分段组')
+  assert((await providerGroup.getByRole('radio').count()) >= 2, '同模型至少两家供应商并排可见')
+
+  const geometries = []
+  for (const ratio of ['1:1', '21:9', '9:16']) {
+    await selectRatio(panel, ratio)
+    await getWin().waitForTimeout(220)
+    const [nodeBox, composerBox, triggerBox, panelBox, nodeLayout] = await Promise.all([
+      node.boundingBox(),
+      composer.boundingBox(),
+      trigger.boundingBox(),
+      panel.boundingBox(),
+      node.evaluate((element) => ({ width: Number.parseFloat(element.style.width), height: Number.parseFloat(element.style.height) })),
+    ])
+    assert(Boolean(nodeBox && composerBox && triggerBox && panelBox), `${ratio} 四个几何对象均可测量`)
+    geometries.push({ ratio, node: nodeBox, nodeLayout, composer: composerBox, trigger: triggerBox, panel: panelBox })
+  }
+
+  const reference = geometries[0]
+  for (const current of geometries) {
+    const [widthPart, heightPart] = current.ratio.split(':').map(Number)
+    const targetRatio = widthPart / heightPart
+    const visualRatio = current.node.width / current.node.height
+    assert(Math.abs(visualRatio - targetRatio) < 0.025, `${current.ratio} 节点外形符合目标比例`, visualRatio.toFixed(3))
+    assert(stableBox(reference.composer, current.composer), `${current.ratio} 编辑框不漂移`, JSON.stringify(roundedBox(current.composer)))
+    assert(stableBox(reference.trigger, current.trigger), `${current.ratio} 比例触发器不漂移`)
+    assert(stableBox(reference.panel, current.panel), `${current.ratio} 已打开浮层不漂移`)
+  }
+  const areas = geometries.map((item) => item.node.width * item.node.height)
+  const areaSpread = (Math.max(...areas) - Math.min(...areas)) / areas[0]
+  const touchesInteractionMinimum = geometries.some(
+    (item) => item.nodeLayout.width <= 240.5 || item.nodeLayout.height <= 120.5,
+  )
+  const allowedSpread = touchesInteractionMinimum ? 0.1 : 0.035
+  assert(
+    areaSpread < allowedSpread,
+    '1:1 / 21:9 / 9:16 视觉面积近似守恒',
+    `spread=${(areaSpread * 100).toFixed(2)}%, min-bound=${touchesInteractionMinimum}`,
+  )
+  assert(Math.min(...areas) >= areas[0] * 0.965, '连续切换不会把节点越切越小')
+
+  // 浮框恒在节点正下方（2026-09-25 起不再翻到上方），间距只有一种量法：卡顶边 − 节点底边，应恒为 14×缩放。
+  const canvasZoom = await getWin().evaluate(() => {
+    const viewportEl = document.querySelector('.react-flow__viewport')
+    return viewportEl ? new DOMMatrixReadOnly(getComputedStyle(viewportEl).transform).a : 1
+  })
+  const resolvedGaps = geometries.map((item) => item.composer.y - (item.node.y + item.node.height))
+  assert(
+    resolvedGaps.every((gap) => closeEnough(gap, 14 * canvasZoom, 2)),
+    '节点与编辑框连接间距保持一致（恒为 14×缩放，浮框在节点下方）',
+    `gaps=${resolvedGaps.map((gap) => gap.toFixed(1)).join('/')} zoom=${canvasZoom.toFixed(2)}`,
+  )
+  await snap('02-dark-canvas-ratio-panel.png')
+
+  // ③ 生成数量是明确的 1–4 选择，不再循环跳数；3 个是真选项。
+  //    文案 2026-09-10 由「张」改为「个」：同一个计数件现在也管视频/音频/3D（反馈 #11），
+  //    「张」只对图片成立。
+  await getWin().keyboard.press('Escape')
+  const countSelect = composer.getByRole('button', { name: '每次生成几个', exact: true }).first()
+  await countSelect.click()
+  const countOptions = getWin().getByRole('option')
+  const labels = (await countOptions.allTextContents()).map((text) => text.trim())
+  assert(['1 个', '2 个', '3 个', '4 个'].every((label) => labels.includes(label)), '数量菜单明确包含 1、2、3、4 个')
+  await getWin().getByRole('option', { name: '3 个', exact: true }).click()
+  assert((await countSelect.textContent())?.includes('3 个'), '可直接选择 3 个并在触发器显示')
+
+  // ④ 40px 合一顶栏右簇（10-08 外壳重设计）：任务 · 浏览器 · 设置常驻；「去出片」「接入模型」「上手清单」已归位删除。
+  const actionGroups = await getWin().evaluate(() => ({
+    browser: Boolean(document.querySelector('[data-shell-topbar] [data-shell-browser]')),
+    settings: Boolean(document.querySelector('[data-shell-topbar] [data-shell-settings]')),
+    goToProduce: [...document.querySelectorAll('[data-shell-topbar] button')].some((button) => /去出片/.test(button.textContent || '')),
+    idleTaskVisible: Boolean(document.querySelector('[data-task-center-trigger="true"]')),
+  }))
+  assert(actionGroups.browser && actionGroups.settings, '浏览器与设置常驻顶栏右簇')
+  assert(!actionGroups.goToProduce, '「去出片」已删（预览页「导出 MP4」是唯一导出入口）')
+  assert(actionGroups.idleTaskVisible, '完全无任务历史时仍保留“任务”入口')
+
+  const nodeId = await node.getAttribute('data-node-id')
+  const queueReady = await getWin().evaluate(() => Boolean(window.__nomiQueueStore))
+  assert(queueReady && Boolean(nodeId), '任务走查桥与真实节点 ID 就绪')
+  await getWin().evaluate((id) => {
+    const queue = window.__nomiQueueStore
+    queue.setState({ entries: [], batches: {} })
+    const batch = queue.getState().enqueueBatch([[id, `${id}-second`]])
+    queue.getState().markRunning(batch, id)
+  }, nodeId)
+  await getWin().waitForTimeout(450)
+  const taskButton = getWin().locator('[data-task-center-trigger="true"]').first()
+  assert(await taskButton.isVisible(), '有任务时显示“任务”入口')
+  assert((await taskButton.textContent())?.replace(/\s+/g, '').includes('任务2'), '任务入口显示名称与待处理数量 2')
+
+  const darkTopbar = getWin().locator('[data-shell-topbar]').first()
+  await snap('01-dark-topbar.png', darkTopbar)
+
+  // ⑤ 紧凑宽度：文字折叠后仍有统一 styled tooltip，不出现无名图标。
+  await resize(1280, 820)
+  const settingsButton = getWin().getByRole('button', { name: '设置', exact: true }).first()
+  await settingsButton.focus()
+  const settingsTooltip = getWin().locator('[role="tooltip"]', { hasText: '设置' }).last()
+  await settingsTooltip.waitFor({ timeout: 1800 })
+  assert(await settingsTooltip.isVisible(), '紧凑宽度设置图标悬浮显示名称')
+  await snap('03-dark-compact-tooltip.png')
+
+  await taskButton.focus()
+  const taskTooltip = getWin().locator('[role="tooltip"]', { hasText: '任务' }).last()
+  await taskTooltip.waitFor({ timeout: 1800 })
+  assert(await taskTooltip.isVisible(), '紧凑宽度任务图标悬浮显示名称')
+
+  // ⑥ 浅色同一 DOM 结构复查。
+  await getWin().evaluate(() => localStorage.setItem('nomi-color-scheme', 'light'))
+  await getWin().reload()
+  await getWin().waitForLoadState('domcontentloaded')
+  await getWin().waitForTimeout(1700)
+  await resize(1600, 1000)
+  await ensureGenerationWorkspace()
+  const lightNode = getWin().locator(`[data-node-id="${nodeId}"]`).first()
+  if (await lightNode.isVisible().catch(() => false)) await lightNode.click()
+  await getWin().waitForTimeout(350)
+  await snap('04-light-canvas.png')
+  const resolvedTheme = await getWin().evaluate(() => document.documentElement.dataset.theme || document.documentElement.className)
+  assert(String(resolvedTheme).toLowerCase().includes('light'), '浅色模式真实生效', String(resolvedTheme))
+
+  assert(pageErrors.length === 0, '走查期间无渲染层异常', pageErrors.join(' | '))
+  console.log(`\nCANVAS CONTROL CLARITY WALK PASS: ${passed} assertions`)
+  console.log(`截图：${shotsDir}`)
+  await finish(0)
+} catch (error) {
+  console.error(`\n${error?.stack || error}`)
+  await snap('99-failure.png').catch(() => {})
+  await finish(1)
+}
+
+async function finish(code) {
+  await Promise.race([app.close().catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 3000))])
+  process.exit(code)
+}

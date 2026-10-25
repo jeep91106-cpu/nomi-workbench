@@ -1,0 +1,238 @@
+// ComfyUI 工作流设置整页的文案。
+// plan: docs/plan/2026-08-12-model-settings-home-and-comfyui-workflow-page.md
+//
+// 单独成命名空间（不塞 onboardingProviders）：那份已经 1400+ 行，且这页是自成一体的子系统——
+// 混进去以后「改这页的文案」要在一千多行里翻。
+export const zhComfyuiWorkflowPage = {
+  title: '工作流设置',
+  aria: 'ComfyUI 工作流设置',
+  back: '返回设置',
+  open: '工作流',
+  openAria: '打开「{{name}}」的工作流设置',
+  close: '关闭工作流设置',
+
+  backends: {
+    title: '后端',
+    addressAria: '{{name}} 的接入地址',
+    edit: '改地址',
+    save: '保存地址',
+    remove: '移除这台',
+    removeTitle: '移除这台 ComfyUI',
+    removeMessage: '确定移除「{{name}}」吗？它名下的 {{count}} 条工作流会一起删除——那些工作流指向的是这台的地址，留着是死的。',
+    offline: '连不上',
+    online: '已连上',
+    checking: '检查中',
+  },
+
+  workflows: {
+    title: '工作流',
+    empty: '这台还没有导入过工作流。',
+    emptyHint: '回设置里的 ComfyUI 卡，用「导入自定义工作流」粘贴 ComfyUI 保存的工作流 JSON。',
+    fieldCount: '{{count}} 个字段',
+    complete: '齐全',
+    missingNodes: '缺 {{count}} 个节点',
+    missingFiles: '缺 {{count}} 个模型：{{names}}',
+    offline: '这台没开，没法对账',
+    selectAria: '打开工作流「{{name}}」',
+    builtin: '内置',
+  },
+
+  header: {
+    nodeCount: '{{count}} 个节点',
+    exposedCount: '已暴露 {{count}} 个字段',
+    nameAria: '工作流名称',
+    namePlaceholder: '给这条工作流起个名',
+    save: '保存',
+    saving: '保存中',
+    unsaved: '有未保存的改动',
+    delete: '删除',
+    deleteTitle: '删除这条工作流',
+    deleteMessage: '确定删除「{{name}}」吗？画布上已经用它生成过的结果不受影响。',
+    noOutput: '还没指定成品节点——不知道从哪取结果，保存了也跑不出东西',
+  },
+
+  graph: {
+    aria: '工作流节点图',
+    edgesAria: '节点连线',
+    zoomIn: '放大',
+    zoomOut: '缩小',
+    fit: '适应',
+    showList: '节点列表',
+    showGraph: '节点图',
+    listAria: '完整节点列表',
+    empty: '这张图里没有节点。',
+    hint: '点节点指定它的角色，或把它的输入变成画布上的可调字段。',
+    exposedBadge: '{{count}} 已用',
+    exposedBadgeAria: '这个节点有 {{count}} 个输入是画布上的可调字段',
+    nodeAria: '节点 {{title}}，{{classType}} #{{id}}',
+    nodeRoleAria: '节点 {{title}}，{{classType}} #{{id}}，当前角色：{{role}}',
+    unbindableTitle: '这个节点没有可绑定的输入——它不接提示词/图片，也没有可调的标量参数',
+  },
+
+  roles: {
+    prompt: '提示词',
+    firstFrame: '首帧',
+    lastFrame: '尾帧',
+    sourceVideo: '源视频',
+    output: '成品',
+    none: '未指定',
+  },
+
+  menu: {
+    aria: '节点 #{{id}} 的角色与字段',
+    roleSection: '在画布上当',
+    roleEmpty: '这个节点没有可绑定的输入。',
+    fieldSection: '变成画布上的可调字段',
+    fieldEmpty: '这个节点没有可调的标量输入。',
+    clear: '取消',
+    close: '关闭菜单',
+    inputSuffix: '· {{key}}',
+  },
+
+  preview: {
+    title: '画布节点预览',
+    live: '实时',
+    empty: '画布上只会有一个「生成」钮——还没有任何输入被绑定或暴露。',
+    promptPlaceholder: '在画布上你会在这里打提示词',
+    mediaImage: '拖一张图进来',
+    mediaVideo: '拖一段视频进来',
+    mediaAudio: '拖一段音频进来',
+    mediaHint: '试跑不带素材，这个槽只是给你看画布上会有它',
+    fromNode: '来自 #{{id}}',
+    run: '运行测试',
+    running: '正在跑',
+    runHint: '会先保存，再拿你填的值真跑一次这台 ComfyUI。',
+    runNeedsOutput: '先指定成品节点——不知道从哪取结果',
+    runNeedsBackend: '这台 ComfyUI 连不上，先把它启动起来',
+    runNeedsFrame: '这条工作流绑了首帧/尾帧，没图跑不起来；试跑不带素材，去画布上连一张图再生成',
+    runNeedsMissing: '缺少 {{count}} 个模型文件：{{names}}',
+    runNeedsNodes: '缺少 {{count}} 个自定义节点，无法试跑',
+  },
+
+  errors: {
+    analyzeFailed: '这条工作流读不出来：{{error}}',
+    noDraft: '这条工作流没有存下原始 JSON，改不了绑定——重新导入一次即可。',
+    saveFailed: '保存失败：{{error}}',
+    deleteFailed: '删除失败：{{error}}',
+    unsupported: '当前版本不支持编辑工作流',
+  },
+} as const
+
+type TranslationShape<T> = {
+  [K in keyof T]: T[K] extends string ? string : TranslationShape<T[K]>
+}
+
+export const enComfyuiWorkflowPage = {
+  title: 'Workflow settings',
+  aria: 'ComfyUI workflow settings',
+  back: 'To Settings',
+  open: 'Workflow settings',
+  openAria: 'Open workflow settings for “{{name}}”',
+  close: 'Close workflow settings',
+
+  backends: {
+    title: 'Backends',
+    addressAria: 'Address for {{name}}',
+    edit: 'Edit address',
+    save: 'Save address',
+    remove: 'Remove this backend',
+    removeTitle: 'Remove this ComfyUI',
+    removeMessage: 'Remove “{{name}}”? Its {{count}} workflows are deleted with it — they point at this backend’s address, so they would be dead anyway.',
+    offline: 'Unreachable',
+    online: 'Connected',
+    checking: 'Checking',
+  },
+
+  workflows: {
+    title: 'Workflows',
+    empty: 'No workflows imported on this backend yet.',
+    emptyHint: 'Go back to the ComfyUI card in settings and paste a workflow JSON under “Import custom workflow”.',
+    fieldCount: '{{count}} fields',
+    complete: 'All present',
+    missingNodes: '{{count}} nodes missing',
+    missingFiles: '{{count}} models missing: {{names}}',
+    offline: 'Backend is down, cannot check',
+    selectAria: 'Open workflow “{{name}}”',
+    builtin: 'Built-in',
+  },
+
+  header: {
+    nodeCount: '{{count}} nodes',
+    exposedCount: '{{count}} fields exposed',
+    nameAria: 'Workflow name',
+    namePlaceholder: 'Name this workflow',
+    save: 'Save',
+    saving: 'Saving',
+    unsaved: 'Unsaved changes',
+    delete: 'Delete',
+    deleteTitle: 'Delete this workflow',
+    deleteMessage: 'Delete “{{name}}”? Results already generated with it on the canvas are unaffected.',
+    noOutput: 'No output node assigned yet — there is nowhere to read the result from',
+  },
+
+  graph: {
+    aria: 'Workflow node graph',
+    edgesAria: 'Node connections',
+    zoomIn: 'Zoom in',
+    zoomOut: 'Zoom out',
+    fit: 'Fit',
+    showList: 'Node List',
+    showGraph: 'Graph View',
+    listAria: 'Full node list',
+    empty: 'This graph has no nodes.',
+    hint: 'Click a node to assign its role, or expose one of its inputs as a canvas field.',
+    exposedBadge: '{{count}} in use',
+    exposedBadgeAria: 'This node has {{count}} inputs exposed as canvas fields',
+    nodeAria: 'Node {{title}}, {{classType}} #{{id}}',
+    nodeRoleAria: 'Node {{title}}, {{classType}} #{{id}}, current role: {{role}}',
+    unbindableTitle: 'This node has nothing to bind — it takes no prompt or image, and has no adjustable scalar input',
+  },
+
+  roles: {
+    prompt: 'Prompt',
+    firstFrame: 'First frame',
+    lastFrame: 'Last frame',
+    sourceVideo: 'Source video',
+    output: 'Output',
+    none: 'Unassigned',
+  },
+
+  menu: {
+    aria: 'Roles and fields for node #{{id}}',
+    roleSection: 'On the canvas, act as',
+    roleEmpty: 'This node has nothing to bind.',
+    fieldSection: 'Expose as a canvas field',
+    fieldEmpty: 'This node has no adjustable scalar input.',
+    clear: 'Clear',
+    close: 'Close menu',
+    inputSuffix: '· {{key}}',
+  },
+
+  preview: {
+    title: 'Canvas node preview',
+    live: 'live',
+    empty: 'The canvas node would show only a Generate button — nothing is bound or exposed yet.',
+    promptPlaceholder: 'On the canvas you type your prompt here',
+    mediaImage: 'Drop an image here',
+    mediaVideo: 'Drop a video here',
+    mediaAudio: 'Drop an audio file here',
+    mediaHint: 'Test runs go without media; this slot just shows you the canvas will have it',
+    fromNode: 'from #{{id}}',
+    run: 'Test run',
+    running: 'Running',
+    runHint: 'Saves first, then really runs this ComfyUI with the values you typed.',
+    runNeedsOutput: 'Assign an output node first — there is nowhere to read the result from',
+    runNeedsBackend: 'This ComfyUI is unreachable — start it first',
+    runNeedsFrame: 'This workflow binds a first/last frame and cannot run without one. Test runs carry no media — connect an image on the canvas instead.',
+    runNeedsMissing: 'This workflow is missing {{count}} model files: {{names}}',
+    runNeedsNodes: 'This workflow is missing {{count}} custom nodes and cannot run',
+  },
+
+  errors: {
+    analyzeFailed: 'This workflow could not be read: {{error}}',
+    noDraft: 'This workflow has no stored source JSON, so its bindings cannot be edited — re-import it once.',
+    saveFailed: 'Save failed: {{error}}',
+    deleteFailed: 'Delete failed: {{error}}',
+    unsupported: 'Editing workflows is unavailable in this version',
+  },
+} satisfies TranslationShape<typeof zhComfyuiWorkflowPage>

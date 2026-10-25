@@ -1,0 +1,157 @@
+// 交付1 · nomi_list_models 的「真话」派生（纯函数，输入 CatalogState → 输出逐模型清单，可零依赖单测）。
+//
+// 旧 listAvailableModels 只 filter(enabled) 就说「已接入且可用」——不验 key（kie 没配 key 也列为可用，
+// 调用它白白浪费一趟往返报「API key missing: kie」）、不说这个模型带不带得动参考。这里补两件真话：
+//   ① keyStatus：ok / missing / locked（复用 secrets.apiKeyDecryptStatus 的三态健康度，P1 不另写解密探测）；
+//   ② references：这个模型的 mapping body 到底带得动什么参考（复用 referenceReachability.bodyReferenceSupport，
+//      与第三闸/UI 收窄同源判据，P1 不另写一份），跨该模型所有 mapping 汇总，并记下「哪个 taskKind 模式能带」。
+// 已发布模型即使没 key 也照列并带状态；adapter staging/failed 新行则不进入生产清单。
+import { type ApiKeyDecryptStatus, type KeyStatusProbe } from "./secrets";
+import { bodyReferenceSupport, type BodyReferenceSupport } from "./referenceReachability";
+import type { ModelModeBody } from "./taskParams";
+import { type CatalogState, type Mapping, type ProfileKind } from "./types";
+import { modelHasPublishedExecution } from "../shared/modelPublication";
+import type { ModelAvailability } from "../shared/modelAvailability";
+import { createCatalogAvailability } from "./catalogModelAvailability";
+import { SINGLE_SHOT_GENERATION_MODULE_ID } from "../shared/generationModuleId";
+
+/** 一个模型跨其所有 mapping 汇总出的参考承载力 + 是哪些模式（taskKind）带得动。 */
+export type ModelReferenceSupport = BodyReferenceSupport & {
+  /** 携带参考的 taskKind 模式（如 image_to_video / image_edit）——供拒发建议/选型时点名"用哪个模式"。 */
+  referenceModes: ProfileKind[];
+};
+
+export type ModelListingEntry = {
+  vendor: string;
+  vendorName: string;
+  modelKey: string;
+  /**
+   * 生成写工具（nomi_operation_plan）要的 `{moduleId, providerId, modelId}` 三元组里的第一项。
+   * 修复前它**不出现在任何读工具的输出里**，外部宿主只能猜（探针猜了 `image`，plan 通过、preview 立刻回
+   * `Unknown module: image`）。`providerId` = 本行的 `vendor`、`modelId` = 本行的 `modelKey`，
+   * 三项现在都从这一行读得到 —— 写工具接受的东西，读工具认得。
+   */
+  moduleId: string;
+  kind: string;
+  label: string;
+  /** 这个模型此刻能不能真用：ok=key 在且解得开；missing=没配 key；locked=key 在但当前宿主身份解不开。 */
+  keyStatus: ApiKeyDecryptStatus;
+  /**
+   * 这个模型**此刻能不能真用**——全 App 唯一那条判据（供应商启用 + 模型启用 + 发布资格 + 钥匙解得开）
+   * 的结论，和 Nomi 自己界面里的下拉、首页横幅、设置页计数读的是同一个答案。
+   */
+  usable: boolean;
+  /** 一句人话状态（诚实敞口，D4）：可用就报可用；不可用各报缺口 + 该干什么。 */
+  statusReason: string;
+  /** 该模型带得动的参考类别 + 承载模式（无 mapping 或纯文生 → 全 false / 空）。 */
+  references: ModelReferenceSupport;
+};
+
+/**
+ * 一句人话状态（vendor 名插值，不 hardcode 任何 vendor）。
+ *
+ * 「可用」这两个字**只由可用性 owner 说了算**：钥匙好端端在那儿、模型却没走完认证（发布资格不成立）
+ * 时，旧实现照样答「已接入且可用」——外部助手据此转述给用户，而 Nomi 自己的下拉里一个都选不到
+ * （真实验收 P0-10）。所以先问 owner，钥匙三态只负责在「不可用」时说清是不是钥匙那一档。
+ */
+function statusReasonFor(keyStatus: ApiKeyDecryptStatus, vendorName: string, availability: ModelAvailability): string {
+  if (!availability.usable && availability.reason === "model_unpublished") {
+    return `${vendorName} 的这个模型还没走完接入认证，暂时不能调用；请在 Nomi 应用的模型接入里完成它的自检`;
+  }
+  if (!availability.usable && (availability.reason === "vendor_disabled" || availability.reason === "vendor_missing")) {
+    return `${vendorName} 这个连接当前未启用；请在 Nomi 应用的模型接入里重新启用`;
+  }
+  if (!availability.usable && availability.reason === "model_disabled") {
+    return `这个模型在 ${vendorName} 下被停用了；请在 Nomi 应用的模型接入里启用它`;
+  }
+  switch (keyStatus) {
+    case "ok":
+      return "已接入且可用";
+    case "locked":
+      return `${vendorName} 的 API Key 已保存但当前宿主身份解不开（多见于 MCP/命令行宿主与 Nomi 主程序加密身份不一致）；请在 Nomi 应用里重新保存该 Key，或让宿主以正确身份运行`;
+    case "needs_resave":
+      return `${vendorName} 的 API Key 来自旧版明文存储；请在 Nomi 应用里重新保存后再使用`;
+    case "missing":
+    default:
+      return `未配置 ${vendorName} 的 API Key；请先在 Nomi 应用的模型接入里填入`;
+  }
+}
+
+/**
+ * 这个模型能用到的所有 mapping（精确绑定该 modelKey 的 + generic 无 modelKey 的通用模板）。
+ * **单一真相源**：list_models 的参考承载力汇总与 runtime 的拒发建议（modelModeBodies）都用它，不各写一份（P1）。
+ */
+export function mappingsForModel(mappings: Mapping[], vendorKey: string, modelKey: string, modelAlias: string | null | undefined): Mapping[] {
+  return mappings.filter(
+    (m) =>
+      m.vendorKey === vendorKey &&
+      (m.modelKey === undefined || m.modelKey === "" || m.modelKey === modelKey || (modelAlias ? m.modelKey === modelAlias : false)),
+  );
+}
+
+/** 这个模型**所有启用模式**的 (taskKind, create body)——供 L3 拒发建议判"哪个模式带得动携带的参考"（交付4）。 */
+export function modelModeBodies(mappings: Mapping[], vendorKey: string, modelKey: string, modelAlias: string | null | undefined): ModelModeBody[] {
+  return mappingsForModel(mappings, vendorKey, modelKey, modelAlias)
+    .filter((m) => m.enabled)
+    .map((m) => ({ taskKind: m.taskKind, body: m.create?.body }));
+}
+
+/** 跨该模型所有 mapping 汇总参考承载力（任一 mapping 能发 = 能发；记下携带参考的 taskKind）。 */
+function referenceSupportForModel(modelMappings: Mapping[]): ModelReferenceSupport {
+  const out: ModelReferenceSupport = { image: false, video: false, audio: false, multiImage: false, referenceModes: [] };
+  const modes = new Set<ProfileKind>();
+  for (const mapping of modelMappings) {
+    if (!mapping.enabled) continue;
+    const support = bodyReferenceSupport(mapping.create?.body);
+    out.image ||= support.image;
+    out.video ||= support.video;
+    out.audio ||= support.audio;
+    out.multiImage ||= support.multiImage;
+    if (support.image || support.video || support.audio) modes.add(mapping.taskKind);
+  }
+  // 稳定排序（输出确定性，便于快照/断言）。
+  out.referenceModes = [...modes].sort();
+  return out;
+}
+
+/**
+ * 逐模型生产清单（enabled 且 adapter 已发布；legacy 无 adapter metadata 的存量行保持兼容）。
+ * 纯函数：输入完整 CatalogState，不读盘不解密以外的副作用（解密由 secrets 注入的 safeStorage 完成）。
+ *
+ * **解密探测按 vendorKey 记忆化（本次调用内）**：keyStatus 只取决于 vendorKey（同 vendor 的所有模型共享同一条
+ * key 记录与 authType），旧实现却**逐模型**调 apiKeyDecryptStatus——单 vendor N 个模型就是 N 次 safeStorage
+ * 钥匙串 IPC，且 locked vendor 每个模型都吐一行重复解密失败日志（N 行一模一样）。改为每 vendor 探一次
+ * 存进小 Map，同 vendor 后续模型直接命中，钥匙串往返与错误日志都降到「每 vendor 一次」。
+ *
+ * @param deps.keyStatusProbe 解密探测缝（house DI，默认真 apiKeyDecryptStatus）；测试注入 spy 断言「每 vendor 只探一次」。
+ */
+export function deriveModelListing(
+  state: CatalogState,
+  deps: { keyStatusProbe?: KeyStatusProbe } = {},
+): ModelListingEntry[] {
+  const vendorByKey = new Map(state.vendors.map((v) => [v.key, v] as const));
+  // 钥匙的 per-vendor 记忆化住在可用性派生器里（同一份 memo 同时答「能不能用」和「钥匙什么态」）。
+  // 这里再建第二份 Map 就是第二次 safeStorage 往返 + 第二行重复的解密失败日志。
+  const availability = createCatalogAvailability(state, deps.keyStatusProbe);
+  return state.models
+    .filter((model) => modelHasPublishedExecution(model, { mappings: state.mappings }))
+    .map((model) => {
+      const vendor = vendorByKey.get(model.vendorKey);
+      const vendorName = vendor?.name || model.vendorKey;
+      const modelAvailability = availability.of(model);
+      const keyStatus = availability.credentialStatusFor(model.vendorKey);
+      const modelMappings = mappingsForModel(state.mappings, model.vendorKey, model.modelKey, model.modelAlias);
+      return {
+        vendor: model.vendorKey,
+        vendorName,
+        modelKey: model.modelKey,
+        moduleId: SINGLE_SHOT_GENERATION_MODULE_ID,
+        kind: model.kind,
+        label: model.labelZh || model.modelKey,
+        keyStatus,
+        usable: modelAvailability.usable,
+        statusReason: statusReasonFor(keyStatus, vendorName, modelAvailability),
+        references: referenceSupportForModel(modelMappings),
+      };
+    });
+}

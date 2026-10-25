@@ -1,0 +1,472 @@
+import { revalidatePendingCredential } from './catalog/validateCandidateCredential';
+import crypto from "node:crypto";
+import { assertLocalAssetTransportReady, localizeAssetsForVendor } from "./catalog/assetLocalization";
+import { assertNoReferencesOutsideSubmit, stageSubmitsReferences } from "./catalog/referenceStage";
+import { assetIngestionResolver, assetLocalizationOptions } from "./catalog/assetTransportRuntime";
+import { readNomiLocalAsset, postJsonForAssetUpload, postMultipartForAssetUpload, putBinaryForAssetUpload } from "./assets/localAssetFile";
+import { writeAsset, writeGeneratedAsset, writeGeneratedDeterministicAsset } from "./assets/projectAssetStore";
+import { endpoint } from "./vendorEndpoint";
+import { requestJson, requestMultipart, vendorResponseLimitForKind } from "./vendor/vendorHttp";
+import { runMultipartProfileOperation } from "./catalog/multipartOperation";
+import { templateContext, buildProfileHttpRequest, validateProfileRequestBeforeSpend } from "./catalog/profileHttpRequest";
+import { chatImageFallbackOperation } from "./catalog/imageRouteFallback";
+import { buildNormalizedRecipe, buildTaskProvenance } from "./vendor/provenance";
+import { extractProviderCostActual, type ProviderCostActual } from "./vendor/cost";
+import { traceVendorCompleted, traceVendorRequested } from "./events/vendorCallTrace";
+import { localizeTaskAsset } from "./assets/localizeTaskAsset";
+export { localizeTaskAsset };
+import { localizedTaskAssetFileName } from "./assets/localizedAsset";
+import { authHeaders as buildAuthHeaders, extractTaskId as extractTaskIdShared } from "./ai/requestPipeline"; import { vendorAuthSpec } from "./catalog/vendorAuthSpec";
+import { assertCanonicalAntigravityOperation, executeProcessOperation, prepareAntigravityCreateOperation } from "./catalog/processOperation"; import type { AntigravityProcessStage } from "./catalog/antigravityCatalog";
+import { executeTextTask } from "./textTaskRunner";
+import { runAudioTask } from "./audioTaskRunner";
+import { firstString, isJsonRecord, trim, type JsonRecord } from "./jsonUtils";
+import { firstMappedString, providerMetaFromResponse, taskFailureMessageFromResponse } from "./tasks/responseParsing"; import { expectedMediaKind, readTaskResponse, requestEchoUrls } from "./tasks/taskResultReading";
+import { applyResponseTransform } from "./tasks/responseTransforms";
+import { applyRequestTransform } from "./tasks/requestTransforms";
+import { taskCache } from "./tasks/taskCache";
+export { taskCache, hasInFlightTasks } from "./tasks/taskCache";
+import { markTaskAdmitted } from "./tasks/taskAdmission";
+import { readCachedTaskResult, recipeFingerprint, rememberTaskResult } from "./vendor/fingerprintCache";
+import {
+  createProject,
+  deleteProject,
+  listProjects,
+  readProject,
+  resolveProjectRelativePath,
+  saveProject,
+} from "./projects/repository";
+// 公共 API：main.ts 仍从 "./runtime" 消费这些 —— re-export 保持其 import 不变。
+export { createProject, deleteProject, listProjects, readProject, resolveProjectRelativePath, saveProject };
+export { copyAssetFile, copyProjectAsset, importRemoteAsset, listProjectAssets, moveAssetFile, storeAssetBytes, writeAsset, writeGeneratedAsset } from "./assets/projectAssetStore";
+// localizedTaskAssetFileName 已抽到 ./assets/localizedAsset（规则 9/12 减负 giant shell）；re-export 保持既有 import（含 runtime.assets.test）不变。
+export { localizedTaskAssetFileName };
+/**
+ * 生产执行时**正在发哪一条 op**：create / query / result。
+ *
+ * 这与「接入自检失败在哪一段」是两件事，只是恰好都叫 stage。此前它是从
+ * `AdapterModeResult["stage"]` 里 Extract 出 "result" 拼出来的——那条耦合让「改认证流程」
+ * 顺手就能改坏「生产发哪条 op」。2026-09-11 删付费验证时它立刻炸了，所以在这里各自定义（P1）。
+ */
+export type ProfileOperationStage = AntigravityProcessStage | "result";
+// 任务执行复用 catalog 状态（readCatalog + extractVendorExtraHeaders 纯函数）；
+// catalogStore 反向复用本文件任务引擎 → 运行期循环引用（CommonJS 安全）。
+import { extractVendorExtraHeaders, readCatalog } from "./catalog/catalogStore";
+import { unlocalizedTaskAsset } from "./tasks/unlocalizedTaskAsset";
+import type { BillingModelKind, HttpOperation, Mapping, Model, ProfileKind, Vendor } from "./catalog/types";
+import { billingKindForTaskKind, selectTaskMapping } from "./catalog/types";
+import { applyHeadlessParamDefaults, imageEditGuardError, projectOutboundPrompt } from "./catalog/taskParams"; import { assertNoReferenceResidueBeforeSend } from "./tasks/referenceResidueGuard";
+import { modelModeBodies } from "./catalog/modelCatalogListing";
+import { runCustomCallTask } from "./catalog/customCallDispatch";
+import { resolveCustomCallExecution } from "./catalog/customCallMode";
+import { certifyTaskOutputAndSettleComfyCandidate, materializeCertifiedComfyAssets, resolveComfyCandidateExecution } from "./catalog/comfyuiCandidateLifecycle";
+import { TOKEN_ADMISSION, type TaskAdmission } from "./tasks/taskSpend"; // runTask 缺省走令牌路；画布单镜 Run 传 RUN_APPROVED_ADMISSION
+import { desktopT } from "./i18n";
+export type {
+  AiSdkProviderKind,
+  BillingModelKind,
+  CatalogState,
+  CatalogVersion,
+  HttpOperation,
+  Mapping,
+  Model,
+  ProfileKind,
+  Vendor,
+} from "./catalog/types";
+// ── 巨壳拆分：子模块再导出，main.ts/测试仍从 "./runtime" 消费这些符号（API 不破） ──
+export {
+  startExportJob,
+  getExportJobStatus,
+  listExportJobs,
+  cancelExportJob,
+  writeExportTempInput,
+  finishExportTempInput,
+  subscribeExportJobEvents,
+  startTimelineMp4Export,
+  showExportInFolder,
+} from "./export/exportJobs";
+export {
+  ensureBuiltinModelSeeds,
+  normalizeProviderKind,
+  listModelCatalogVendors,
+  listModelCatalogModels,
+  listModelCatalogMappings,
+  resolveOnboardingAgentFromCatalog,
+  getModelCatalogHealth,
+  upsertModelCatalogVendor,
+  deleteModelCatalogVendor,
+  upsertModelCatalogVendorApiKey,
+  clearModelCatalogVendorApiKey,
+  upsertModelCatalogModel,
+  deleteModelCatalogModel,
+  upsertModelCatalogMapping,
+  deleteModelCatalogMapping,
+  exportModelCatalogPackage,
+  importModelCatalogPackage,
+  extractVendorExtraHeaders,
+} from "./catalog/catalogStore";
+export {
+  commitOnboardedModelToCatalog,
+  fetchModelCatalogDocs,
+  testModelCatalogMapping,
+} from "./catalog/catalogCommit";
+// 请求与工作缓存两份形状住在 ./taskTypes（R9：runtime.ts 是编排层）；re-export 保住既有 import 面。
+export type { CachedTask, TaskRequest } from "./taskTypes";
+import type { CachedTask, TaskRequest } from "./taskTypes";
+export type TaskResult = {
+  id: string;
+  kind: ProfileKind;
+  status: "queued" | "running" | "succeeded" | "failed";
+  assets: Array<import("./shared/canvas/canvasMediaPreview").TaskAssetPreviewFields & {
+    type: "image" | "video" | "audio" | "model3d";
+    url: string;
+    assetId?: string | null;
+    assetRefId?: string | null;
+    assetName?: string | null;
+    /** 原始 CDN URL（https://...）。供后续生成直接用，无需上传。可能过期，过期后退回本地字节。 */
+    providerUrl?: string | null;
+    durationSeconds?: number;
+    /** 落盘边界 ffprobe 出来的源像素尺寸；画布拿到它就不必解码原图才知道有多大。 */
+    width?: number;
+    height?: number;
+  }>;
+  raw: unknown;
+  /**
+   * 文本任务的收尾原因（AI SDK 的 `finishReason`：`stop` / `length` / `content-filter`…）。
+   * **截断这一类问题在下游只能靠它自证**——没有它，「模型答不出来」和「我们自己把它截断了」长得一模一样。
+   */
+  finishReason?: string;
+  /** failed 时的上游真实原因（tasks/responseParsing.taskFailureMessageFromResponse 取；渲染层只读这一处）。 */
+  error?: string;
+  /**
+   * E11: Complete provenance for reproducibility. Populated on successful
+   * generation. Renderer copies this into GenerationNodeResult.provenance.
+   */
+  provenance?: {
+    provider?: string;
+    modelKey?: string;
+    prompt?: string;
+    negativePrompt?: string;
+    seed?: number;
+    params?: Record<string, unknown>;
+    vendorRequestId?: string;
+    cost?: { amount: number; currency: "credits"; unit: "actual" | "estimate" };
+    timestamp: number;
+  };
+};
+// TTL(1h) + LRU(200) 上限，防异步任务条目无界驻留（P0-7）。不再缓存明文 apiKey。
+
+/** 受理一个异步任务：写工作缓存 + 记账本（单一入口，所有 admit 点同源，防漏记）。 */
+export function admitTask(id: string, entry: CachedTask): void {
+  taskCache.set(id, entry);
+  markTaskAdmitted(id);
+}
+
+// 可执行模型解析下沉到 catalog/executableModel（R12 净减）；re-export 保住 textTaskRunner/taskResultQuery 既有 import 面。
+export { findExecutableModel, findExecutableModelForTask } from "./catalog/executableModel";
+import { findExecutableModel } from "./catalog/executableModel";
+import { noMappingWireModel } from "./shared/modelArchetypes/wireModelIdentity";
+
+// billingKindForTaskKind 下沉到 catalog/types（R12 净减）；re-export 保住既有消费方 import 面。
+export { billingKindForTaskKind } from "./catalog/types";
+
+export function findTaskMapping(vendorKey: string, taskKind: ProfileKind, modelKey?: string, modeId?: string): Mapping | null {
+  // 按 (vendor, taskKind, modelKey) 选——同 vendor 下两模型共用一个 taskKind 但请求形状不同时（如 HappyHorse 与 Kling 都 text_to_video），靠 modelKey 精确路由，不再「第一个赢、另一个套错模板」。
+  return selectTaskMapping(readCatalog().mappings, vendorKey, taskKind, modelKey, modeId);
+}
+
+/** Audio with a query operation is an asynchronous generation task, not a synchronous TTS/STT response. */
+export function usesSynchronousAudioRunner(wantedKind: BillingModelKind, mapping?: Mapping | null): boolean {
+  return wantedKind === "audio" && !mapping?.query;
+}
+
+export { buildProfileHttpRequest };
+export async function executeProfileOperation(input: {
+  vendor: Vendor;
+  model: Model;
+  apiKey: string;
+  request: TaskRequest;
+  operation: HttpOperation;
+  providerMeta?: JsonRecord;
+  localAssetReader?: import("./catalog/assetLocalization").LocalAssetReader; signal?: AbortSignal; stage: ProfileOperationStage; antigravityPreflight?: import("./ai/antigravityTask").PreparedAntigravityTask;
+}): Promise<{ response: unknown; request: unknown }> {
+  // Process and multipart declarations are handled by their shared executors.
+  if (input.operation.process) {
+    if (input.stage === "result") throw new Error("ANTIGRAVITY_INVALID_CONFIG");
+    if (input.operation.process.parser === "antigravity-cli-image" && !input.stage) throw new Error("ANTIGRAVITY_INVALID_CONFIG");
+    if (input.operation.process.parser === "antigravity-cli-image") assertCanonicalAntigravityOperation({ vendorKey: input.vendor.key, modelKey: input.model.modelKey, taskKind: input.request.kind, stage: input.stage!, operation: input.operation });
+    const context = templateContext(
+      input.request,
+      input.model,
+      input.apiKey,
+      input.providerMeta || {},
+      input.operation,
+    );
+    return executeProcessOperation({
+      process: input.operation.process,
+      context,
+      projectId: trim(input.request.extras?.projectId),
+      writeAsset: writeGeneratedAsset, writeDeterministicAsset: writeGeneratedDeterministicAsset, signal: input.signal, stage: input.stage, identity: { vendorKey: input.vendor.key, modelKey: input.model.modelKey, taskKind: input.request.kind }, antigravityPreflight: input.antigravityPreflight,
+    });
+  }
+  if (input.operation.multipart) return runMultipartProfileOperation(input, (u, h, q, f) => requestMultipart(input.vendor, input.apiKey, u, h, q, f, input.signal, { maxResponseBytes: vendorResponseLimitForKind(input.model.kind) }));
+  const uploadCatalog = readCatalog();
+  const localized = stageSubmitsReferences(input.stage) ? await localizeAssetsForVendor(
+    input.request.extras,
+    assetIngestionResolver(input.vendor, uploadCatalog, input.operation.assetIngestion),
+    input.localAssetReader || readNomiLocalAsset,
+    postJsonForAssetUpload,
+    postMultipartForAssetUpload,
+    assetLocalizationOptions(input.request.extras),
+    putBinaryForAssetUpload,
+  ) : { value: input.request.extras, uploaded: 0 };
+  const effectiveInput = localized.uploaded > 0 ? { ...input, request: { ...input.request, extras: localized.value as TaskRequest["extras"] } } : input;
+  const built = assertNoReferencesOutsideSubmit(input.stage, buildProfileHttpRequest(effectiveInput));
+  const body = await applyRequestTransform(input.operation.request_transform, built.body, { baseUrl: String(input.vendor.baseUrlHint || ""), promptId: trim(input.request.extras?.comfyPromptId), request: input.request });
+  const { vendor, apiKey } = effectiveInput;
+  const response = await requestJson(vendor, apiKey, built.method, built.url, built.headers, built.query, body, input.signal, { maxResponseBytes: vendorResponseLimitForKind(input.model.kind) });
+  return { response, request: built.preview };
+}
+/** Normalize an upstream response into the shared TaskResult contract. */
+export async function buildProfileTaskResult(input: {
+  response: unknown;
+  mapping: Mapping;
+  operation: HttpOperation;
+  request: TaskRequest;
+  taskIdFallback: string;
+  wantedKind: BillingModelKind;
+  projectId?: string;
+  nodeId?: string;
+  /** S4-1:provenance 统一在本出口写(修主路径漏写根因),需要 vendor/model。 */
+  vendor?: Vendor;
+  model?: Model;
+}): Promise<{ result: TaskResult; providerMeta: JsonRecord; unrecognizedStatus: string; actualCost?: ProviderCostActual }> {
+  const response = applyResponseTransform(input.operation.response_transform, input.response, {
+    baseUrl: String(input.vendor?.baseUrlHint || ""),
+  });
+  const { response_mapping: rawResponseMapping, provider_meta_mapping: rawMetaMapping } = input.operation;
+  const responseMapping = isJsonRecord(rawResponseMapping) ? rawResponseMapping : null;
+  const providerMetaMapping = isJsonRecord(rawMetaMapping) ? rawMetaMapping : null;
+  const providerMeta = providerMetaFromResponse(response, providerMetaMapping);
+  // 「上游到底给没给任务编号」只能有一个答案。providerMeta 只看 provider_meta_mapping 与
+  // extractTaskId 认得的那几个键（id / taskId / task_id / jobId…），**看不见 response_mapping**；
+  // 而像本机 ComfyUI 这样把编号叫 `prompt_id` 的供应商，编号只走 response_mapping 这一条路。
+  // 于是 result.id 明明已经拿到了 prompt_id，runTask 里那道「没返回任务编号就按失败处理」的闸
+  // 却问的是 providerMeta，答案是「没有」——整条 ComfyUI 认证必失败（2026-09-11 真机实锤）。
+  // 所以在这里就把「来自上游的编号」统一回填：本地兜底 id（taskIdFallback）刻意不回填，
+  // 那道闸要拦的正是「拿伪造编号去轮询」。
+  const providerTaskId = firstString(
+    firstMappedString(response, responseMapping, "task_id"),
+    providerMeta.task_id,
+    providerMeta.query_id,
+    extractTaskIdShared(response),
+  );
+  if (providerTaskId) {
+    providerMeta.task_id = providerMeta.task_id || providerTaskId;
+    providerMeta.query_id = providerMeta.query_id || providerTaskId;
+  }
+  const taskId = firstString(providerTaskId, input.taskIdFallback);
+  const type: "image" | "video" | "audio" | "model3d" =
+    input.wantedKind === "video" ? "video" : input.wantedKind === "audio" ? "audio" : input.wantedKind === "model3d" ? "model3d" : "image";
+  // 「成没成、结果在哪」只有一种读法（tasks/taskResultReading，两台引擎共用）：先合同、再通用规则。
+  const { status, unrecognizedStatus, assetUrls } = readTaskResponse({ response, responseMapping, statusMapping: input.mapping.statusMapping, wantedKind: expectedMediaKind(input.wantedKind), echoUrls: requestEchoUrls(input.request.extras), trace: { vendor: input.vendor?.key, model: input.model?.modelKey } });
+  const certification = await certifyTaskOutputAndSettleComfyCandidate({ request: input.request, modelKey: input.model?.modelKey, status, urls: assetUrls, kind: type, vendorBaseUrl: String(input.vendor?.baseUrlHint || "") });
+  const assets = await materializeCertifiedComfyAssets({ certification, status, urls: assetUrls,
+    materialize: (url, index) => input.projectId
+      ? localizeTaskAsset(input.projectId, url, type, input.nodeId, input.vendor, certification.evidence[index])
+      : Promise.resolve(unlocalizedTaskAsset(type, url)) });
+  const actualCost = extractProviderCostActual(input.vendor?.key || "", input.response);
+  return {
+    providerMeta,
+    unrecognizedStatus,
+    ...(actualCost ? { actualCost } : {}),
+    result: {
+      id: taskId,
+      kind: input.request.kind,
+      status,
+      assets,
+      raw: input.response,
+      ...(status === "failed" ? { error: taskFailureMessageFromResponse(response, responseMapping) } : {}),
+      ...(status === "succeeded" && input.vendor && input.model
+        ? { provenance: buildTaskProvenance({ vendor: input.vendor, model: input.model, request: input.request, vendorRequestId: taskId, actualCost }) }
+        : {}),
+    },
+  };
+}
+
+export async function runTask(payload: unknown, admission: TaskAdmission = TOKEN_ADMISSION): Promise<TaskResult> {
+  const raw = payload as { vendor?: string; request?: TaskRequest };
+  const vendorKey = trim(raw.vendor);
+  const request = raw.request;
+  if (!vendorKey || !request) throw new Error("vendor and request are required");
+  const kind = request.kind;
+  const wantedKind = billingKindForTaskKind(kind);
+  const modelKey = firstString(request.extras?.modelKey, request.extras?.modelAlias);
+  const archetypeMeta = request.extras?.archetype;
+  const modeId = archetypeMeta && typeof archetypeMeta === "object" ? firstString((archetypeMeta as JsonRecord).modeId) : firstString(request.extras?.modeId);
+  await revalidatePendingCredential(vendorKey);
+  const stagedCandidate = resolveComfyCandidateExecution(request);
+  const { vendor, model, apiKey, customConfig } = stagedCandidate || findExecutableModel(vendorKey, modelKey, wantedKind);
+  const projectId = trim(request.extras?.projectId), nodeId = trim(request.extras?.nodeId), grantId = trim(request.extras?.grantId);
+  const taskId = `task-${crypto.randomUUID()}`;
+  const effectiveVendorKey = vendor.key;
+  const mapping = stagedCandidate?.mapping || findTaskMapping(effectiveVendorKey, kind, modelKey, modeId);
+  request.extras = applyHeadlessParamDefaults(assertNoReferenceResidueBeforeSend(request.extras, `${modelKey}/${modeId || "-"}`), (model?.meta as { archetypeId?: string } | undefined)?.archetypeId, kind, effectiveVendorKey, mapping?.create?.defaultParams, mapping?.create?.body, model.modelKey);
+  // A5：@ 内联参考在发出去之前投影成 @image1/@video1。判据与注释住 taskParams（引擎 A 只有这一个出口）。
+  request.prompt = projectOutboundPrompt(request.prompt, request.extras);
+  const customCall = resolveCustomCallExecution(model as Model, request, mapping);
+  const customCallScript = customCall?.script || "";
+  const guardError = imageEditGuardError(kind, request, Boolean(mapping) || Boolean(customCallScript), model.labelZh || model.modelKey, customCallScript ? undefined : mapping?.create?.body, modelModeBodies(readCatalog().mappings, effectiveVendorKey, modelKey, (model as Model).modelAlias), { vendorKey: effectiveVendorKey, modelKey: model.modelKey });
+  if (guardError) throw new Error(guardError);
+  if (customCallScript)
+    return runCustomCallTask({ vendor, model, apiKey, customConfig, script: customCallScript, taskKind: customCall!.taskKind, modeId: customCall!.modeId, operation: mapping?.create, request, kind, wantedKind, projectId, nodeId, grantId, taskId, localizeTaskAsset, writeAsset, spendGate: admission.spendGate });
+  if (usesSynchronousAudioRunner(wantedKind, mapping)) {
+    await admission.spendGate({ grantId, nodeId, projectId, vendorKey: vendor.key, modelKey: model.modelKey, parameters: request.extras });
+    return runAudioTask({ vendor, model, apiKey, request, kind, taskId, projectId, nodeId, mapping });
+  }
+  if (mapping) {
+    await validateProfileRequestBeforeSpend({ vendor, model, apiKey, request, operation: mapping.create });
+    const uploadCatalog = readCatalog();
+    if (!mapping.create.multipart && !mapping.create.process) {
+      assertLocalAssetTransportReady(
+        request.extras,
+        assetIngestionResolver(vendor, uploadCatalog, mapping.create.assetIngestion),
+        readNomiLocalAsset,
+        assetLocalizationOptions(request.extras),
+      );
+    }
+    const recipe = buildNormalizedRecipe({
+      vendor,
+      model,
+      mappingId: trim((mapping as unknown as JsonRecord).id),
+      request,
+    });
+    const fingerprint = recipeFingerprint(recipe);
+    const cachedHit = readCachedTaskResult({ projectId, fingerprint, nodeId, extras: request.extras });
+    if (cachedHit) return cachedHit as TaskResult;
+    const antigravityPreflight = await prepareAntigravityCreateOperation({ vendorKey: effectiveVendorKey, modelKey: model.modelKey, taskKind: kind, operation: mapping.create, request });
+    await admission.spendGate({ grantId, nodeId, projectId, vendorKey: vendor.key, modelKey: model.modelKey, parameters: request.extras }); // 付费守卫：缓存未命中=真发 vendor，发前校验消费令牌
+    let createOperation = mapping.create; let executed;
+    try {
+      executed = await executeProfileOperation({ vendor, model, apiKey, request, operation: createOperation, stage: "create", antigravityPreflight });
+    } catch (error) {
+      const fallbackOp = chatImageFallbackOperation(error, createOperation, kind);
+      if (!fallbackOp) throw error;
+      createOperation = fallbackOp;
+      executed = await executeProfileOperation({ vendor, model, apiKey, request, operation: createOperation, stage: "create", antigravityPreflight });
+    }
+    const normalized = await buildProfileTaskResult({
+      response: executed.response,
+      mapping,
+      operation: createOperation,
+      request,
+      taskIdFallback: taskId,
+      wantedKind,
+      projectId,
+      nodeId,
+      vendor,
+      model,
+    });
+    if (normalized.result.status === "queued" && mapping.query && !normalized.providerMeta.task_id && !normalized.providerMeta.query_id) {
+      const missingTaskIdResult: TaskResult = { ...normalized.result, status: "failed", error: desktopT("tasks.missingTaskId") };
+      traceVendorRequested(projectId, { runId: missingTaskIdResult.id, nodeId, recipe });
+      traceVendorCompleted(projectId, {
+        runId: missingTaskIdResult.id,
+        nodeId,
+        status: "failed",
+        assetCount: 0,
+      });
+      rememberTaskResult(projectId, fingerprint, missingTaskIdResult);
+      return missingTaskIdResult;
+    }
+    traceVendorRequested(projectId, { runId: normalized.result.id, nodeId, recipe });
+    if (["succeeded", "failed"].includes(normalized.result.status)) {
+      traceVendorCompleted(projectId, { runId: normalized.result.id, nodeId, status: normalized.result.status as "succeeded" | "failed", assetCount: normalized.result.assets.length, ...(normalized.actualCost ? { cost: normalized.actualCost } : {}) });
+      rememberTaskResult(projectId, fingerprint, normalized.result);
+    }
+    if (!["succeeded", "failed"].includes(normalized.result.status)) {
+      admitTask(normalized.result.id, {
+        vendor: effectiveVendorKey,
+        request,
+        raw: executed.response,
+        mapping,
+        model,
+        providerMeta: normalized.providerMeta,
+        projectId,
+        nodeId,
+        wantedKind,
+        fingerprint,
+      });
+    }
+    return normalized.result;
+  }
+
+  if (wantedKind === "text") {
+    await admission.spendGate({ grantId, nodeId, projectId, vendorKey: vendor.key, modelKey: model.modelKey, parameters: request.extras });
+    return executeTextTask({ vendor, model, apiKey, kind, request, taskId });
+  }
+
+  const suffix = wantedKind === "video" ? "/v1/videos/generations" : "/v1/images/generations";
+  const fallbackRecipe = buildNormalizedRecipe({ vendor, model, request });
+  const fallbackFingerprint = recipeFingerprint(fallbackRecipe);
+  const fallbackHit = readCachedTaskResult({
+    projectId,
+    fingerprint: fallbackFingerprint,
+    nodeId,
+    extras: request.extras,
+  });
+  if (fallbackHit) return fallbackHit as TaskResult;
+  await admission.spendGate({ grantId, nodeId, projectId, vendorKey: vendor.key, modelKey: model.modelKey, parameters: request.extras });
+  const fallbackExtraHeaders = extractVendorExtraHeaders(vendor);
+  const fallbackHeaders: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...buildAuthHeaders(vendorAuthSpec(vendor), apiKey),
+    ...(fallbackExtraHeaders || {}),
+  };
+  const providerResponse = await requestJson(vendor, apiKey, "POST", endpoint(vendor, suffix), fallbackHeaders, {},
+    { // 键形状由 taskParams.NO_MAPPING_FALLBACK_BODY 声明并被测试钉死（两处必须同构）。
+      model: noMappingWireModel(model, request), // 线上模型名只问 owner（wireModelIdentity）
+      prompt: request.prompt,
+      size: request.width && request.height ? `${request.width}x${request.height}` : undefined,
+      seed: request.seed,
+      n: 1,
+      response_format: "url",
+      extras: request.extras,
+    },
+  );
+  const assetUrl = readTaskResponse({ response: providerResponse, responseMapping: null, statusMapping: undefined, wantedKind: expectedMediaKind(wantedKind) }).assetUrls[0] ?? ""; // 无 mapping 兜底提交也走唯一读法
+  const upstreamTaskId = extractTaskIdShared(providerResponse) || taskId;
+  traceVendorRequested(projectId, { runId: upstreamTaskId, nodeId, recipe: fallbackRecipe });
+  if (!assetUrl) {
+    admitTask(upstreamTaskId, {
+      vendor: vendorKey,
+      request,
+      raw: providerResponse,
+      model,
+      projectId,
+      nodeId,
+      wantedKind,
+      fingerprint: fallbackFingerprint,
+    });
+    return { id: upstreamTaskId, kind, status: "queued", assets: [], raw: providerResponse };
+  }
+  const type: "image" | "video" | "audio" | "model3d" =
+    wantedKind === "video" ? "video" : wantedKind === "audio" ? "audio" : wantedKind === "model3d" ? "model3d" : "image";
+  const asset: TaskResult["assets"][number] = projectId
+    ? await localizeTaskAsset(projectId, assetUrl, type, nodeId, vendor) : unlocalizedTaskAsset(type, assetUrl);
+  const actualCost = extractProviderCostActual(vendor.key, providerResponse);
+  const provenance = buildTaskProvenance({ vendor, model, request, vendorRequestId: upstreamTaskId, actualCost });
+  traceVendorCompleted(projectId, { runId: upstreamTaskId, nodeId, status: "succeeded", assetCount: 1, ...(actualCost ? { cost: actualCost } : {}) });
+  const finalResult: TaskResult = {
+    id: upstreamTaskId,
+    kind,
+    status: "succeeded",
+    assets: [asset],
+    raw: providerResponse,
+    provenance,
+  };
+  rememberTaskResult(projectId, fallbackFingerprint, finalResult);
+  return finalResult;
+}
+
+export { fetchTaskResult } from "./tasks/taskResultQuery";

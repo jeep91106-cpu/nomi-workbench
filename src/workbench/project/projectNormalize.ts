@@ -1,0 +1,277 @@
+import { normalizeTimeline } from '../timeline/timelineMath'
+import { normalizeWorkbenchDocument } from '../workbenchPersistence'
+import { createDefaultWorkbenchDocument, type StoryboardDesign, type WorkbenchDocument } from '../workbenchTypes'
+import { logRendererWarn } from '../../desktop/rendererLog'
+import {
+  createDefaultWorkbenchProjectPayload,
+  workbenchProjectPayloadSchema,
+  workbenchProjectRecordSchema,
+  type WorkbenchProjectPayload,
+  type WorkbenchProjectRecordLegacy,
+  type WorkbenchProjectRecordV1,
+  type WorkbenchProjectSummary,
+} from './projectRecordSchema'
+import { normalizeCategories } from './projectCategories'
+import { storyboardPlanSchema } from '../generationCanvas/agent/storyboardPlanSchema'
+import { renumberStoryboardShots } from '../../../electron/shared/storyboard/storyboardSubjectIdentity'
+import i18n from '../../i18n'
+
+// 封面派生已收口到 ./projectCoverDerive（媒体类型分流版，2026-08-01）：
+// 旧 extractCanvasThumbnailUrls / extractThumbnailUrlsFromRaw 对视频/音频结果也取 url 塞
+// 进 <img>，纯导入视频项目封面必「加载失败」。派生真相源与 main 侧等价关系见那边头注释。
+
+export function normalizeSummary(input: unknown): WorkbenchProjectSummary | null {
+  if (!input || typeof input !== 'object') return null
+  const raw = input as Record<string, unknown>
+  const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+  const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : i18n.t('runtime.project.untitled')
+  const updatedAt = typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt) ? raw.updatedAt : Date.now()
+  const createdAt = typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? raw.createdAt : updatedAt
+  if (!id) return null
+  return {
+    id,
+    name,
+    updatedAt,
+    createdAt,
+    ...(typeof raw.revision === 'number' && Number.isInteger(raw.revision) && raw.revision >= 0
+      ? { revision: raw.revision }
+      : {}),
+    ...(typeof raw.savedAt === 'number' && Number.isFinite(raw.savedAt) ? { savedAt: raw.savedAt } : {}),
+    ...(typeof raw.thumbStyle === 'string' && raw.thumbStyle.trim() ? { thumbStyle: raw.thumbStyle.trim() } : {}),
+    ...(typeof raw.thumbnail === 'string' && raw.thumbnail.trim() ? { thumbnail: raw.thumbnail.trim() } : {}),
+    ...(Array.isArray(raw.thumbnailUrls) && raw.thumbnailUrls.length
+      ? {
+          thumbnailUrls: raw.thumbnailUrls.filter((u): u is string => typeof u === 'string'),
+        }
+      : {}),
+    ...(typeof raw.seedKey === 'string' && raw.seedKey.trim() ? { seedKey: raw.seedKey.trim() } : {}),
+    ...(raw.source === 'native' || raw.source === 'folder' ? { source: raw.source } : {}),
+    ...(typeof raw.rootPath === 'string' && raw.rootPath.trim()
+      ? { rootPath: raw.rootPath.trim() }
+      : typeof raw.lastKnownRootPath === 'string' && raw.lastKnownRootPath.trim()
+        ? { rootPath: raw.lastKnownRootPath.trim() }
+        : {}),
+    ...(typeof raw.missing === 'boolean' ? { missing: raw.missing } : {}),
+  }
+}
+
+function normalizeLegacyRecord(input: unknown): WorkbenchProjectRecordLegacy | null {
+  if (!input || typeof input !== 'object') return null
+  const raw = input as Record<string, unknown>
+  const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+  const name = typeof raw.name === 'string' ? raw.name.trim() : ''
+  const createdAt = typeof raw.createdAt === 'number' && Number.isFinite(raw.createdAt) ? raw.createdAt : null
+  const updatedAt = typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt) ? raw.updatedAt : null
+  if (!id || !name || createdAt == null || updatedAt == null) return null
+  return {
+    id,
+    name,
+    createdAt,
+    updatedAt,
+    ...(typeof raw.thumbStyle === 'string' && raw.thumbStyle.trim() ? { thumbStyle: raw.thumbStyle.trim() } : {}),
+    workbenchDocument: raw.workbenchDocument,
+    timeline: raw.timeline,
+    generationCanvas: raw.generationCanvas,
+  }
+}
+
+export function normalizePayload(input: unknown): WorkbenchProjectPayload {
+  const parsed = workbenchProjectPayloadSchema.safeParse(input)
+  if (!parsed.success) {
+    throw new Error(i18n.t('runtime.project.corruptPayload'))
+  }
+  const payload = parsed.data
+  // P2 多文档迁移：优先读新字段 workbenchDocuments；老项目只有 workbenchDocument → 包装成单元素集合。
+  const legacyDoc = payload.workbenchDocument
+  const documents = Array.isArray(payload.workbenchDocuments) && payload.workbenchDocuments.length
+    ? payload.workbenchDocuments
+    : legacyDoc
+      ? [legacyDoc]
+      : [createDefaultWorkbenchDocument()]
+  const activeId = payload.activeDocumentId
+  const normalizedDocuments = documents.map(normalizeWorkbenchDocument)
+  const firstDocumentId = normalizedDocuments[0].id
+  const activeDocumentId = activeId && documents.some((d) => (d as WorkbenchDocument).id === activeId)
+    ? activeId
+    : firstDocumentId
+  const raw = input && typeof input === 'object' ? input as Record<string, unknown> : {}
+  const legacyMapKey = ['storyboard', 'Plans'].join('')
+  const legacyPlanKey = ['storyboard', 'Plan'].join('')
+  const legacyCommittedKey = ['storyboard', 'Plan', 'Committed'].join('')
+  const legacyMap = raw[legacyMapKey] && typeof raw[legacyMapKey] === 'object' ? raw[legacyMapKey] as Record<string, unknown> : undefined
+  const owner = payload.storyboardDesignsByDocumentId
+    ? withShotNumbersOnlyCountingShots(payload.storyboardDesignsByDocumentId)
+    : (() => {
+        const migrated: Record<string, StoryboardDesign[]> = {}
+        // 迁移读不动一份旧方案时，用户失去的是整份分镜——那件事不许静默发生。schema 这一侧
+        // 已经回到「剥离未知键」（见 storyboardPlanSchema 头注释），所以走到这里只剩真正残缺的
+        // 记录；至少把是谁、缺哪个字段留在控制台，别让它变成「打开项目分镜就没了」的谜。
+        const reportUnreadablePlan = (documentId: string, issues: readonly { path: PropertyKey[]; message: string }[]): void => {
+          logRendererWarn('storyboard-plan-migration-skipped',
+            { documentId, issues: issues.slice(0, 8).map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; ') })
+        }
+        const legacyEntries = legacyMap
+          ? Object.entries(legacyMap).flatMap(([documentId, value]) => {
+              if (!value || typeof value !== 'object') return []
+              const entry = value as Record<string, unknown>
+              const plan = storyboardPlanSchema.safeParse(entry.plan)
+              if (!plan.success) { reportUnreadablePlan(documentId, plan.error.issues); return [] }
+              return [[documentId, { plan: plan.data, committed: entry.committed === true }] as const]
+            })
+          : (() => {
+              if (raw[legacyPlanKey] === undefined) return []
+              const plan = storyboardPlanSchema.safeParse(raw[legacyPlanKey])
+              if (!plan.success) { reportUnreadablePlan(activeDocumentId, plan.error.issues); return [] }
+              return [[activeDocumentId, { plan: plan.data, committed: raw[legacyCommittedKey] === true }] as const]
+            })()
+        for (const [documentId, entry] of legacyEntries) {
+          const document = normalizedDocuments.find((item) => item.id === documentId)
+          const now = Date.now()
+          migrated[documentId] = [{
+            id: `migrated-${documentId}`,
+            documentId,
+            title: entry.plan.title.trim(),
+            plan: entry.plan,
+            committed: entry.committed,
+            status: entry.committed ? 'committed' : 'draft',
+            sourceDocumentUpdatedAt: document?.updatedAt ?? now,
+            createdAt: now,
+            updatedAt: now,
+          }]
+        }
+        return migrated
+      })()
+  return {
+    workbenchDocuments: normalizedDocuments,
+    activeDocumentId,
+    timeline: normalizeTimeline(payload.timeline),
+    generationCanvas: payload.generationCanvas,
+    categories: normalizeCategories(payload.categories),
+    generationCanvasLastSeq: payload.generationCanvasLastSeq,
+    ...(payload.editingPanelLayout ? { editingPanelLayout: payload.editingPanelLayout } : {}),
+    ...(payload.pendingAssetDeletions?.length ? { pendingAssetDeletions: payload.pendingAssetDeletions } : {}),
+    ...(Object.values(owner).some((designs) => designs.length > 0) ? { storyboardDesignsByDocumentId: owner } : {}),
+  }
+}
+
+/**
+ * True when the raw record carries any persisted creation content. A workspace
+ * that was initialized by "打开文件夹" on an existing folder (but never saved)
+ * has a minimal manifest payload (just `{ rootPath }`) and none of these fields.
+ */
+function recordHasPersistedContent(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object') return false
+  const rec = raw as Record<string, unknown>
+  const containers: Array<Record<string, unknown> | undefined> = [
+    rec,
+    rec.payload && typeof rec.payload === 'object' ? (rec.payload as Record<string, unknown>) : undefined,
+  ]
+  return containers.some((container) =>
+    Boolean(container && (container.workbenchDocument || container.timeline || container.generationCanvas)),
+  )
+}
+
+/**
+ * 从原始 record 上取未经 zod 剥离的 payload；取不到就退回 undefined，让
+ * normalizePayload 自己走「缺字段」的既有兜底（它第一步就 safeParse）。
+ */
+function readRawPayload(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object') return undefined
+  return (raw as { payload?: unknown }).payload
+}
+
+export function normalizeRecord(summary: WorkbenchProjectSummary, raw: unknown): WorkbenchProjectRecordV1 {
+  const legacyParsed = workbenchProjectRecordSchema.safeParse(raw)
+  if (legacyParsed.success) {
+    return {
+      ...legacyParsed.data,
+      // 迁移必须吃**原始** payload，不能吃 zod 解析后的那份：payload schema 是普通
+      // z.object，会把它不认识的键默默剥掉——而已退役的那三个老键（见上面
+      // legacyMapKey / legacyPlanKey / legacyCommittedKey 三处拼装）恰恰就不在 schema 里。
+      // 喂解析后的那份，兼容读取就永远看不见它们：老项目的分镜方案打开即静默消失，
+      // 随后任何一次自动保存会把它从盘上永久抹掉。
+      // normalizePayload 自己第一步就重新 safeParse，喂原始值不会放宽任何校验。
+      payload: normalizePayload(readRawPayload(raw)),
+    }
+  }
+  // Freshly-initialized workspace (existing folder opened via "打开文件夹",
+  // never saved): its manifest payload is minimal (just rootPath). Open it as
+  // an empty project with default payload instead of throwing 记录损坏 and
+  // failing to open silently.
+  if (!recordHasPersistedContent(raw)) {
+    return {
+      ...summary,
+      version: 1,
+      payload: createDefaultWorkbenchProjectPayload(),
+    }
+  }
+  const legacy = normalizeLegacyRecord(raw)
+  if (!legacy) {
+    throw new Error(i18n.t('runtime.project.corruptRecord', { id: summary.id }))
+  }
+  const payload = normalizePayload(legacy)
+  return {
+    ...summary,
+    version: 1,
+    payload,
+  }
+}
+
+export function createProjectRecord(
+  summary: WorkbenchProjectSummary,
+  payload?: Partial<WorkbenchProjectPayload>,
+): WorkbenchProjectRecordV1 {
+  return {
+    ...summary,
+    revision: summary.revision ?? 0,
+    savedAt: summary.savedAt ?? summary.updatedAt,
+    version: 1,
+    payload: {
+      ...createDefaultWorkbenchProjectPayload(),
+      ...(payload || {}),
+    },
+  }
+}
+
+export function seedDocFromMarkdown(markdown: string): unknown {
+  const lines = markdown.split(/\r?\n/)
+  const blocks: Array<Record<string, unknown>> = []
+  for (const line of lines) {
+    const trimmed = line.replace(/\s+$/, '')
+    if (!trimmed) continue
+    if (trimmed.startsWith('# ')) {
+      blocks.push({
+        type: 'heading',
+        attrs: { level: 1 },
+        content: [{ type: 'text', text: trimmed.slice(2) }],
+      })
+    } else if (trimmed.startsWith('## ')) {
+      blocks.push({
+        type: 'heading',
+        attrs: { level: 2 },
+        content: [{ type: 'text', text: trimmed.slice(3) }],
+      })
+    } else {
+      blocks.push({
+        type: 'paragraph',
+        content: [{ type: 'text', text: trimmed }],
+      })
+    }
+  }
+  return { type: 'doc', content: blocks }
+}
+
+/**
+ * 读盘归位（2026-10-05）：分镜主体身份的唯一 owner 落地之前，Agent 建的方案把参考卡排进了镜号
+ * （2 张参考卡 + 2 镜的方案，镜头行号是 03、04）。镜号只是「它在镜头里的位置」，镜头身份是 shotId，
+ * 所以每一镜都有 shotId 的方案按位置归位成 1..N 不改任何身份（分镜表与画布节点按 shotId 绑定）。
+ * 有镜头没 shotId 的（旧的手建方案，身份按镜号派生）一字不动——它们本来就是连续的，动了反而换身份。
+ */
+function withShotNumbersOnlyCountingShots(designs: Record<string, StoryboardDesign[]>): Record<string, StoryboardDesign[]> {
+  return Object.fromEntries(Object.entries(designs).map(([documentId, list]) => [documentId, list.map((design) => {
+    const shots = design.plan.shots
+    if (!shots.every((shot) => typeof shot.shotId === 'string' && shot.shotId.trim())) return design
+    const renumbered = renumberStoryboardShots(shots)
+    return renumbered.every((shot, position) => shot === shots[position]) ? design : { ...design, plan: { ...design.plan, shots: renumbered } }
+  })]))
+}

@@ -1,0 +1,98 @@
+import { describe, expect, it } from 'vitest'
+import type { GenerationCanvasNode, GenerationNodeResult } from '../model/generationCanvasTypes'
+import { readNodeMediaAspectRatio, resolveNodeVisualSize } from '../nodes/nodeSizing'
+import { nodeRunOutcomePatch } from './nodeRunOutcome'
+import { normalizeNodeResultVersionNumbers, removeNodeResult } from '../model/nodeResultLifecycle'
+
+const imageResult: GenerationNodeResult = {
+  id: 'result-1',
+  type: 'image',
+  url: 'nomi-local://asset/project/image.png',
+  thumbnailUrl: 'nomi-local://asset/project/image.preview.jpg',
+  createdAt: Date.now(),
+}
+
+function node(): GenerationCanvasNode {
+  return {
+    id: 'node-1',
+    kind: 'image',
+    title: 'image',
+    prompt: '',
+    position: { x: 0, y: 0 },
+    size: { width: 340, height: 340 },
+    meta: {},
+    result: undefined,
+    history: [],
+    status: 'idle',
+  } as GenerationCanvasNode
+}
+
+describe('nodeRunOutcomePatch intrinsic media dimensions', () => {
+  it('writes original landing dimensions even when the node renders a thumbnail', () => {
+    const patch = nodeRunOutcomePatch(node(), {
+      kind: 'result',
+      result: imageResult,
+      mediaDimensions: { width: 1600, height: 900 },
+    })
+
+    const landed = { ...node(), ...patch, meta: patch.meta ?? {} } as GenerationCanvasNode
+    expect(readNodeMediaAspectRatio(landed)).toBeCloseTo(16 / 9)
+    expect(resolveNodeVisualSize(landed).height).toBeCloseTo(resolveNodeVisualSize(landed).width / (16 / 9))
+    expect(landed.meta).toMatchObject({ imageWidth: 1600, imageHeight: 900, imageAspectRatio: 16 / 9 })
+  })
+
+  it('deduplicates asset-only results through the shared identity owner and keeps monotonic numbers', () => {
+    const first = { ...imageResult, id: '', url: undefined, thumbnailUrl: undefined, assetId: 'asset-1', assetRefId: undefined }
+    const second = { ...first, createdAt: Date.now() + 1 }
+    const withHistory = { ...node(), result: first, history: [first], status: 'success' as const }
+    const patch = nodeRunOutcomePatch(withHistory, { kind: 'result', result: second })
+    expect(patch.history).toHaveLength(1)
+    expect(patch.history?.[0].versionNo).toBe(1)
+  })
+
+  it('keeps version numbers monotonic across deletion', () => {
+    const make = (id: string): GenerationNodeResult => ({ id, type: 'image', url: `nomi-local://asset/${id}.png`, createdAt: Number(id.slice(1)) })
+    let current = node()
+    for (const id of ['r1', 'r2', 'r3']) current = { ...current, ...nodeRunOutcomePatch(current, { kind: 'result', result: make(id) }) }
+    expect(current.history?.map((entry) => entry.versionNo)).toEqual([3, 2, 1])
+    const afterDelete = removeNodeResult(current, 'r2')
+    expect(afterDelete?.history?.map((entry) => entry.versionNo)).toEqual([3, 1])
+    const afterRegenerate = { ...current, ...afterDelete }
+    const next = nodeRunOutcomePatch(afterRegenerate, { kind: 'result', result: make('r4') })
+    expect(next.history?.map((entry) => entry.versionNo)).toEqual([4, 3, 1])
+  })
+
+  it('continues the durable sequence after backfilling a legacy project', () => {
+    const older = { id: 'older', type: 'image' as const, url: 'older.png', createdAt: 1 }
+    const newest = { id: 'newest', type: 'image' as const, url: 'newest.png', createdAt: 2 }
+    const legacy = normalizeNodeResultVersionNumbers({ ...node(), result: older, history: [newest, older] })
+    const patch = nodeRunOutcomePatch({ ...node(), ...legacy, status: 'success' }, {
+      kind: 'result',
+      result: { id: 'next', type: 'image', url: 'next.png', createdAt: 3 },
+    })
+
+    // 主图指向旧版也不打乱持久顺序（旧实现把主图挪到最前：next 3 / older 1 / newest 2）。
+    expect(patch.history?.map((entry) => [entry.id, entry.versionNo])).toEqual([
+      ['next', 3],
+      ['newest', 2],
+      ['older', 1],
+    ])
+  })
+})
+
+describe('nodeRunOutcomePatch keeps the reason a node landed recoverable (#1213)', () => {
+  const RETRIEVAL_FAILURE = 'Provider request failed (HTTP 503) at relay GET https://relay.example/api/v3/contents/generations/tasks/cgt-1: no available channel'
+
+  it('stores the last retrieval failure on the node and on the in-flight run record', () => {
+    const running = { ...node(), status: 'running', runs: [{ id: 'run-1', status: 'running', taskId: 'cgt-1', startedAt: 1, updatedAt: 1 }] } as GenerationCanvasNode
+    const patch = nodeRunOutcomePatch(running, { kind: 'status', status: 'recoverable', error: RETRIEVAL_FAILURE })
+    expect(patch.status).toBe('recoverable')
+    expect(patch.error).toBe(RETRIEVAL_FAILURE)
+    expect(patch.runs?.[0]).toMatchObject({ status: 'recoverable', error: RETRIEVAL_FAILURE })
+  })
+
+  it('a plain wait-timeout with no reason stays reasonless (no invented fallback sentence)', () => {
+    const patch = nodeRunOutcomePatch({ ...node(), status: 'running' } as GenerationCanvasNode, { kind: 'status', status: 'recoverable' })
+    expect(patch.error).toBeUndefined()
+  })
+})

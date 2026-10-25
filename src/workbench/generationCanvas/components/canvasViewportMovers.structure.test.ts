@@ -1,0 +1,74 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { describe, expect, it } from 'vitest'
+
+/**
+ * 「谁有权移动画布视口」的名单（2026-09-25 用户拍板：程序不再主动平移 / 缩放画布，只有用户显式操作能动）。
+ *
+ * 这类问题反复发生（用户原话「好像修过，但类似问题反复发生」）的机械原因：「新建后露出 / 落地后适应 /
+ * 复制后聚焦 / 导入后对准」各自在自己的入口里请求一次移动，每加一个新入口就多一扇门。这里把能请求移动的
+ * 两扇总门——`requestCanvasFit`（适应并切分类）与 `FOCUS_GENERATION_NODE_EVENT`（定位到某个节点）——的
+ * 全部调用处列成名单；名单里每一处都必须是用户点出来的。新增一处而不进名单 = 红；进名单要在这里写清
+ * 「这是用户的哪一下点击」。新东西落在屏外，正确做法是让画布边缘提示（CanvasArrivalHint）指路，不是加门。
+ */
+const SRC = path.resolve(__dirname, '../../..')
+
+const FIT_CALLERS: Record<string, string> = {
+  'workbench/production/useProductionStatus.ts': '生产状态卡「去看看」按钮（open-stage）：用户点了才去',
+  'workbench/onboarding/journeyTourStore.ts': '60 秒引导把示例落到画布后铺开一次：用户点了「看 Nomi 怎么出片」，这是引导自己的一步',
+}
+
+const FOCUS_DISPATCHERS: Record<string, string> = {
+  'workbench/sidebar/CategoryTree.tsx': '侧栏点节点定位',
+  'workbench/creation/storyboard/StoryboardPlanEditor.tsx': '分镜表「在画布上查看」按钮',
+  'workbench/generationCanvas/nodes/BaseGenerationNode.tsx': '节点「定位来源」角标',
+  'workbench/generationCanvas/components/BatchPlanOverlay.tsx': '批量条上点被卡住的那一镜',
+  'workbench/generationCanvas/nodes/completeNodeConnection.ts': 'toast 上的「定位」动作',
+  'workbench/generationCanvas/nodes/director/agent/hostNotice.ts': '导演台 Host（站位出图 / 运镜小片挂接）提示上的「定位节点」动作：图和目标镜头常落在视口外，用户点了才对准它',
+  'workbench/project/useProjectNotificationTarget.ts': '点系统通知 / 深链跳到节点',
+  'workbench/generation/list/generationListSource.ts': '生成页列表检查器「在画布里看」/ 工具卡「在画布里打开」：用户点了才切回画布并对准那个节点',
+  'workbench/generationCanvas/nodes/extractVideoFrameToNode.ts': '视频浮条点「首帧 / 尾帧」：用户点了才抽，新图片节点建好后对准它（之前落在视口外看不见）',
+  'workbench/generationCanvas/nodes/trimVideoToNode.ts': '剪辑面板点「确认」：用户点了才剪，旁边的新视频卡建好后对准它（和截帧同一个理由）',
+}
+
+function sourceFiles(dir: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) return sourceFiles(full)
+    return /\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name) ? [full] : []
+  })
+}
+
+/** 剥掉注释再扫：注释里提到这些符号（记录历史的那几行）不算调用（check:walkthroughs「结构测试须剥注释」）。 */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+const relative = (file: string) => path.relative(SRC, file).split(path.sep).join('/')
+const files = sourceFiles(path.join(SRC, 'workbench'))
+
+describe('canvas viewport movers', () => {
+  it('only explicit user actions request a canvas fit', () => {
+    const callers = files
+      .filter((file) => /\brequestCanvasFit\(/.test(stripComments(fs.readFileSync(file, 'utf8'))))
+      .map(relative)
+      .filter((file) => file !== 'workbench/workbenchStore.ts')
+      .sort()
+    expect(callers).toEqual(Object.keys(FIT_CALLERS).sort())
+  })
+
+  it('only explicit user actions dispatch the focus event', () => {
+    const dispatchers = files
+      // 常量与字面量两种写法都算（侧栏以前就是用字面量派发的，同一扇门换个拼法照样是门）。
+      .filter((file) => /new CustomEvent\((FOCUS_GENERATION_NODE_EVENT|['"]nomi-focus-generation-node['"])/.test(stripComments(fs.readFileSync(file, 'utf8'))))
+      .map(relative)
+      .sort()
+    expect(dispatchers).toEqual(Object.keys(FOCUS_DISPATCHERS).sort())
+  })
+
+  it('the created-node reveal pan and its target tracker stay deleted', () => {
+    for (const gone of ['useCreatedNodeVisibilityPan.ts', 'viewportTargetTracker.ts']) {
+      expect(fs.existsSync(path.join(__dirname, gone)), gone).toBe(false)
+    }
+  })
+})

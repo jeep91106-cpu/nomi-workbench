@@ -1,0 +1,655 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nomi — 商业级体验，模型按原价</title>
+<meta name="description" content="开源、本地优先的 AI 视频工作台。Agent 替你拆镜头、出关键帧、做视频、排进时间轴；用的是你自己接的模型，按供应商原价付钱，连 Agent 也不订阅、不加价。" />
+<meta name="robots" content="index,follow,max-image-preview:large" />
+<meta name="theme-color" content="#faf9f6" />
+<link rel="canonical" href="https://nomiaqm.com/" />
+<link rel="alternate" hreflang="zh-CN" href="https://nomiaqm.com/" />
+<link rel="alternate" hreflang="en" href="https://nomiaqm.com/en/" />
+<link rel="alternate" hreflang="x-default" href="https://nomiaqm.com/" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Nomi" />
+<meta property="og:locale" content="zh_CN" />
+<meta property="og:title" content="Nomi — 商业级体验，模型按原价" />
+<meta property="og:description" content="开源、本地优先的 AI 视频工作台。Agent 替你拆镜头、出关键帧、做视频、排进时间轴；用的是你自己接的模型，按供应商原价付钱，连 Agent 也不订阅、不加价。" />
+<meta property="og:url" content="https://nomiaqm.com/" />
+<meta property="og:image" content="https://nomiaqm.com/assets/social-preview-zh.jpg" />
+<meta property="og:image:alt" content="Nomi：对话出片，模型按原价" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Nomi — 商业级体验，模型按原价" />
+<meta name="twitter:description" content="开源、本地优先的 AI 视频工作台。Agent 替你拆镜头、出关键帧、做视频、排进时间轴；用的是你自己接的模型，按供应商原价付钱，连 Agent 也不订阅、不加价。" />
+<meta name="twitter:image" content="https://nomiaqm.com/assets/social-preview-zh.jpg" />
+<meta name="twitter:image:alt" content="Nomi：对话出片，模型按原价" />
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"WebSite","@id":"https://nomiaqm.com/#website","name":"Nomi","url":"https://nomiaqm.com/","inLanguage":["zh-CN","en"]},{"@type":"WebPage","@id":"https://nomiaqm.com/","url":"https://nomiaqm.com/","name":"Nomi — 商业级体验，模型按原价","description":"开源、本地优先的 AI 视频工作台。Agent 替你拆镜头、出关键帧、做视频、排进时间轴；用的是你自己接的模型，按供应商原价付钱，连 Agent 也不订阅、不加价。","inLanguage":"zh-CN","isPartOf":{"@id":"https://nomiaqm.com/#website"},"about":{"@id":"https://nomiaqm.com/#application"},"primaryImageOfPage":{"@type":"ImageObject","contentUrl":"https://nomiaqm.com/assets/social-preview-zh.jpg"}},{"@type":"SoftwareApplication","@id":"https://nomiaqm.com/#application","name":"Nomi","applicationCategory":"MultimediaApplication","operatingSystem":"macOS, Windows","codeRepository":"https://github.com/aqm857886159/Nomi","license":"https://www.gnu.org/licenses/agpl-3.0.html","url":"https://nomiaqm.com/","softwareVersion":"0.23.2","downloadUrl":"https://github.com/aqm857886159/Nomi/releases/latest"}]}</script>
+<script>(() => {
+  if (location.pathname !== '/') return
+  const localeKey = 'nomi_locale'
+  const preferred = (() => { try { return localStorage.getItem(localeKey) } catch { return null } })()
+  const browserLanguages = navigator.languages || [navigator.language || '']
+  const browserLocale = browserLanguages
+    .map((value) => String(value).toLowerCase())
+    .map((value) => value.startsWith('zh') ? 'zh-CN' : value.startsWith('en') ? 'en' : null)
+    .find(Boolean)
+  const resolvedLocale = preferred === 'en' || preferred === 'zh-CN' ? preferred : browserLocale
+  if (resolvedLocale === 'en') location.replace('/en/' + location.search + location.hash)
+})()</script>
+<link rel="icon" type="image/svg+xml" href="/assets/nomi-logo.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700;900&display=swap" />
+<style>
+:root {
+  --ground: #faf9f6;
+  --paper: #ffffff;
+  --ink: #1e1b17;
+  --ink-2: #4a463f;
+  --ink-3: #6b665e;
+  --ink-4: #a19b92;
+  --line: #e6e2db;
+  --line-soft: #efece6;
+  --dot: #e2ddd5;
+  --accent: #2e6cb4;
+  --accent-soft: #e9f0f9;
+  --shadow-node: 0 1px 2px rgb(30 27 23 / 0.05), 0 12px 32px rgb(30 27 23 / 0.07);
+  --shadow-window: 0 2px 4px rgb(30 27 23 / 0.05), 0 30px 70px rgb(30 27 23 / 0.13);
+  --font-en: "Fraunces", Georgia, "Times New Roman", serif;
+  --font-zh: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-ui: "Inter", "Noto Sans SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+  --radius: 10px;
+  --radius-lg: 16px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #151311;
+    --paper: #1d1b18;
+    --ink: #eeeae3;
+    --ink-2: #cdc7bd;
+    --ink-3: #a29b90;
+    --ink-4: #6f695f;
+    --line: #2f2c27;
+    --line-soft: #26231f;
+    --dot: #2a2723;
+    --accent: #78a6e0;
+    --accent-soft: #1e2a3a;
+    --shadow-node: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 32px rgb(0 0 0 / 0.35);
+    --shadow-window: 0 2px 4px rgb(0 0 0 / 0.3), 0 30px 70px rgb(0 0 0 / 0.5);
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background-color: var(--ground);
+  background-image: radial-gradient(var(--dot) 1px, transparent 1.2px);
+  background-size: 22px 22px;
+  color: var(--ink);
+  font-family: var(--font-zh);
+  font-size: 16px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+html[lang="en"] body { font-family: var(--font-ui); }
+body.modal-open { overflow: hidden; }
+a { color: inherit; }
+img, video { max-width: 100%; display: block; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+.skip-link { position: absolute; left: 16px; top: -48px; z-index: 50; background: var(--ink); color: var(--ground); padding: 8px 14px; border-radius: 8px; }
+.skip-link:focus { top: 12px; }
+.wrap { width: 100%; max-width: 1180px; margin: 0 auto; padding-inline: 24px; }
+@media (max-width: 560px) { .wrap { padding-inline: 16px; } }
+
+.eyebrow { margin: 0; font-family: var(--font-ui); font-size: 13px; font-weight: 500; letter-spacing: 0.06em; color: var(--ink-3); text-transform: uppercase; }
+.display { margin: 14px 0 0; font-weight: 900; letter-spacing: -0.01em; text-wrap: balance; font-size: clamp(40px, 5.4vw, 68px); line-height: 1.12; }
+.display em { font-style: normal; color: var(--accent); }
+html[lang="en"] .display { font-family: var(--font-en); font-weight: 600; letter-spacing: -0.02em; line-height: 1.04; }
+.lede { margin: 22px 0 0; font-size: 19px; line-height: 1.75; color: var(--ink-2); max-width: 30em; }
+h2 { margin: 10px 0 0; font-weight: 900; font-size: clamp(30px, 3.6vw, 44px); line-height: 1.2; letter-spacing: -0.005em; text-wrap: balance; }
+html[lang="en"] h2 { font-family: var(--font-en); font-weight: 600; letter-spacing: -0.015em; }
+.body { margin: 16px 0 0; color: var(--ink-2); font-size: 17px; max-width: 34em; }
+
+.button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  font-family: var(--font-ui); font-weight: 600; font-size: 15px; line-height: 1;
+  padding: 13px 20px; border-radius: 999px; text-decoration: none; cursor: pointer; border: 1px solid transparent;
+  background: none; color: inherit;
+  transition: transform 140ms cubic-bezier(.2,.7,.3,1), background-color 140ms, border-color 140ms;
+}
+.button:active { transform: translateY(1px); }
+.button.primary { background: var(--ink); color: var(--ground); }
+.button.primary:hover { background: var(--ink-2); }
+.button.quiet { background: var(--paper); color: var(--ink); border-color: var(--line); }
+.button.quiet:hover { border-color: var(--ink-4); }
+.button.small { padding: 9px 15px; font-size: 14px; }
+
+.site-header { position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--ground) 88%, transparent); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border-bottom: 1px solid var(--line-soft); }
+.nav { display: flex; align-items: center; gap: 28px; height: 60px; }
+.brand { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; flex-shrink: 0; }
+.wordmark { font-family: var(--font-en); font-weight: 600; font-size: 24px; letter-spacing: -0.01em; line-height: 1; }
+.wordmark span { color: var(--accent); }
+.wordmark.small { font-size: 20px; }
+.nav-links { display: flex; gap: 22px; font-family: var(--font-ui); font-size: 14px; color: var(--ink-3); }
+.nav-links a { text-decoration: none; white-space: nowrap; }
+.nav-links a:hover, .nav-links a[aria-current="page"] { color: var(--ink); }
+.nav-actions { margin-left: auto; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.locale { font-family: var(--font-ui); font-size: 13px; color: var(--ink-3); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; text-decoration: none; white-space: nowrap; }
+.locale:hover { color: var(--ink); border-color: var(--ink-4); }
+.menu-toggle { display: none; font-family: var(--font-ui); font-size: 13px; background: none; border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; color: var(--ink); cursor: pointer; }
+/* 英文导航最宽，要 820px 才放得下；860px 以下收成「菜单」按钮，中英文用同一个断点。 */
+@media (max-width: 860px) {
+  .menu-toggle { display: inline-flex; }
+  .nav-links { display: none; position: absolute; top: 60px; left: 0; right: 0; flex-direction: column; gap: 0; background: var(--ground); border-bottom: 1px solid var(--line); padding: 8px 16px 16px; }
+  .nav-links.open { display: flex; }
+  .nav-links a { padding: 10px 0; font-size: 16px; }
+  .nav { gap: 12px; }
+}
+
+.block { padding-block: 72px; }
+@media (max-width: 760px) { .block { padding-block: 48px; } }
+.block-head { max-width: 44rem; }
+
+.footer { padding-block: 40px 56px; font-family: var(--font-ui); font-size: 13px; color: var(--ink-4); }
+.footer .wrap { display: flex; flex-wrap: wrap; gap: 10px 26px; align-items: center; }
+.footer a { text-decoration: none; }
+.footer-links { display: flex; flex-wrap: wrap; gap: 10px 20px; }
+.footer a:hover { color: var(--ink); }
+
+.download-options { display: grid; gap: 8px; margin-top: 14px; }
+.download-option { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); text-decoration: none; font-family: var(--font-ui); }
+.download-option:hover { border-color: var(--ink-4); }
+.download-option strong { display: block; font-size: 15px; }
+.download-option small { display: block; color: var(--ink-3); font-size: 12px; }
+.download-option > span:last-child { color: var(--accent); font-weight: 600; font-size: 13px; white-space: nowrap; }
+.mac-install-guide { margin-top: 18px; padding: 14px 16px; border-radius: var(--radius); background: var(--line-soft); font-size: 14px; color: var(--ink-2); }
+.mac-install-guide p, .mac-install-guide ol { margin: 8px 0 0; }
+.mac-install-guide ol { padding-left: 20px; }
+.mac-install-command { display: block; margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--paper); border: 1px solid var(--line); font-family: var(--font-mono); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.download-fallback { padding-block: 40px; }
+
+dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 48px); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 0; background: var(--ground); color: var(--ink); box-shadow: var(--shadow-window); }
+dialog::backdrop { background: rgb(20 18 16 / 0.45); }
+.dialog-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--line-soft); font-family: var(--font-ui); }
+.dialog-close { background: none; border: 0; font-size: 22px; line-height: 1; cursor: pointer; color: var(--ink-3); padding: 4px 8px; }
+.dialog-body { padding: 16px 18px 20px; overflow-y: auto; }
+.dialog-body > p { margin: 0; color: var(--ink-2); font-size: 14px; }
+
+.button.on-dark { color: var(--ground); border-color: color-mix(in srgb, var(--ground) 30%, transparent); }
+.button.on-dark:hover { border-color: var(--ground); }
+.hero { padding-block: 72px 56px; }
+.hero-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 56px; align-items: center; }
+@media (max-width: 960px) { .hero-grid { grid-template-columns: 1fr; gap: 40px; } .hero { padding-block: 44px 36px; } }
+.hero-actions { margin-top: 30px; display: flex; flex-wrap: wrap; gap: 12px; }
+.hero-meta { margin: 18px 0 0; font-family: var(--font-ui); font-size: 13px; color: var(--ink-4); }
+.mac-download-note { margin: 6px 0 0; font-size: 13px; color: var(--ink-3); }
+.mac-download-note a { color: var(--accent); }
+.window { margin: 0; background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: var(--shadow-window); overflow: hidden; }
+.window-bar { display: flex; align-items: center; gap: 7px; height: 34px; padding-inline: 14px; border-bottom: 1px solid var(--line-soft); }
+.window-bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
+.window-bar span { margin-left: 10px; font-family: var(--font-ui); font-size: 12px; color: var(--ink-4); }
+.film { position: relative; aspect-ratio: 16 / 9; max-width: 100%; background: #111; }
+.film-video { width: 100%; height: 100%; object-fit: cover; }
+/* 样张里的「播放宣传片（有声音）」：放在右侧图片区上方，不压海报标题、不压原生控件条。脚本在才显示。 */
+.film-play { position: absolute; right: clamp(12px, 3%, 28px); top: 38%; display: inline-flex; align-items: center; gap: 10px; border: 0; cursor: pointer; background: var(--ink); color: var(--ground); font-family: var(--font-ui); font-weight: 600; font-size: 15px; padding: 12px 20px 12px 16px; border-radius: 999px; box-shadow: 0 10px 30px rgb(0 0 0 / 0.25); }
+.film-play:hover { background: var(--ink-2); }
+@media (max-width: 560px) { .film-play { font-size: 13px; padding: 8px 13px 8px 11px; top: 24%; } }
+.gap-card { margin-top: 36px; background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 32px clamp(20px, 4vw, 44px); }
+.bar-row + .bar-row { margin-top: 26px; }
+.bar-label { font-size: 15px; color: var(--ink-3); }
+.bar { margin-top: 10px; height: 16px; border-radius: 999px; }
+.bar.commercial { width: 100%; background: var(--ink); }
+.bar.yours { width: 22%; background: var(--accent); }
+.gap-note { margin: 22px 0 0; font-size: 14px; color: var(--ink-3); }
+.facts { margin-top: 28px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 820px) { .facts { grid-template-columns: 1fr; } }
+.fact { padding: 18px 20px 4px; border-top: 2px solid var(--ink); }
+.fact h3 { margin: 0; font-size: 17px; font-weight: 700; }
+.fact p { margin: 6px 0 0; font-size: 15px; color: var(--ink-3); }
+.feature { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 56px; align-items: center; padding-block: 44px; }
+.feature.flip .feature-text { order: 2; }
+@media (max-width: 960px) { .feature, .feature.flip { grid-template-columns: 1fr; gap: 20px; padding-block: 32px; } .feature.flip .feature-text { order: 0; } }
+.feature h3 { margin: 8px 0 0; font-size: clamp(24px, 2.6vw, 32px); font-weight: 900; line-height: 1.25; text-wrap: balance; }
+html[lang="en"] .feature h3 { font-family: var(--font-en); font-weight: 600; letter-spacing: -0.01em; }
+.feature p { margin: 12px 0 0; color: var(--ink-2); max-width: 30em; }
+.feature .kicker { margin: 0; font-family: var(--font-ui); font-size: 13px; color: var(--accent); font-weight: 600; }
+.node-title { margin: 0 0 6px 2px; font-family: var(--font-ui); font-size: 12px; color: var(--ink-4); }
+.node-frame { position: relative; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); box-shadow: var(--shadow-node); background: #111; aspect-ratio: 16 / 9; max-width: 100%; }
+.node-frame video { width: 100%; height: 100%; object-fit: cover; }
+.node-frame::before, .node-frame::after { content: ""; position: absolute; top: 50%; width: 9px; height: 9px; margin-top: -4.5px; border-radius: 50%; background: var(--paper); border: 1px solid var(--ink-4); z-index: 2; }
+.node-frame::before { left: 6px; }
+.node-frame::after { right: 6px; }
+.segment-time { position: absolute; right: 10px; bottom: 10px; z-index: 2; font-family: var(--font-ui); font-size: 11px; color: #fff; background: rgb(20 18 16 / 0.62); padding: 2px 7px; border-radius: 6px; font-variant-numeric: tabular-nums; }
+.open-grid { margin-top: 32px; display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 40px; align-items: start; }
+@media (max-width: 900px) { .open-grid { grid-template-columns: 1fr; } }
+.tree { background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 24px 26px; font-family: var(--font-mono); font-size: 15px; line-height: 2; overflow-x: auto; }
+.tree div { display: flex; gap: 24px; white-space: nowrap; }
+.tree .root { font-weight: 600; }
+.tree .note { color: var(--ink-4); font-family: var(--font-zh); font-size: 14px; }
+html[lang="en"] .tree .note { font-family: var(--font-ui); }
+.checks { list-style: none; margin: 0; padding: 0; display: grid; gap: 14px; }
+.checks li { padding-left: 26px; position: relative; color: var(--ink-2); }
+.checks li::before { content: ""; position: absolute; left: 0; top: 0.62em; width: 12px; height: 7px; border-left: 2px solid var(--accent); border-bottom: 2px solid var(--accent); transform: rotate(-45deg); }
+.open-actions { margin-top: 24px; display: flex; flex-wrap: wrap; gap: 12px; }
+.vision { background: var(--ink); color: var(--ground); border-radius: var(--radius-lg); padding: clamp(28px, 5vw, 56px); display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 40px; align-items: center; }
+@media (max-width: 900px) { .vision { grid-template-columns: 1fr; } }
+.vision .eyebrow { color: color-mix(in srgb, var(--ground) 60%, transparent); }
+.vision h2 { color: var(--ground); }
+.vision .body { color: color-mix(in srgb, var(--ground) 78%, transparent); }
+.qr-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.qr { margin: 0; background: #fff; border-radius: var(--radius); padding: 10px; width: 150px; }
+.qr img { width: 100%; height: auto; }
+.qr figcaption { font-size: 12px; color: #4a463f; text-align: center; margin-top: 6px; line-height: 1.4; }
+.teams { margin-top: 20px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px 32px; padding: 24px clamp(20px, 4vw, 32px); border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--paper); }
+.teams h3 { margin: 0; font-size: 18px; }
+.teams p { margin: 4px 0 0; color: var(--ink-3); font-size: 15px; }
+.teams .hero-actions { margin-top: 0; }
+.qr-content { display: grid; justify-items: center; gap: 12px; text-align: center; }
+.qr-content img { width: min(240px, 70vw); height: auto; border-radius: var(--radius); background: #fff; padding: 8px; }
+</style>
+</head>
+<body class="page-home">
+<a class="skip-link" href="#main">跳到主要内容</a>
+<header class="site-header">
+  <nav class="nav wrap" aria-label="主导航">
+    <a class="brand" href="/" aria-label="Nomi"><img src="/assets/nomi-logo.svg" width="26" height="26" alt="" /><span class="wordmark">No<span>mi</span></span></a>
+    <div class="nav-links" id="nav-links">
+      <a href="/features">功能</a>
+      <a href="/models">模型</a>
+      <a href="/prompts">提示词</a>
+      <a href="/skills">技能</a>
+      <a href="/quickstart">上手</a>
+      <a href="#community">社区</a>
+    </div>
+    <div class="nav-actions">
+      <a class="locale" href="/en/" data-locale-choice="en" aria-label="切换到英文">EN</a>
+      <a class="button primary small" data-download-nomi href="#download-options">下载</a>
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="nav-links">菜单</button>
+    </div>
+  </nav>
+</header>
+<main id="main">
+<section class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div class="hero-copy">
+      <p class="eyebrow">开源 · 本地优先 · AI 视频工作台</p>
+      <h1 class="display"><span>商业级体验，</span> <em>模型按原价。</em></h1>
+      <p class="lede">Nomi 给你商业产品级别的 AI 视频工作流，底下跑的是你自己接的模型。钱直接付给供应商，上游什么价你就付什么价——连 Agent 用的也是你挑的模型。</p>
+      <div class="hero-actions">
+        <a class="button primary" data-download-nomi href="#download-options">下载 Nomi</a>
+        <a class="button quiet" data-github-hero href="https://github.com/aqm857886159/Nomi" target="_blank" rel="noreferrer">在 GitHub 上看源码 ↗</a>
+      </div>
+      <p class="hero-meta">macOS · Windows · AGPL-3.0 · 不用注册</p>
+      <p class="mac-download-note">macOS 安装包暂未签名或公证，首次打开可能被系统拦截。 <a href="#download-options" data-open-dialog="download-dialog">查看安全打开方法</a></p>
+    </div>
+    <figure class="window" id="film">
+      <div class="window-bar" aria-hidden="true"><i></i><i></i><i></i><span>Nomi 0.22 · 90 秒看懂</span></div>
+      <div class="film"><video class="film-video" data-film src="/assets/video/nomi-0.22-film.mp4" poster="/assets/promo-0.22/cover-zh-light.jpg" controls preload="none" playsinline aria-label="Nomi 0.22 宣传片封面：对话出片，模型按原价"></video><button class="film-play" type="button" data-film-play hidden><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 1.5v11l9-5.5z" fill="currentColor" /></svg>播放宣传片（有声音）</button></div>
+    </figure>
+  </div>
+</section>
+<section class="block" id="price" aria-labelledby="price-title">
+  <div class="wrap">
+    <div class="block-head">
+      <p class="eyebrow">为什么是 Nomi</p>
+      <h2 id="price-title">同一个模型，别多付几倍。</h2>
+      <p class="body">中转站、官方 API、ComfyUI、本地模型，本身都很便宜。商业 AI 视频产品用的往往是同一批模型，价钱却常常翻几倍。</p>
+    </div>
+    <div class="gap-card" role="img" aria-label="示意图：商业产品的价格条远长于直接用模型的价格条">
+      <div class="bar-row"><div class="bar-label">商业产品</div><div class="bar commercial"></div></div>
+      <div class="bar-row"><div class="bar-label">中转站 · 官方 API · ComfyUI · 本地模型</div><div class="bar yours"></div></div>
+      <p class="gap-note">示意，不是具体报价：各家价格一直在变，Nomi 不替你算价，也不经手你的钱。</p>
+    </div>
+    <div class="facts"><div class="fact"><h3>接哪家都行</h3><p>APIMart、Kie.ai、火山方舟、魔搭社区、即梦会员、任意 OpenAI 兼容的中转站，或者你本地的 ComfyUI。</p></div><div class="fact"><h3>钱不经过 Nomi</h3><p>用你自己的 Key，直接按供应商的价付。Nomi 不代理、不转售任何模型调用。</p></div><div class="fact"><h3>Agent 也按原价</h3><p>帮你干活的 Agent，用的也是你接的模型——包括免费的。不订阅，不加价。</p></div></div>
+  </div>
+</section>
+<section class="block" id="features" aria-labelledby="features-title">
+  <div class="wrap">
+    <div class="block-head">
+      <p class="eyebrow">0.22 能做什么</p>
+      <h2 id="features-title">从一句话，到排好的时间轴。</h2>
+    </div>
+    <article class="feature" data-feature="agent">
+      <div class="feature-text">
+        <p class="kicker">Agent</p>
+        <h3>说一句，它就开始干活</h3>
+        <p>说说你想拍什么。Agent 会看你的画布、把故事拆成镜头、出关键帧、做成视频、排进时间轴。它做的每样东西都落在画布上，看得见，也随时能改。</p>
+      </div>
+      <div class="node">
+        <p class="node-title">Agent · 一句话出四个镜头</p>
+        <div class="node-frame">
+          <video class="segment" data-segment data-start="13" data-end="22" src="/assets/video/nomi-0.22-film.mp4#t=13,22" poster="/assets/promo-0.22/still-agent.jpg" muted playsinline preload="none" aria-label="Nomi 的 Agent 把一句需求变成画布上的四张关键帧"></video>
+          <span class="segment-time">0:13–0:22</span>
+        </div>
+      </div>
+    </article>
+<article class="feature flip" data-feature="charge">
+      <div class="feature-text">
+        <p class="kicker">你说了算</p>
+        <h3>每一步问不问你，你来定</h3>
+        <p>三档：每步问、自动改（花钱的生成仍然先问）、全自动。切到全自动要你亲手确认一次；不可逆的操作永远先问。</p>
+      </div>
+      <div class="node">
+        <p class="node-title">Agent · 自主程度</p>
+        <div class="node-frame">
+          <video class="segment" data-segment data-start="29" data-end="35" src="/assets/video/nomi-0.22-film.mp4#t=29,35" poster="/assets/promo-0.22/still-charge.jpg" muted playsinline preload="none" aria-label="Agent 面板里切到全自动前的确认卡"></video>
+          <span class="segment-time">0:29–0:35</span>
+        </div>
+      </div>
+    </article>
+<article class="feature" data-feature="storyboard">
+      <div class="feature-text">
+        <p class="kicker">分镜表</p>
+        <h3>一镜一镜，由你导演</h3>
+        <p>一镜一行：提示词、首帧、模型、时长，一眼看全。给角色或场景锁一张参考卡，用到它的镜头都还是同一张脸。</p>
+      </div>
+      <div class="node">
+        <p class="node-title">分镜表 · 黄雨衣女孩的海边一天</p>
+        <div class="node-frame">
+          <video class="segment" data-segment data-start="35" data-end="44" src="/assets/video/nomi-0.22-film.mp4#t=35,44" poster="/assets/promo-0.22/still-storyboard.jpg" muted playsinline preload="none" aria-label="分镜表里四个镜头都已出片，角色参考卡已锁定"></video>
+          <span class="segment-time">0:35–0:44</span>
+        </div>
+      </div>
+    </article>
+<article class="feature flip" data-feature="director">
+      <div class="feature-text">
+        <p class="kicker">3D 导演台</p>
+        <h3>拿起手机，就是取景器</h3>
+        <p>摆好人物姿势、定好机位，用手机取景。拍到的画面直接回到画布上，接着拿去做视频。</p>
+      </div>
+      <div class="node">
+        <p class="node-title">导演台 · 街角咖啡馆</p>
+        <div class="node-frame">
+          <video class="segment" data-segment data-start="44" data-end="58" src="/assets/video/nomi-0.22-film.mp4#t=44,58" poster="/assets/promo-0.22/still-director.jpg" muted playsinline preload="none" aria-label="3D 导演台和手机取景页"></video>
+          <span class="segment-time">0:44–0:58</span>
+        </div>
+      </div>
+    </article>
+<article class="feature" data-feature="model">
+      <div class="feature-text">
+        <p class="kicker">换模型</p>
+        <h3>哪家模型都能用，一镜一换</h3>
+        <p>同一个镜头，Seedance、可灵、Wan、海螺随手换一版。模型下拉里直接看得到每个模型在哪几家能用。</p>
+      </div>
+      <div class="node">
+        <p class="node-title">空镜 · 清晨渔港</p>
+        <div class="node-frame">
+          <video class="segment" data-segment data-start="58" data-end="66" src="/assets/video/nomi-0.22-film.mp4#t=58,66" poster="/assets/promo-0.22/still-model.jpg" muted playsinline preload="none" aria-label="同一张视频卡换成可灵 3.0 再拍一版"></video>
+          <span class="segment-time">0:58–1:06</span>
+        </div>
+      </div>
+    </article>
+<article class="feature flip" data-feature="newmodel">
+      <div class="feature-text">
+        <p class="kicker">新模型</p>
+        <h3>新模型，当天就能用</h3>
+        <p>点「用 AI 帮我接入」，让 Claude Code 或 Codex 替你接：地址、参数、模型 ID 它去查；Key 你在 Nomi 自己的页面里贴，助手看不到；真跑一次验证，通过了才上列表。</p>
+      </div>
+      <div class="node">
+        <p class="node-title">设置 · 模型</p>
+        <div class="node-frame">
+          <video class="segment" data-segment data-start="66" data-end="75" src="/assets/video/nomi-0.22-film.mp4#t=66,75" poster="/assets/promo-0.22/still-newmodel.jpg" muted playsinline preload="none" aria-label="「用 AI 帮我接入」卡片，五步都已完成"></video>
+          <span class="segment-time">1:06–1:15</span>
+        </div>
+      </div>
+    </article>
+  </div>
+</section>
+<section class="block" id="open" aria-labelledby="open-title">
+  <div class="wrap">
+    <div class="block-head">
+      <p class="eyebrow">东西都是你的</p>
+      <h2 id="open-title">一个项目，就是你硬盘上的一个文件夹。</h2>
+    </div>
+    <div class="open-grid">
+      <div class="tree" role="img" aria-label="一个 Nomi 项目的文件夹结构"><div><span class="root">海边小镇/</span></div><div><span>├─ .nomi/project.json</span><span class="note">画布、分镜、时间轴</span></div><div><span>├─ assets/generated/</span><span class="note">每一张图、每一段视频</span></div><div><span>└─ exports/海边小镇.mp4</span><span class="note">成片</span></div></div>
+      <div>
+        <ul class="checks"><li>不用注册账号。默认不上报任何数据；想帮忙改进的话，可以在设置里自愿开启匿名统计，随时能关。</li><li>调用外部模型时，只把完成这一次生成必需的内容发给你配置的那家。</li><li>代码全部开源（AGPL-3.0），想改成什么样都行，也可以让你的 AI 编程助手来改。</li></ul>
+        <div class="open-actions">
+          <a class="button quiet" href="https://github.com/aqm857886159/Nomi" target="_blank" rel="noreferrer">查看 GitHub</a>
+          <a class="button quiet" href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">查看许可证</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<section class="block" id="community" aria-labelledby="community-title">
+  <div class="wrap">
+    <div class="vision">
+      <div>
+        <p class="eyebrow">下一步</p>
+        <h2 id="community-title">AI 剪辑。然后是一站式的内容创作 AI 工作台。</h2>
+        <p class="body">Nomi 是一个人起头的开源项目，更新很快。遇到问题直接说，大家都会碰到的会并进主线；想一起做，欢迎来。</p>
+        <div class="hero-actions">
+          <a class="button on-dark" href="https://github.com/aqm857886159/Nomi" target="_blank" rel="noreferrer">GitHub</a>
+          <a class="button on-dark" href="https://github.com/aqm857886159/Nomi/discussions" target="_blank" rel="noreferrer">讨论区</a>
+          <a class="button on-dark" href="https://www.bilibili.com/video/BV1Lf8b6nEjf/" target="_blank" rel="noreferrer">B 站</a>
+        </div>
+      </div>
+      <div class="qr-row">
+        <figure class="qr" id="community-qr"><img src="/assets/group-wechat-2026-10-25.jpg" alt="Nomi 用户群微信二维码" width="140" height="210" /><figcaption>扫码进用户群</figcaption></figure>
+        <figure class="qr"><img src="/assets/qingyang-wechat.jpg" alt="Nomi 维护者微信二维码" width="140" height="140" /><figcaption>群码过期加维护者 TZ857886159</figcaption></figure>
+      </div>
+    </div>
+    <div class="teams">
+      <div><h3>团队要把 Nomi 放进真实生产流程？</h3><p>定制开发、系统集成、AGPL 合规部署、长期迭代。</p></div>
+      <div class="hero-actions">
+        <button class="button quiet" type="button" data-open-dialog="author-dialog">添加维护者微信</button>
+        <a class="button quiet" href="https://github.com/aqm857886159/Nomi/issues/new?template=business_inquiry.yml" target="_blank" rel="noreferrer">提交项目需求</a>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+<footer class="footer">
+  <div class="wrap">
+    <span class="wordmark small">No<span>mi</span></span>
+    <nav class="footer-links" aria-label="站内导航">
+      <a href="/features">功能</a>
+      <a href="/models">模型</a>
+      <a href="/prompts">提示词</a>
+      <a href="/skills">技能</a>
+      <a href="/quickstart">上手</a>
+    </nav>
+    <a href="https://github.com/aqm857886159/Nomi" target="_blank" rel="noreferrer">GitHub 源码</a>
+    <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">AGPL-3.0 开源</a>
+    <a href="https://github.com/aqm857886159/Nomi/releases" target="_blank" rel="noreferrer">更新说明</a>
+    <a href="https://x.com/sdf297417627618" target="_blank" rel="noreferrer">X / Twitter</a>
+    <a href="/en/" data-locale-choice="en">English</a>
+    <span class="made">宣传片里的界面都是 Nomi 的真实组件，画面素材都由 Nomi 生成。</span>
+  </div>
+</footer>
+<dialog id="author-dialog" aria-labelledby="author-title">
+  <div class="dialog-head"><strong id="author-title">添加维护者微信</strong><button class="dialog-close" type="button" aria-label="关闭">×</button></div>
+  <div class="dialog-body qr-content"><img src="/assets/qingyang-wechat.jpg" alt="添加维护者微信" width="960" height="960" /><p>微信号：TZ857886159。请简单说明项目、当前流程和最想解决的问题。</p></div>
+</dialog>
+<dialog id="download-dialog" aria-labelledby="download-title">
+  <div class="dialog-head"><strong id="download-title">选择适合这台电脑的版本</strong><button class="dialog-close" type="button" aria-label="关闭">×</button></div>
+  <div class="dialog-body download-dialog-body"><p>能识别系统时会直接下载；无法可靠判断 Mac 芯片时，请选择对应安装包。</p><div class="download-options"><a class="download-option" data-direct-download href="https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-windows-setup.exe"><span><strong>Windows x64</strong><small>Windows 10 / 11 · .exe 安装包</small></span><span aria-hidden="true">EXE ↓</span></a><a class="download-option" data-direct-download href="https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-mac-arm64.dmg"><span><strong>Mac Apple 芯片</strong><small>macOS 12+ · M1 / M2 / M3 / M4 · .dmg 安装包</small></span><span aria-hidden="true">ARM64 ↓</span></a><a class="download-option" data-direct-download href="https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-mac-intel.dmg"><span><strong>Mac Intel 芯片</strong><small>macOS 12+ · Intel 处理器 · .dmg 安装包</small></span><span aria-hidden="true">X64 ↓</span></a></div><section class="mac-install-guide" data-mac-install-guide>
+  <strong class="mac-install-guide-title">macOS 第一次打开</strong>
+  <p>当前 macOS 安装包未使用 Apple Developer ID 签名，也未经过 Apple 公证。请只使用本页或 Nomi GitHub 官方仓库的下载链接。</p>
+  <ol><li>下载对应的 DMG，双击打开，把 Nomi 拖到“应用程序”上。</li><li>从“应用程序”打开 Nomi。第一次会被系统拦下：关掉提示，不要点“移到废纸篓”。</li><li>打开“系统设置” → “隐私与安全性”，往下找到“安全性”，在 Nomi 那条提示旁点“仍要打开”并确认（macOS 12 在“系统偏好设置” → “安全性与隐私” → “通用”里）。</li></ol>
+  <p>仅当 macOS 提示 Nomi“已损坏”时：先确认安装包来自上述官方链接，再打开“终端”运行：</p>
+  <code class="mac-install-command">xattr -dr com.apple.quarantine "/Applications/Nomi.app"</code>
+  <p class="mac-install-safety">不需要、也不要全局关闭 Gatekeeper。</p>
+</section></div>
+</dialog>
+<noscript><section class="download-fallback" id="download-options"><div class="wrap"><h2>选择适合这台电脑的版本</h2><p>能识别系统时会直接下载；无法可靠判断 Mac 芯片时，请选择对应安装包。</p><div class="download-options"><a class="download-option" data-direct-download href="https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-windows-setup.exe"><span><strong>Windows x64</strong><small>Windows 10 / 11 · .exe 安装包</small></span><span aria-hidden="true">EXE ↓</span></a><a class="download-option" data-direct-download href="https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-mac-arm64.dmg"><span><strong>Mac Apple 芯片</strong><small>macOS 12+ · M1 / M2 / M3 / M4 · .dmg 安装包</small></span><span aria-hidden="true">ARM64 ↓</span></a><a class="download-option" data-direct-download href="https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-mac-intel.dmg"><span><strong>Mac Intel 芯片</strong><small>macOS 12+ · Intel 处理器 · .dmg 安装包</small></span><span aria-hidden="true">X64 ↓</span></a></div><section class="mac-install-guide" data-mac-install-guide>
+  <strong class="mac-install-guide-title">macOS 第一次打开</strong>
+  <p>当前 macOS 安装包未使用 Apple Developer ID 签名，也未经过 Apple 公证。请只使用本页或 Nomi GitHub 官方仓库的下载链接。</p>
+  <ol><li>下载对应的 DMG，双击打开，把 Nomi 拖到“应用程序”上。</li><li>从“应用程序”打开 Nomi。第一次会被系统拦下：关掉提示，不要点“移到废纸篓”。</li><li>打开“系统设置” → “隐私与安全性”，往下找到“安全性”，在 Nomi 那条提示旁点“仍要打开”并确认（macOS 12 在“系统偏好设置” → “安全性与隐私” → “通用”里）。</li></ol>
+  <p>仅当 macOS 提示 Nomi“已损坏”时：先确认安装包来自上述官方链接，再打开“终端”运行：</p>
+  <code class="mac-install-command">xattr -dr com.apple.quarantine "/Applications/Nomi.app"</code>
+  <p class="mac-install-safety">不需要、也不要全局关闭 Gatekeeper。</p>
+</section></div></section></noscript>
+<script>(() => {
+  const downloadUrls = {"windowsX64":"https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-windows-setup.exe","macArm64":"https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-mac-arm64.dmg","macX64":"https://github.com/aqm857886159/Nomi/releases/latest/download/Nomi-mac-intel.dmg"}
+  const selectDownload = function selectDownload({ platform = '', userAgent = '', architecture = '' } = {}) {
+  const platformText = `${platform} ${userAgent}`.toLowerCase()
+  const architectureText = String(architecture).toLowerCase()
+
+  if (/\b(?:win32|win64|windows)\b/.test(platformText) && !/arm/.test(architectureText)) return downloadUrls.windowsX64
+  if (!/mac|darwin|iphone|ipad/.test(platformText)) return null
+  if (/arm|aarch64/.test(architectureText) || /arm64/.test(platformText)) return downloadUrls.macArm64
+  if (/x86|x64|intel/.test(architectureText)) return downloadUrls.macX64
+  return null
+}
+  const resolveDownloadRequest = function resolveDownloadRequest({ search = '', platform = '', userAgent = '', architecture = '' } = {}) {
+  const params = new URLSearchParams(search)
+  const requestedPlatform = params.get('platform') || ''
+  const requestedArchitecture = params.get('arch') || ''
+  const hasExplicitTarget = params.has('platform') || params.has('arch')
+  const url = hasExplicitTarget
+    ? selectDownload({ platform: requestedPlatform, architecture: requestedArchitecture })
+    : selectDownload({ platform, userAgent, architecture })
+
+  return {
+    autoDownload: params.get('download') === '1',
+    hasExplicitTarget,
+    url,
+  }
+}
+  const localeKey = 'nomi_locale'
+  document.querySelectorAll('[data-locale-choice]').forEach((link) => {
+    if (location.hash) {
+      const destination = new URL(link.href, location.href)
+      destination.hash = location.hash
+      link.href = destination.pathname + destination.search + destination.hash
+    }
+    link.addEventListener('click', () => {
+      try { localStorage.setItem(localeKey, link.dataset.localeChoice) } catch {}
+    })
+  })
+
+  const menuToggle = document.querySelector('.menu-toggle')
+  const navLinks = document.querySelector('#nav-links')
+  const closeMenu = () => {
+    navLinks?.classList.remove('open')
+    menuToggle?.setAttribute('aria-expanded', 'false')
+  }
+  menuToggle?.addEventListener('click', () => {
+    const open = navLinks?.classList.toggle('open') || false
+    menuToggle.setAttribute('aria-expanded', String(open))
+  })
+  navLinks?.querySelectorAll('a').forEach((link) => link.addEventListener('click', closeMenu))
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && navLinks?.classList.contains('open')) {
+      closeMenu()
+      menuToggle?.focus()
+    }
+  })
+
+  // 库页面的「复制」：复制按钮指向的那块提示词原文；剪贴板被拒时退回「选中它」，让人自己按复制。
+  document.querySelectorAll('[data-copy]').forEach((button) => button.addEventListener('click', async () => {
+    const source = document.getElementById(button.dataset.copy)
+    if (!source) return
+    try {
+      await navigator.clipboard.writeText(source.innerText.trim())
+      button.dataset.copied = 'true'
+      setTimeout(() => { delete button.dataset.copied }, 1600)
+    } catch {
+      const range = document.createRange()
+      range.selectNodeContents(source)
+      const selection = window.getSelection()
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+    }
+  }))
+
+  // 首屏片子是原生播放器（不用脚本也能播）；脚本在时再亮出样张里那颗「播放宣传片（有声音）」，开播后自己消失。
+  const film = document.querySelector('video[data-film]')
+  const filmPlay = document.querySelector('[data-film-play]')
+  if (film && filmPlay) {
+    filmPlay.hidden = false
+    filmPlay.addEventListener('click', () => { film.play().catch(() => {}) })
+    film.addEventListener('play', () => filmPlay.remove(), { once: true })
+  }
+
+  // 功能段：同一个片子文件，只在 [start, end] 这几秒里循环；滚到眼前才静音播放，减少动效偏好时不自动播。
+  const segments = Array.from(document.querySelectorAll('video[data-segment]'))
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  segments.forEach((video) => {
+    const start = Number(video.dataset.start)
+    const end = Number(video.dataset.end)
+    video.addEventListener('loadedmetadata', () => { video.currentTime = start })
+    video.addEventListener('timeupdate', () => {
+      if (video.currentTime >= end || video.currentTime < start - 0.5) video.currentTime = start
+    })
+    if (reduceMotion) { video.controls = true; video.preload = 'metadata' }
+  })
+  if (!reduceMotion && 'IntersectionObserver' in window) {
+    const observer = new IntersectionObserver((entries) => entries.forEach((entry) => {
+      const video = entry.target
+      if (entry.isIntersecting) {
+        if (video.preload === 'none') video.preload = 'auto'
+        video.play().catch(() => {})
+      } else {
+        video.pause()
+      }
+    }), { threshold: 0.35 })
+    segments.forEach((video) => observer.observe(video))
+  }
+  document.querySelectorAll('[data-open-dialog]').forEach((trigger) => trigger.addEventListener('click', (event) => {
+    const dialog = document.querySelector('#' + trigger.dataset.openDialog)
+    if (!dialog || typeof dialog.showModal !== 'function') return
+    event.preventDefault()
+    dialog.showModal()
+    document.body.classList.add('modal-open')
+  }))
+  document.querySelectorAll('dialog').forEach((dialog) => {
+    dialog.querySelector('.dialog-close')?.addEventListener('click', () => dialog.close())
+    dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close() })
+    dialog.addEventListener('close', () => {
+      if (!document.querySelector('dialog[open]')) document.body.classList.remove('modal-open')
+    })
+  })
+
+  const downloadDialog = document.querySelector('#download-dialog')
+  const showDownloadOptions = () => {
+    if (!downloadDialog || typeof downloadDialog.showModal !== 'function') return
+    downloadDialog.showModal()
+    document.body.classList.add('modal-open')
+  }
+  downloadDialog?.querySelectorAll('[data-direct-download]').forEach((link) => link.addEventListener('click', () => {
+    downloadDialog.close()
+  }))
+
+  const resolvePlatformDownload = async () => {
+    const platform = navigator.platform || ''
+    const userAgent = navigator.userAgent || ''
+    let architecture = ''
+    if (navigator.userAgentData?.getHighEntropyValues) {
+      try { architecture = (await navigator.userAgentData.getHighEntropyValues(['architecture'])).architecture || '' } catch {}
+    }
+    return resolveDownloadRequest({ search: location.search, platform, userAgent, architecture })
+  }
+  const applyPlatformDownload = (url) => {
+    if (!url) return
+    document.querySelectorAll('[data-download-nomi]').forEach((link) => {
+      link.href = url
+    })
+  }
+  document.querySelectorAll('[data-download-nomi]').forEach((link) => link.addEventListener('click', async (event) => {
+    event.preventDefault()
+    const request = await resolvePlatformDownload()
+    if (request.url) location.href = request.url
+    else showDownloadOptions()
+  }))
+  void resolvePlatformDownload().then((request) => {
+    applyPlatformDownload(request.url)
+    if (!request.autoDownload) return
+    const cleanUrl = new URL(location.href)
+    for (const key of ['download', 'source', 'platform', 'arch']) cleanUrl.searchParams.delete(key)
+    history.replaceState(null, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash)
+    if (request.url) location.href = request.url
+    else showDownloadOptions()
+  })
+})()</script>
+</body>
+</html>

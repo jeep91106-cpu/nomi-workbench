@@ -1,0 +1,491 @@
+/**
+ * 卡片渲染共用 helpers + 子组件。
+ *
+ * 4 张卡片（角色/场景/道具/声音）共享：
+ * - 占位斜条纹背景
+ * - 关联计数 dot
+ * - 变体 chip
+ * - 数据缺失时隐藏对应行（spec §3.4 Level 0）
+ */
+import React, { type JSX } from 'react'
+import { isProjectExecutionContextCurrent, withProjectAction, type ProjectExecutionContext } from '../../../project/projectCanvasReadSurface'
+import { useTranslation } from 'react-i18next'
+import { IconBox, IconPlayerStop, IconUpload } from '../../../../vendor/tablerIcons'
+import { cn } from '../../../../utils/cn'
+import i18n from '../../../../i18n'
+import { NodeEmptyState } from './NodeEmptyState'
+import type { GenerationCanvasNode } from '../../model/generationCanvasTypes'
+import { getGenerationNodeLabel } from '../../model/generationNodeKinds'
+import { NodeTryList } from '../../quickActions/NodeTryList'
+import { nodeTryRecipes } from '../../quickActions/nodeTryRecipes'
+import { resolveNodeVisualSize } from '../nodeSizing'
+import { getGenerationNodeIcon } from '../renderRegistry'
+import { useEmptyNodeActivation } from './NodeEmptyStateContext'
+
+/** 没出图 / 没放素材的卡面：纸白底（Claude Design 拍板稿 EmptyStates：去掉斜线底纹，卡的描边由外壳给）。 */
+export const EMPTY_SURFACE_CLASS =
+  'bg-nomi-paper'
+
+/**
+ * 透明图的棋盘格底（亮 / 暗两套 token 自动跟主题）。只垫在**抠图结果**下面：
+ * 没有它，亮色下白底图抠完落在白卡上和原图一模一样，用户以为「点了没反应」（2026-10-06）。
+ */
+export const CHECKERBOARD_BG_CLASS =
+  'bg-[repeating-conic-gradient(var(--nomi-ink-10)_0_25%,var(--nomi-paper)_0_50%)] bg-[length:16px_16px]'
+
+/**
+ * 节点 body 左上角标题行（统一规格：text-body-sm font-semibold 标题；没有镜号——镜号只来自 storyboardShotLabel）。
+ * 收口占位卡 / 画板 / 音频等非图片 body 的标题——此前各写一套字号字重，扫节点找标题没稳定落点。
+ * 图片卡（角色/场景/道具）的标题压在图上/图下是刻意沉浸式，不走这里（仅字号字重经 EditableNodeTitle 对齐）。
+ */
+export function NodeBodyHeader({
+  title,
+}: {
+  title?: string
+}): JSX.Element | null {
+  if (!title) return null
+  return (
+    <div className="flex flex-col gap-1 min-w-0">
+      {title ? <span className="text-body-sm font-semibold text-nomi-ink-80 truncate">{title}</span> : null}
+    </div>
+  )
+}
+
+/**
+ * 空态启动器（统一：size-12 圆形实心墨图标 + 主文案 + 副提示）。收口画板「点击打开」/ 3D「点击进入」
+ * 此前圆⇄方、实心⇄描边的分叉。
+ *
+ * 点击：给 onActivate 即渲染成**可点按钮**（onPointerDown stopPropagation 不触发节点拖拽，卡片其余可拖；
+ * 收口「文案说『点击进入』但 body 没挂 handler」的真坑）。不给 onActivate 则纯视觉。onPreload 在 hover/focus
+ * 触发（如 3D 预拉编辑器 chunk）。点击/拖拽手势与外壳一致（外壳 setPointerCapture 在 article，故走显式按钮）。
+ */
+export function EmptyStateLauncher({
+  icon,
+  label,
+  hint,
+  onActivate,
+  onPreload,
+  activateAriaLabel,
+  testId,
+  height,
+}: {
+  icon: React.ReactNode
+  label?: string
+  hint?: string
+  onActivate?: () => void
+  onPreload?: () => void
+  activateAriaLabel?: string
+  testId?: string
+  /** 所在节点的卡高（给了才按档位收矮，见 NodeEmptyState）。 */
+  height?: number
+}): JSX.Element {
+  const { t } = useTranslation()
+  const cluster = <NodeEmptyState icon={icon} title={label || ''} description={hint || ''} height={height} />
+  if (!onActivate) {
+    return <div className="h-full w-full">{cluster}</div>
+  }
+  return (
+    <CardActivationButton
+      testId={testId}
+      ariaLabel={activateAriaLabel || label || t('generationCommon.card.open')}
+      onActivate={onActivate}
+      onPreload={onPreload}
+      className="flex-col items-center justify-center gap-2 text-center px-4 py-3"
+    >
+      {cluster}
+    </CardActivationButton>
+  )
+}
+
+/**
+ * 卡片正文「点开」的那颗按钮：空态启动器和有内容的卡（如画板缩略图）共用一套激活规矩——
+ * 宿主判定节点已被选中才放行（按下那一刻定，见 useEmptyNodeActivation），没选中时这一下只是选中 / 拖动。
+ */
+export function CardActivationButton({
+  children,
+  onActivate,
+  onPreload,
+  ariaLabel,
+  title,
+  testId,
+  className,
+}: {
+  children: React.ReactNode
+  onActivate: () => void
+  onPreload?: () => void
+  ariaLabel: string
+  title?: string
+  testId?: string
+  className?: string
+}): JSX.Element {
+  const activation = useEmptyNodeActivation()
+  return (
+    <button
+      type="button"
+      data-testid={testId}
+      aria-label={ariaLabel}
+      title={title}
+      tabIndex={activation.canActivate ? 0 : -1}
+      onPointerDownCapture={activation.onPointerDownCapture}
+      onPointerCancelCapture={activation.onPointerCancelCapture}
+      onClickCapture={activation.onClickCapture}
+      className={cn(
+        'flex h-full w-full rounded-nomi bg-transparent border-0 cursor-pointer',
+        'transition-[background] duration-nomi-fast ease-nomi-fast hover:bg-nomi-ink-05',
+        'focus-visible:outline-2 focus-visible:outline-nomi-ink focus-visible:outline-offset-2',
+        className,
+      )}
+      onClick={(event) => {
+        if (event.defaultPrevented) return
+        event.stopPropagation()
+        onActivate()
+      }}
+      onPointerDown={(event) => { if (activation.canActivate) event.stopPropagation() }}
+      onPointerEnter={activation.canActivate ? onPreload : undefined}
+      onFocus={activation.canActivate ? onPreload : undefined}
+    >
+      {children}
+    </button>
+  )
+}
+
+export function UsageDot({ count }: { count: number }): JSX.Element | null {
+  if (count <= 0) return null
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className="inline-block w-1.5 h-1.5 rounded-full bg-nomi-accent" aria-hidden />
+      <span className="text-micro text-nomi-ink-60 tabular-nums">{count}</span>
+    </span>
+  )
+}
+
+export function VariantChip({ count }: { count: number }): JSX.Element | null {
+  const { t } = useTranslation()
+  if (count <= 0) return null
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center rounded-full',
+        'bg-nomi-ink-05 text-nomi-ink-60',
+        'text-micro px-2 py-[1px] tabular-nums',
+      )}
+    >
+      {t('generationCommon.card.variants', { count })}
+    </span>
+  )
+}
+
+/**
+ * 空媒体只给下一步；镜头号和标题属于共同框外标签行。
+ * 2026-10-08 拍板 ③：图片 / 视频空卡用「试试」（2–3 个只搭结构的创作任务）**替换**那一句操作说明；
+ * 2026-10-12 用户改：浏览态（没选中）只留类型图标，选中单选才出「试试」——
+ * 标题和说明都不再出现（种类已由图标和框外标签行说了）。派生好待生成、已连上游等产出两种状态仍是一句话：
+ * 那是在告诉用户此刻的状态，不是教他怎么用。3D 模型还没有配方，保留原说明。
+ */
+export function PendingGenerationPlaceholder({
+  node,
+  waitingUpstream = false,
+  derivedReady = false,
+}: {
+  node: GenerationCanvasNode
+  waitingUpstream?: boolean
+  /** 派生出来、提示词已填好、还没生成（`isDerivedPromptReady`）。 */
+  derivedReady?: boolean
+}): JSX.Element {
+  const { t } = useTranslation()
+  const isVideo = node.kind === 'video'
+  // 3D 模型节点也走这条通用占位（无专属卡 body）。不按 kind 分就会拿图片文案自称「图片节点」。
+  const isModel3d = node.kind === 'model3d'
+  const Icon = getGenerationNodeIcon(node.kind)
+  const icon = <Icon size={20} stroke={1.5} />
+  if (!derivedReady && !waitingUpstream && nodeTryRecipes(node).length) {
+    return (
+      <div className="h-full w-full">
+        <NodeEmptyState
+          height={resolveNodeVisualSize(node).height}
+          icon={icon}
+          title={t(isVideo ? 'canvas.nodeKinds.video' : 'canvas.nodeKinds.image')}
+          description={t(isVideo ? 'generationCommon.nodeTry.status.video' : 'generationCommon.nodeTry.status.image')}
+          action={<NodeTryList node={node} />}
+        />
+      </div>
+    )
+  }
+  const titleText = derivedReady
+    ? t('generationCommon.nodeEmpty.derivedReady.title')
+    : isVideo
+    ? t('generationCommon.nodeEmpty.video.title')
+    : isModel3d
+      ? t('generationCommon.nodeEmpty.model3d.title')
+      : getGenerationNodeLabel(node.kind)
+  const description = derivedReady
+    ? t('generationCommon.nodeEmpty.derivedReady.description')
+    : waitingUpstream
+    ? t('generationCommon.nodeEmpty.waiting')
+    : isModel3d
+      ? t('generationCommon.nodeEmpty.model3d.description')
+      : undefined
+  return (
+    <div className="h-full w-full">
+      <NodeEmptyState purpose={derivedReady || waitingUpstream ? 'status' : 'guidance'} height={resolveNodeVisualSize(node).height} icon={icon} title={titleText} description={description} />
+    </div>
+  )
+}
+
+function clampProgressPercent(value: number | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return Math.max(0, Math.min(100, Math.round(value)))
+}
+
+/**
+ * 进度环。`compact` 是同一个环缩进一条横条里用的那一档（顶部进度条 · 见 GeneratingOverlay）：去掉自带的圆形托底与阴影——横条本身已经是那块底了，再叠一层
+ * 就是「一个东西两层底」，在 28px 高的条里看着像贴了个贴纸。
+ */
+function RemoveBackgroundProgressMark({ progress, compact = false }: { progress?: number; compact?: boolean }): JSX.Element {
+  const percent = clampProgressPercent(progress)
+  const radius = 18
+  const circumference = 2 * Math.PI * radius
+  const isDeterminate = percent !== null && percent > 0
+  return (
+    <div
+      className={cn(
+        'grid place-items-center rounded-full',
+        compact ? 'size-4 shrink-0 text-nomi-ink-80' : 'size-14 bg-nomi-paper/[0.92] text-nomi-ink shadow-nomi-md backdrop-blur-[8px]',
+      )}
+      aria-hidden="true"
+    >
+      <svg className={compact ? 'size-4' : 'size-10'} viewBox="0 0 44 44">
+        <circle cx="22" cy="22" r={radius} fill="none" stroke="currentColor" strokeWidth="4" opacity="0.16" />
+        <circle
+          className={isDeterminate ? undefined : 'origin-center animate-spin motion-reduce:animate-none'}
+          cx="22"
+          cy="22"
+          r={radius}
+          fill="none"
+          stroke="currentColor"
+          strokeLinecap="round"
+          strokeWidth="4"
+          strokeDasharray={isDeterminate ? circumference : '28 85'}
+          strokeDashoffset={isDeterminate ? circumference * (1 - percent / 100) : 0}
+          transform={isDeterminate ? 'rotate(-90 22 22)' : undefined}
+        />
+      </svg>
+    </div>
+  )
+}
+
+function RemoveBackgroundPendingStatus({
+  title,
+  message,
+  progress,
+}: {
+  title?: string
+  message?: string
+  progress?: number
+}): JSX.Element {
+  const { t } = useTranslation()
+  const percent = clampProgressPercent(progress)
+  const statusMessage = message || t('generationCommon.card.removingBackground')
+  const statusTitle = title || t('generationCommon.card.removeBackgroundNode')
+  return (
+    <div
+      className="grid place-items-center gap-2"
+      role="status"
+      aria-label={t('generationCommon.card.removingBackground')}
+      aria-busy="true"
+    >
+      <RemoveBackgroundProgressMark progress={progress} />
+      <span className="rounded-full bg-nomi-paper/[0.88] px-2.5 py-1 text-micro font-medium text-nomi-ink-80 shadow-nomi-sm backdrop-blur-[8px]">
+        {percent !== null && percent > 0 ? `${statusMessage} ${percent}%` : statusMessage}
+      </span>
+      <span className="sr-only">{t('generationCommon.card.generatingTransparentPng', { title: statusTitle })}</span>
+    </div>
+  )
+}
+
+export function RemoveBackgroundPendingPlaceholder({
+  title,
+  progress,
+}: {
+  title?: string
+  progress?: number
+}): JSX.Element {
+  return (
+    <div className="grid h-full w-full place-items-center overflow-hidden bg-nomi-ink-05 p-4">
+      <RemoveBackgroundPendingStatus title={title} progress={progress} />
+    </div>
+  )
+}
+
+/** 本地图片操作（抠图 / 切图 / 裁剪）进行中的读屏播报。视觉那一层是图本身的模糊呼吸。 */
+export function LocalImageOpPendingStatus({
+  message,
+  progress,
+}: {
+  message?: string
+  progress?: number
+}): JSX.Element {
+  const { t } = useTranslation()
+  const percent = clampProgressPercent(progress)
+  const statusMessage = message || t('generationCommon.card.removingBackground')
+  return (
+    <span className="sr-only" role="status" aria-label={statusMessage} aria-busy="true">
+      {percent !== null && percent > 0 ? `${statusMessage} ${percent}%` : statusMessage}
+    </span>
+  )
+}
+
+/** 遮罩里那颗取消按钮。两档摆法共用一颗，别各写一份（两份总有一份会先漂）。 */
+export function GeneratingCancelButton({ onCancel, compact }: { onCancel: () => void; compact?: boolean }): JSX.Element {
+  const { t } = useTranslation()
+  return (
+    <button
+      type="button"
+      aria-label={t('generationCommon.card.generationCancelAria')}
+      onClick={(event) => {
+        event.stopPropagation()
+        onCancel()
+      }}
+      onPointerDown={(event) => event.stopPropagation()}
+      className={cn(
+        'pointer-events-auto inline-flex shrink-0 items-center gap-1 rounded-full text-micro font-medium',
+        'text-workbench-danger bg-[var(--workbench-danger-soft)] hover:opacity-85',
+        compact ? 'px-2 py-0.5' : 'px-3.5 py-1',
+      )}
+    >
+      <IconPlayerStop size={13} stroke={1.8} />
+      {t('generationCommon.card.generationCancel')}
+    </button>
+  )
+}
+
+/**
+ * 贴着卡顶的一条进度（2026-09-07 用户拍板：「把那个放到上面 别遮挡视频」），画面区一点不挡。
+ * 只给**本地处理**那一族（视频深度）用：它的活预览帧就是这张卡此刻的内容，所以这一条必须盖在
+ * `__preview`（z-[2]）之上。模型生成的等待不走这里——那是 GenerationWaitingSurface（像素动画）。
+ *
+ * 2026-09-24 删掉了居中那一档（模糊遮罩 + 大 N 转圈）：它最后一个调用方是 Agent 批次镜的「生成中」，
+ * 那一层 8-25 写成、9-08 普通节点换成像素动画时没跟上；现在批次镜也走 GenerationWaitingSurface。
+ */
+export function GeneratingOverlay({
+  percent,
+  message,
+  previewUrl,
+  onCancel,
+}: {
+  /** 0-100 真实进度。缺省 = 不画百分比的进度环（No fake progress）。 */
+  percent?: number
+  /** 人话进度（如「深度处理 · 第 3/17 帧」）。 */
+  message?: string
+  /** 活预览帧 data URL（深度逐帧回传，会话瞬态、不落盘）。 */
+  previewUrl?: string
+  /** 提供即显示取消按钮（仅本地可中断任务）。 */
+  onCancel?: () => void
+} = {}): JSX.Element {
+  const { t } = useTranslation()
+  return (
+    <div
+      className={cn(
+        'generation-canvas-v2-node__generating-overlay',
+        'absolute inset-0 z-[4] rounded-nomi overflow-hidden',
+        'bg-nomi-paper/[0.55] backdrop-blur-[2px] pointer-events-none',
+      )}
+      data-generating-placement="top"
+      aria-hidden={onCancel ? undefined : true}
+    >
+      {previewUrl ? (
+        <img
+          src={previewUrl}
+          alt={t('generationCommon.card.comfyPreviewAlt')}
+          className="absolute inset-0 h-full w-full object-cover opacity-90"
+          draggable={false}
+        />
+      ) : null}
+      <div
+        className={cn(
+          'absolute inset-x-0 top-0 z-[1] flex items-center gap-2 px-2 py-1.5',
+          'border-b border-nomi-line bg-nomi-paper/[0.92] shadow-nomi-sm backdrop-blur-[8px]',
+        )}
+        data-generating-progress-bar="true"
+      >
+        <RemoveBackgroundProgressMark progress={percent} compact />
+        <span className="min-w-0 flex-1 truncate text-micro font-medium text-nomi-ink-80">
+          {message || t('generationCommon.card.generating')}
+        </span>
+        {onCancel ? <GeneratingCancelButton onCancel={onCancel} compact /> : null}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * v0.7.1: 卡片上传 CTA — 角色 / 场景 / 道具卡占位态时显示 + 上传按钮（accept=image/*）。
+ * 上传后通过 onUpload(dataUrl, file) 回调写到 node.result。
+ * 只有这三种卡用它（图片 / 视频 / 声音卡的空态各有自己的一套：「试试」/ 声音条），不再留它们的分支。
+ */
+export function UploadFallback({
+  accept,
+  label,
+  onUpload,
+  kind,
+  height,
+}: {
+  accept: string
+  label: string
+  onUpload: (dataUrl: string, file: File, context: ProjectExecutionContext) => void
+  kind: 'character' | 'scene' | 'prop'
+  /** 所在节点卡高（给了才按档位收矮）。 */
+  height?: number
+}): JSX.Element {
+  const { t } = useTranslation()
+  const activation = useEmptyNodeActivation()
+  const handleChange = React.useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const file = event.currentTarget.files?.[0]
+      event.currentTarget.value = ''
+      if (!file) return
+      withProjectAction((context) => {
+        const reader = new FileReader()
+        reader.onload = (loadEvent) => {
+          if (!isProjectExecutionContextCurrent(context)) return
+          const dataUrl = loadEvent.target?.result
+          if (typeof dataUrl === 'string') onUpload(dataUrl, file, context)
+        }
+        reader.readAsDataURL(file)
+      })
+    },
+    [onUpload],
+  )
+  // v0.7.3 fix: 不 stopPropagation onPointerDown — 否则空卡片没法拖动。
+  // 「短按弹文件框、长按拖动」由外壳 useNodeDragResize 保证：pointer capture 推迟到拖拽
+  // 阈值(2px)跨过才抢——按下就抢会把 click 重定向到外壳，label 弹文件框整类失效（2026-08-03 群反馈）。
+  const Icon = kind === 'prop' ? IconBox : getGenerationNodeIcon(kind)
+  const icon = <Icon size={20} stroke={1.5} />
+  const action = t('generationCommon.card.upload', { label })
+  const nodeCopy = kind === 'character'
+    ? { title: t('generationCommon.nodeEmpty.character.title'), description: t('generationCommon.nodeEmpty.character.description') }
+    : kind === 'scene'
+      ? { title: t('generationCommon.nodeEmpty.scene.title'), description: t('generationCommon.nodeEmpty.scene.description') }
+      : { title: t('generationCommon.nodeEmpty.prop.title'), description: t('generationCommon.nodeEmpty.prop.description') }
+  return (
+    <label onPointerDownCapture={activation.onPointerDownCapture} onPointerCancelCapture={activation.onPointerCancelCapture} onClickCapture={activation.onClickCapture} className="block h-full w-full cursor-pointer text-nomi-ink-60 transition-colors hover:text-nomi-ink hover:bg-nomi-ink-05/50">
+      <NodeEmptyState
+        height={height}
+        icon={icon}
+        title={nodeCopy.title}
+        description={nodeCopy.description}
+        action={<span className="inline-flex items-center gap-1.5 rounded-nomi-sm bg-nomi-ink px-3 py-1.5 text-caption font-medium text-nomi-paper"><IconUpload size={14} stroke={1.8} />{action}</span>}
+      />
+      <input disabled={!activation.canActivate} className="hidden" type="file" accept={accept} onChange={handleChange} />
+    </label>
+  )
+}
+
+/**
+ * 取节点的"placeholder 标签"
+ * shots → "分镜 NN"（由 BaseGenerationNode 接管，不走这里）
+ * 其它 → 分类名 / fallback title
+ */
+export function placeholderLabel(categoryName: string | undefined, title: string | undefined): string {
+  return categoryName || title || i18n.t('generationCommon.card.node')
+}

@@ -1,0 +1,78 @@
+// 素材库 → 画布的拖拽契约。
+// 素材已在池里（画布产出 / 项目文件），拖到画布只需引用其 renderUrl 建 asset 节点，无需重新上传。
+// 与 workspaceFileDrag 同构，但携带 AssetRef 的 origin 线索，便于发送链解析「传输地址」（见 assetTypes.ts 文件头 R1）。
+
+import type { AssetDimensions, AssetKind, AssetOrigin } from './assetTypes'
+
+export const ASSET_LIBRARY_DRAG_MIME = 'application/x-nomi-asset-ref'
+
+// 三类素材都可拖：图片/视频 → 画布建节点；音频 → 时间轴音频轨（画布无音频节点，drop 端各自判 kind）。
+export type AssetLibraryDragPayload = {
+  kind: AssetKind
+  name: string
+  renderUrl: string
+  /** 落盘边界派生的画布预览（图片缩略 / 视频 poster）；落到画布的节点挂它而不是 renderUrl。 */
+  thumbUrl?: string
+  dimensions?: AssetDimensions
+  origin: AssetOrigin
+  dragAnchor?: {
+    xRatio: number
+    yRatio: number
+  }
+}
+
+export function serializeAssetLibraryDrag(payload: AssetLibraryDragPayload | readonly AssetLibraryDragPayload[]): string {
+  return JSON.stringify(payload)
+}
+
+function normalizeAssetLibraryDragItem(value: unknown): AssetLibraryDragPayload | null {
+  if (!value || typeof value !== 'object') return null
+  const item = value as Partial<AssetLibraryDragPayload>
+  const kind = item.kind
+  const renderUrl = typeof item.renderUrl === 'string' ? item.renderUrl.trim() : ''
+  if ((kind === 'image' || kind === 'video' || kind === 'audio') && renderUrl && item.origin && typeof item.origin === 'object') {
+    const rawAnchor = item.dragAnchor
+    const dragAnchor = rawAnchor && typeof rawAnchor === 'object'
+      ? {
+          xRatio: Math.min(1, Math.max(0, Number(rawAnchor.xRatio) || 0)),
+          yRatio: Math.min(1, Math.max(0, Number(rawAnchor.yRatio) || 0)),
+        }
+      : undefined
+    const thumbUrl = typeof item.thumbUrl === 'string' ? item.thumbUrl.trim() : ''
+    const rawDimensions = item.dimensions
+    const dimensions = rawDimensions && typeof rawDimensions === 'object'
+      && Number.isFinite(Number(rawDimensions.width)) && Number(rawDimensions.width) > 0
+      && Number.isFinite(Number(rawDimensions.height)) && Number(rawDimensions.height) > 0
+      ? { width: Number(rawDimensions.width), height: Number(rawDimensions.height) }
+      : undefined
+    return {
+      kind,
+      name: typeof item.name === 'string' ? item.name : '',
+      renderUrl,
+      ...(thumbUrl ? { thumbUrl } : {}),
+      ...(dimensions ? { dimensions } : {}),
+      origin: item.origin as AssetOrigin,
+      ...(dragAnchor ? { dragAnchor } : {}),
+    }
+  }
+  return null
+}
+
+export function parseAssetLibraryDragItems(raw: string | null | undefined): AssetLibraryDragPayload[] {
+  if (!raw) return []
+  try {
+    const value = JSON.parse(raw) as unknown
+    const items = Array.isArray(value) ? value : [value]
+    return items.flatMap((item) => {
+      const normalized = normalizeAssetLibraryDragItem(item)
+      return normalized ? [normalized] : []
+    })
+  } catch {
+    // ignore malformed payloads
+  }
+  return []
+}
+
+export function parseAssetLibraryDrag(raw: string | null | undefined): AssetLibraryDragPayload | null {
+  return parseAssetLibraryDragItems(raw)[0] ?? null
+}

@@ -1,0 +1,138 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { ESLint } from 'eslint'
+import ts from 'typescript'
+import { describe, expect, test } from 'vitest'
+import { VITEST_LANE, ruleClaims } from '../vitest.config.ts'
+
+// 可达性判据只有一份：门岗自己的 resolveReachable。这里原先抄了一份只认 `pnpm run x` 的
+// 正则闭包，gates:contracts 改成 runner 实参清单后它立刻报出「typecheck 不可达」的假红——
+// 两份判据必然漂移（R14.1）。要改可达性语义只改 scripts/check-gates-chain.mjs。
+import { resolveReachable } from './check-gates-chain.mjs'
+import { TYPECHECK_PROJECTS } from './lib/typecheckProjects.mjs'
+import { TYPECHECK_JOBS } from './typecheck.mjs'
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const read = (relative) => fs.readFileSync(path.join(repoRoot, relative), 'utf8')
+const pkg = JSON.parse(read('package.json'))
+const nativeTests = ['attachments', 'lane-session-durability', 'lane-shadow-parity', 'lane-multi'].map((name) => `${name}.test.mts`)
+const normalizedPath = (value) => path.resolve(value).split(path.sep).join('/')
+
+function json(relative) {
+  expect(fs.existsSync(path.join(repoRoot, relative)), `missing integration config: ${relative}`).toBe(true)
+  return JSON.parse(read(relative))
+}
+
+const reachable = (entry) => resolveReachable(pkg.scripts, entry)
+
+describe('private pi build and test wiring', () => {
+  test('pins the verified SDK graph, keeps Nomi Zod, and has no second model-call stack (ai / @ai-sdk/*)', () => {
+    for (const name of ['pi-agent-core', 'pi-ai', 'pi-coding-agent']) {
+      expect(pkg.dependencies[`@earendil-works/${name}`]).toBe('0.85.1')
+    }
+    // The override set is exactly the pi packages that exist in the 0.85.1 tree:
+    // the three direct dependencies plus the three they pull in (chord, pi-telemetry,
+    // pi-tui). pi-client and pi-protocol left the tree in 0.85.1, so pinning them
+    // would be a dead lock nobody can notice going stale.
+    expect(Object.keys(pkg.pnpm.overrides ?? {}).filter((name) => name.startsWith('@earendil-works/')).sort())
+      .toEqual(['@earendil-works/chord', '@earendil-works/pi-agent-core', '@earendil-works/pi-ai',
+        '@earendil-works/pi-coding-agent', '@earendil-works/pi-telemetry', '@earendil-works/pi-tui'])
+    for (const name of ['chord', 'pi-agent-core', 'pi-ai', 'pi-coding-agent', 'pi-telemetry', 'pi-tui']) {
+      expect(pkg.pnpm.overrides?.[`@earendil-works/${name}`]).toBe('0.85.1')
+    }
+    expect(pkg.dependencies.typebox).toBe('1.3.7')
+    expect(pkg.dependencies['zod-to-json-schema']).toBe('3.25.1')
+    expect(pkg.dependencies.zod).toBe('^3.25.76')
+    // 2026-10-21 文本任务迁 pi-ai 单次调用：ai@4 与 @ai-sdk/* 整体删除（check:llm-stream-owner 同样拦回流）。
+    expect(Object.keys(pkg.dependencies).filter((name) => name === 'ai' || name.startsWith('@ai-sdk/'))).toEqual([])
+    expect(pkg.engines.node).toBe('>=22.19.0')
+  })
+
+  test('uses an independent strict NodeNext island without changing the CommonJS host', () => {
+    expect(json('electron/tsconfig.json').compilerOptions.module).toBe('CommonJS')
+    const config = json('electron/tsconfig.pi.json')
+    expect(config.compilerOptions).toMatchObject({ module: 'NodeNext', moduleResolution: 'NodeNext',
+      rootDir: '.', outDir: '../dist-electron', strict: true, noEmitOnError: true })
+    // 现役 lane 是唯一 NodeNext 运行时岛。
+    expect(config.include).toEqual(['agentLane/**/*.mts', 'agentLane/**/*.cts'])
+    const parsed = ts.getParsedCommandLineOfConfigFile(path.join(repoRoot, 'electron/tsconfig.json'), {}, {
+      ...ts.sys, onUnRecoverableConfigFileDiagnostic: (diagnostic) => { throw new Error(String(diagnostic.messageText)) },
+    })
+    const program = ts.createProgram(parsed.fileNames, parsed.options)
+    // CommonJS 那半**看不见**任何一块岛地的 .mts/.cts。断言两块而不只是老那块：
+    // 只钉一块的话，新岛地哪天漏进 CJS 工程也是静默的——而那正是这条断言存在的意义。
+    expect(program.getSourceFiles().filter((file) =>
+      /(?:harness\/runtime\/pi|agentLane)\/.*\.[mc]ts$/.test(file.fileName))).toEqual([])
+    const host = read('electron/agentLane/laneDesktopRuntime.ts')
+    expect(host).toContain('laneNativeLoader.cjs')
+    expect(host).not.toMatch(/harness\/runtime\/pi\/.*\.(?:m|c)?js/)
+  })
+
+  test('root build and dev compile the same entry once; both launch paths check complete artifacts', () => {
+    expect(pkg.scripts['build:electron']).toBe('node scripts/build-electron.mjs')
+    const dev = read('scripts/dev-electron.mjs')
+    expect(dev).toContain('build-electron.mjs')
+    expect(dev).not.toContain('tscBin')
+    expect(dev.match(/compileElectronMain\(\);/g)).toHaveLength(1)
+    expect(read('scripts/start-electron.mjs')).toMatch(/assertElectronBuildArtifacts\(repoRoot\)/)
+    const launch = read('tests/ux/_launchApp.mjs')
+    expect(launch).toMatch(/if \(isDevElectron\)\s*\{\s*(?:\/\/[^\n]*\s*)*assertFreshBuild\(repoRoot\)\s*assertElectronBuildArtifacts\(repoRoot\)/)
+    expect(launch).not.toContain('function assertBuilt(')
+  })
+
+  test('all four native suites run once outside Vitest against private production modules', () => {
+    expect(pkg.scripts['test:agent-runtime']).toBe(
+      'python3 scripts/with-gates-lock.py --command "tsc -p tests/agent-runtime/tsconfig.json && node --test --test-concurrency=1 --test-timeout=60000 .tmp/agent-runtime-tests/tests/agent-runtime/*.test.mjs"',
+    )
+    expect(reachable('test').has('test:agent-runtime')).toBe(true)
+    // 2026-09-12 起 gates 经 scripts/run-gates-tests.mjs 分档，两档的目标脚本由 TIER_COMMANDS
+    // 声明、由 resolveReachable 认领——所以这条「原生套件必须挂在门岗链上」的不变量原样成立。
+    expect(reachable('gates').has('test:agent-runtime')).toBe(true)
+    expect(reachable('gates:full').has('test:agent-runtime')).toBe(true)
+    const config = json('tests/agent-runtime/tsconfig.json')
+    expect(config.compilerOptions).toMatchObject({ rootDir: '../..', outDir: '../../.tmp/agent-runtime-tests' })
+    for (const name of nativeTests) {
+      const relative = `tests/agent-runtime/${name}`
+      expect(fs.existsSync(path.join(repoRoot, relative)), `missing migrated suite: ${name}`).toBe(true)
+      expect(VITEST_LANE.some((rule) => ruleClaims(rule, relative))).toBe(false)
+      const source = read(relative)
+      expect(source).toContain("from 'node:test'")
+      expect(source).toMatch(/\.\.\/\.\.\/electron\/(?:agentLane\/|ai\/nativePdfPayload)/)
+      expect(source).not.toMatch(/from ['"]vitest['"]|experiments\/pi-agent-runtime/)
+    }
+  })
+
+  test('production and zero-error native test types remain reachable from root gates', () => {
+    // 2026-10-01：typecheck 由编排器并发拉起四份检查（生产 tsc x3 + check:test-types），不再是一条 && 链。
+    expect(pkg.scripts.typecheck).toBe('node ./scripts/typecheck.mjs')
+    // 读编排器导出的任务表本身，不 grep 源码文本：tsconfig 名单收进 lib/typecheckProjects.mjs 之后源码里只剩常量名，
+    // 文本断言会假红；import 也让「改 typecheck.mjs → 跑这条测试」进 vitest 的依赖图。
+    expect(TYPECHECK_JOBS.find((job) => job.name === 'tsc electron-pi')?.args).toEqual(['-p', 'electron/tsconfig.pi.json', '--noEmit'])
+    expect(TYPECHECK_JOBS.some((job) => job.kind === 'script' && job.script === 'scripts/check-test-types.mjs')).toBe(true)
+    expect(reachable('gates').has('typecheck')).toBe(true)
+    expect(pkg.scripts['check:test-types']).toContain('check-test-types.mjs')
+    expect(TYPECHECK_PROJECTS.nativeTest).toBe('tests/agent-runtime/tsconfig.json')
+    expect(read('scripts/check-test-types.mjs')).toContain('TYPECHECK_PROJECTS.nativeTest')
+    const parsed = ts.getParsedCommandLineOfConfigFile(path.join(repoRoot, 'tests/agent-runtime/tsconfig.json'), {}, {
+      ...ts.sys, onUnRecoverableConfigFileDiagnostic: (diagnostic) => { throw new Error(String(diagnostic.messageText)) },
+    })
+    expect(parsed.options.strict).toBe(true)
+    expect(parsed.options.noEmitOnError).toBe(true)
+    const suites = fs.readdirSync(path.join(repoRoot, 'tests/agent-runtime'))
+      .filter((name) => /\.test\.mts$/.test(name))
+      .map((name) => normalizedPath(path.join(repoRoot, 'tests/agent-runtime', name))).sort()
+    expect(parsed.fileNames.filter((name) => /\.test\.mts$/.test(name)).map(normalizedPath).sort()).toEqual(suites)
+  })
+
+  test('ESLint applies production TS rules and Node globals to .mts and .cts', async () => {
+    const eslint = new ESLint({ cwd: repoRoot })
+    const extensions = ['mts', 'cts']
+    const configs = await Promise.all(extensions.map((extension) =>
+      eslint.calculateConfigForFile(`electron/agentLane/example.${extension}`)))
+    for (const config of configs) {
+      expect(config.languageOptions.globals?.process).toBe(false)
+      expect(config.rules['@typescript-eslint/no-unused-vars'][0]).toBe(1)
+    }
+  }, 60_000)
+})

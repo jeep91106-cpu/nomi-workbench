@@ -1,0 +1,207 @@
+import type { GenerationCanvasEdge, GenerationCanvasNode, GenerationNodeKind } from '../model/generationCanvasTypes'
+import { collectNodeContext } from '../model/nodeContext'
+import { useGenerationCanvasStore } from '../store/generationCanvasStore'
+import { validateReferenceEdge, type EdgeSkipReason } from './referenceEdgeCapability'
+import { sendGenerationNodeToTimeline, type SendGenerationNodeToTimelineOptions } from './sendGenerationNodeToTimeline'
+import { useWorkbenchStore } from '../../workbenchStore'
+import { storyboardLabelSourceFromDesigns } from '../../../../electron/shared/canvas/storyboardShotLabel'
+
+export type CreateGenerationNodeToolInput = {
+  kind: GenerationNodeKind
+  title?: string
+  prompt?: string
+  position?: { x: number; y: number }
+  /** 所属分类（缺省按 kind 推断：角色→cast/场景→scene/其余→shots）。决定卡片归类与镜头编号。 */
+  categoryId?: string
+  /** bug①：agent 建议的模型/参数（modelKey/modelVendor/archetype/标量参数），写入 node.meta。 */
+  meta?: Record<string, unknown>
+}
+
+export type GenerationCanvasToolResult<T = unknown> = {
+  ok: boolean
+  tool: string
+  message: string
+  data?: T
+  error?: string
+  requiresConfirmation?: boolean
+  preview?: unknown
+}
+
+export type GenerationCanvasToolAction =
+  | { tool: 'read_selected_nodes' }
+  | { tool: 'read_node_context'; nodeId: string }
+  | { tool: 'create_nodes'; nodes: CreateGenerationNodeToolInput[] }
+  | { tool: 'connect_nodes'; edges: Array<Pick<GenerationCanvasEdge, 'source' | 'target' | 'mode' | 'order'>> }
+  | { tool: 'delete_nodes'; nodeIds: string[] }
+  | { tool: 'update_node_prompt'; nodeId: string; prompt: string }
+  | { tool: 'set_node_references'; nodeId: string; references: string[] }
+  // 注：这里曾有 generate_image / generate_video 两个工具。它们**从来没有调用方**
+  //（全仓无人调 generationCanvasTools.execute），却各自绕开花钱确认卡直接跑 runGenerationNode，
+  // 于是也绕开了托管同意——F16b 那张「每次生成都弹」的第二卡就有它们一份。
+  // 2026-08-26 随旧卡一并删除（P1 不留死的并行入口）。真正现役的生成入口是
+  // NodeGenerationComposer → confirmAndRunNode / batchPlanPreview → 花钱卡，
+  // 外部 agent 走语义生成能力（generate → 付费卡 → 制作流程提交出口）。
+  | { tool: 'send_to_timeline'; nodeId: string; options?: SendGenerationNodeToTimelineOptions }
+
+function toolResult<T>(input: GenerationCanvasToolResult<T>): GenerationCanvasToolResult<T> {
+  return input
+}
+
+function findNode(nodeId: string): GenerationCanvasNode | null {
+  const id = String(nodeId || '').trim()
+  if (!id) return null
+  return useGenerationCanvasStore.getState().nodes.find((node) => node.id === id) || null
+}
+
+/** Renderer-owned document snapshot primitive for local planning and write RMW. */
+export function readGenerationCanvasSnapshot() {
+  return useGenerationCanvasStore.getState().readSnapshot()
+}
+
+/**
+ * Agent / MCP 的 canvas.read 源：画布快照 + 分镜编号源（`storyboards`）。
+ * 分镜镜头对模型只报分镜号（「<分镜名> · 镜 03」），编号在 canvasRead 投影里按同一个 owner 解析。
+ */
+export function readCanvasReadSource() {
+  return {
+    ...readGenerationCanvasSnapshot(),
+    storyboards: storyboardLabelSourceFromDesigns(useWorkbenchStore.getState().storyboardDesignsByDocumentId),
+  }
+}
+
+export const generationCanvasTools = {
+  read_selected_nodes(): GenerationCanvasNode[] {
+    const state = useGenerationCanvasStore.getState()
+    const selected = new Set(state.selectedNodeIds)
+    return state.nodes.filter((node) => selected.has(node.id))
+  },
+  create_nodes(nodes: CreateGenerationNodeToolInput[]): GenerationCanvasNode[] {
+    return nodes.map((node) => {
+      const created = useGenerationCanvasStore.getState().addNode(node)
+      // agent 建议的模型/参数：addNode 走 createGenerationNode 不接 meta，这里用现有 updateNode
+      // 补写（初始 meta 为空，整体写入安全）——避开 871 满基线的 store 巨壳。
+      if (node.meta && Object.keys(node.meta).length > 0) {
+        useGenerationCanvasStore.getState().updateNode(created.id, { meta: node.meta })
+      }
+      return created
+    })
+  },
+  connect_nodes(edges: Array<Pick<GenerationCanvasEdge, 'source' | 'target' | 'mode' | 'order'>>) {
+    // 两道校验,放不行的边都带 reason 进 skipped——applyCanvasToolCall 原样回报给 LLM,它据此纠正:
+    //   1. 端点必须真实存在(reason:'dangling')——吊边一旦入 store 会被持久化且永不渲染(连线静默丢失)。
+    //   2. 目标模型必须支持这条参考(reason:'source_not_referenceable'/'unsupported_reference',T8)——
+    //      否则 character_ref→纯文生模型这类盲连会落库后在生成期被静默丢弃。
+    //      文本→图片/视频的通用 reference 边是 prompt 上下文，由 validateReferenceEdge 特判放行。
+    const nodeById = new Map(useGenerationCanvasStore.getState().nodes.map((node) => [node.id, node]))
+    const skipped: Array<Pick<GenerationCanvasEdge, 'source' | 'target'> & { reason: EdgeSkipReason }> = []
+    let connected = 0
+    for (const edge of edges) {
+      const source = nodeById.get(edge.source)
+      const target = nodeById.get(edge.target)
+      if (!source || !target) {
+        skipped.push({ source: edge.source, target: edge.target, reason: 'dangling' })
+        continue
+      }
+      const verdict = validateReferenceEdge(source, target, edge.mode)
+      if (!verdict.ok) {
+        skipped.push({ source: edge.source, target: edge.target, reason: verdict.reason })
+        continue
+      }
+      // T1 轨迹语义:mode(first_frame/character_ref/…)随边落 store,
+      // 生成期 generationReferenceResolver 按它分流参考槽。
+      useGenerationCanvasStore.getState().connectNodes(edge.source, edge.target, edge.mode, undefined, edge.order)
+      connected += 1
+    }
+    return { connected, skipped, edges: useGenerationCanvasStore.getState().edges }
+  },
+  delete_nodes(nodeIds: string[]): string[] {
+    const existing = new Set(useGenerationCanvasStore.getState().nodes.map((node) => node.id))
+    const deleted = Array.from(
+      new Set(nodeIds.map((id) => String(id || '').trim()).filter((id) => id && existing.has(id))),
+    )
+    deleted.forEach((id) => useGenerationCanvasStore.getState().deleteNode(id))
+    return deleted
+  },
+  update_node_prompt(nodeId: string, prompt: string) {
+    useGenerationCanvasStore.getState().updateNodePrompt(nodeId, prompt)
+    return useGenerationCanvasStore.getState().nodes.find((node) => node.id === nodeId) || null
+  },
+  read_node_context(nodeId: string) {
+    const state = useGenerationCanvasStore.getState()
+    return collectNodeContext(state.nodes, state.edges, nodeId)
+  },
+  set_node_references(nodeId: string, references: string[]) {
+    const node = findNode(nodeId)
+    if (!node) return null
+    const normalizedReferences = Array.from(new Set(references.map((ref) => String(ref || '').trim()).filter(Boolean)))
+    useGenerationCanvasStore.getState().updateNode(node.id, { references: normalizedReferences })
+    return useGenerationCanvasStore.getState().nodes.find((candidate) => candidate.id === node.id) || null
+  },
+  send_to_timeline(nodeId: string, options?: SendGenerationNodeToTimelineOptions) {
+    return sendGenerationNodeToTimeline(nodeId, options)
+  },
+  async execute(action: GenerationCanvasToolAction): Promise<GenerationCanvasToolResult> {
+    if (action.tool === 'read_selected_nodes') {
+      const nodes = generationCanvasTools.read_selected_nodes()
+      return toolResult({ ok: true, tool: action.tool, message: `读取选中节点：${nodes.length} 个`, data: nodes })
+    }
+    if (action.tool === 'read_node_context') {
+      const context = generationCanvasTools.read_node_context(action.nodeId)
+      return toolResult({
+        ok: Boolean(context.node),
+        tool: action.tool,
+        message: context.node ? `读取节点上下文：${context.upstream.length} 个上游节点` : '未找到节点',
+        data: context,
+        ...(context.node ? {} : { error: 'node_not_found' }),
+      })
+    }
+    if (action.tool === 'create_nodes') {
+      const nodes = generationCanvasTools.create_nodes(action.nodes)
+      return toolResult({ ok: true, tool: action.tool, message: `创建节点：${nodes.length} 个`, data: nodes })
+    }
+    if (action.tool === 'connect_nodes') {
+      const result = generationCanvasTools.connect_nodes(action.edges)
+      return toolResult({
+        ok: true,
+        tool: action.tool,
+        message: `连接节点：${result.connected} 条`,
+        data: result.edges,
+      })
+    }
+    if (action.tool === 'delete_nodes') {
+      const deleted = generationCanvasTools.delete_nodes(action.nodeIds)
+      return toolResult({ ok: true, tool: action.tool, message: `删除节点：${deleted.length} 个`, data: deleted })
+    }
+    if (action.tool === 'update_node_prompt') {
+      const node = generationCanvasTools.update_node_prompt(action.nodeId, action.prompt)
+      return toolResult({
+        ok: Boolean(node),
+        tool: action.tool,
+        message: node ? '已更新节点 prompt' : '未找到节点',
+        data: node,
+        ...(node ? {} : { error: 'node_not_found' }),
+      })
+    }
+    if (action.tool === 'set_node_references') {
+      const node = generationCanvasTools.set_node_references(action.nodeId, action.references)
+      return toolResult({
+        ok: Boolean(node),
+        tool: action.tool,
+        message: node ? `已设置 ${node.references?.length || 0} 个参考` : '未找到节点',
+        data: node,
+        ...(node ? {} : { error: 'node_not_found' }),
+      })
+    }
+    if (action.tool === 'send_to_timeline') {
+      const result = await generationCanvasTools.send_to_timeline(action.nodeId, action.options)
+      return toolResult({
+        ok: result.ok,
+        tool: action.tool,
+        message: result.ok ? '已发送到时间轴' : '发送到时间轴失败',
+        data: result,
+        ...(result.ok ? {} : { error: result.error }),
+      })
+    }
+    return toolResult({ ok: false, tool: 'unknown', message: '未知工具', error: 'unknown_tool' })
+  },
+}

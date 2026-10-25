@@ -1,0 +1,43 @@
+# 生成画布 — 代码入口图
+
+> 112 文件的画布子系统「我要改 X 去哪」地图。搜符号前先看这张表定位子目录，少 fan-out。
+
+> 历史注记：本目录曾名 `generationCanvasV2`——那是旧 `apps/web` monorepo 布局「publish clean workspace」(commit `27ab140`) 带来的残留后缀，树里从无 V1。2026-06-11 已重命名为 `generationCanvas`（无后缀）。
+
+## 子目录职责
+
+| 子目录 | 文件 | 管什么 | 关键入口 |
+|---|---|---|---|
+| **components/** | 10 | 画布外壳与非节点 UI（工具栏、分组与选择覆盖层） | `GenerationCanvas.tsx`（React Flow 唯一入口）· `AgentPlanCard.tsx`（计划清单卡）；Agent 统一壳位于 `workbench/ai/ProjectAgentResidentShell.tsx` |
+| **reactFlow/** | 12 | React Flow 适配器、节点/边渲染器与画布交互容器 | `GenerationCanvasReactFlow.tsx` · `GenerationCanvasReactFlowNodes.tsx` · `generationCanvasReactFlowAdapter.ts` · `canvasDragDraft.ts` · `canvasDragWriteback.ts` |
+| **nodes/** | 42 | 节点渲染与节点内交互（最大子目录）| `BaseGenerationNode.tsx`（节点基座 952 行）· `NodeParameterControls.tsx` · `NodeGenerationComposer.tsx` · `director/`（导演台节点 + 全屏壳 + AI 来导）· `aspectRatio.ts`（比例） |
+| **runner/** | 15 | 执行层：能不能跑、怎么发、错误分类、结果解析 | `generationNodeExecutor.ts` · `generationRunController.ts` · `catalogTask*.ts` · `classifyGenerationError.ts` · `usableVendorModel.ts` |
+| **model/** | 13 | 领域模型：图结构、类型、schema、节点元数据 | `generationCanvasTypes.ts` · `generationCanvasSchema.ts` · `graphOps.ts` · `nodeMetaFields.ts` · `generationNodeKinds.ts` |
+| **agent/** | 12 | 画布 agent：工具定义、应用工具调用、建节点、推时间轴 | `generationCanvasTools.ts` · `applyCanvasToolCall.ts` · `generationCanvasAgentClient.ts` · `availableModels.ts` · `plannedNodeMeta.ts` |
+| **store/** | 8 | Zustand 状态 + 历史/快照/守卫 | `generationCanvasStore.ts`（871 行）· `canvasHistory.ts` · `canvasSnapshotNormalizer.ts` · `canvasGuards.ts` |
+| **adapters/** | 5 | 外部数据接入（素材导入、模型选项、节点图片持久化）| `assetImportAdapter.ts` · `modelOptionsAdapter.ts` · `persistNodeImage.ts` |
+| **fixation/** | 2 | 定妆（锚卡确认形象、放行下游镜头） | `freezeAnchor.ts` |
+| **hooks/** | 1 | 节点关系 hook | `useNodeRelationships.ts` |
+| **services/** | 1 | 供应商设置 | `providerSettings.ts` |
+| **styles/** | 1 | 画布 CSS | `generationCanvas.css` |
+
+## 按「我要改 X」定位
+
+| 我要改… | 去 |
+|---|---|
+| 画布整体布局 / 缩放 / 自动 fit | `components/GenerationCanvas.tsx` · `reactFlow/GenerationCanvasReactFlow.tsx` · `components/useAutoFitOnLoad.ts` · `components/generationCanvasGeometry.ts` |
+| 画布手势（拖=平移·Shift=框选·滚轮语义可配）/ 平移性能 | 内核开关 `reactFlow/GenerationCanvasReactFlowViewport.tsx` + `reactFlow/canvasViewportGestureProps.ts`（设置→开关）· 辅助平移 `reactFlow/useGenerationCanvasReactFlowPointer.ts` · 仲裁真值表 `components/canvasPointerGestureModel.ts` |
+| 节点卡片长相 / 节点内参数控件 | `nodes/BaseGenerationNode.tsx` · `nodes/NodeParameterControls.tsx` · `nodes/InlineParameterBar.tsx` |
+| 比例 / 变形 | `nodes/aspectRatio.ts` |
+| 连线 / 拖入参考 | `reactFlow/GenerationCanvasReactFlowNodes.tsx` · `nodes/completeNodeConnection.ts` · `model/nodeAssetDrop.ts` |
+| 生成怎么发出去 / 错误处理 | `runner/generationNodeExecutor.ts` · `runner/generationRunController.ts` · `runner/classifyGenerationError.ts` |
+| agent 建节点 / 计划清单卡 | `agent/applyCanvasToolCall.ts` · `agent/plannedNodeMeta.ts` · `components/AgentPlanCard.tsx` |
+| 状态/撤销重做/存盘快照 | `store/generationCanvasStore.ts` · `store/canvasHistory.ts` · `store/canvasSnapshotNormalizer.ts` |
+| 节点数据结构 / schema | `model/generationCanvasTypes.ts` · `model/generationCanvasSchema.ts` |
+| 定妆卡 | `fixation/freezeAnchor.ts` |
+| 导演台（`director` 节点，完整的 3D 导演台；Nomi 唯一的 3D 节点，老 `scene3d` 节点加载时经 `nodes/director/migration/` 迁成它） | `nodes/director/`（L2 见 `nodes/director/CLAUDE.md`；方案 `docs/plan/2026-09-02-director-console-v2.md`；dev 入口 `director-lab.html`） |
+| 推到时间轴 | `agent/sendGenerationNodeToTimeline.ts` · `agent/sendStoryboardToTimeline.ts` |
+
+## 相关方案文档
+
+画布/节点的设计与执行计划见 [`docs/plan/INDEX.md`](../../../docs/plan/INDEX.md) §「生成画布 / 节点系统」。

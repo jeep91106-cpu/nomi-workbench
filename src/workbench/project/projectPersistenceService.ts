@@ -1,0 +1,256 @@
+import { readLocalProjectAsync, renameLocalProject, saveLocalProject, type LocalProjectSummary } from '../library/localProjectStore'
+import { backfillCanvasMediaDimensions, upgradeWorkbenchProjectMediaUrls, normalizeLegacyImageAssetKinds } from './projectMediaMigration'
+import {
+  clearActiveWorkbenchProjectSaveTarget,
+  replayCanvasEventTailAndSealGenesis,
+  restoreWorkbenchProjectPayload,
+  subscribeWorkbenchProjectPersistence,
+} from './workbenchProjectSession'
+import type { WorkbenchProjectPayload, WorkbenchProjectRecordV1 } from './projectRecordSchema'
+import { retireStoryboardTableViews } from './storyboardTableRetirement'
+import { migrateProjectRecord, type CategoryMigrationDiagnostic } from './projectCategoryMigration'
+import { migrateProjectV51ToV60 } from './projectV51ToV60Migration'
+import { backfillShotIndexes } from '../generationCanvas/model/shotNumbering'
+import { backfillNodeResultVersionNumbers } from '../generationCanvas/model/nodeResultLifecycle'
+import { useShotVerifyStore } from '../generationCanvas/agent/shotVerifyStore'
+import type { ProjectHydrationGuard } from './projectCanvasReadSurface'
+import { invalidateAgentTurnStates } from '../ai/agentTurnLifecycle'
+import { measureProjectOpenStage, measureProjectOpenStageSync } from './projectOpenTimeline'
+import { sweepPersistedAssetDeletions } from '../assets/pendingAssetDeletions'
+import { logRendererError } from '../../desktop/rendererLog'
+import { useGenerationCanvasStore } from '../generationCanvas/store/generationCanvasStore'
+
+function isGuardCurrent(guard: ProjectHydrationGuard): boolean {
+  try {
+    guard.assertCurrent()
+    return true
+  } catch {
+    return false
+  }
+}
+
+const categoryMigrationDiagnostics = new WeakMap<object, CategoryMigrationDiagnostic>()
+/** 这次打开移除了几张已退役的分镜表节点（要给用户一句可见提示）。 */
+const retiredTableCounts = new WeakMap<object, number>()
+
+function abandonHydratingProjectOwnership(): void {
+  invalidateAgentTurnStates()
+  // Hydration replaces the whole project snapshot. Invalidate review work here,
+  // not when the persistence subscription merely rebinds after an ordinary save.
+  useShotVerifyStore.getState().activateProject(null)
+}
+
+// 迁移幂等的语义相等（P2 根因 / 守纪律「幂等判定用语义相等不用引用相等」）：
+// hydrate 时串行跑多道迁移，其中任一道（如 v51→v60 把跨分类 derivedFrom 计入 anyChange，
+// 或任何返回 `{ ...record }` 的 no-op）都会换掉顶层引用，于是旧的 `upgraded !== project`
+// 判定恒为 true → 每次打开都 re-save → revision 单调漂移（实测漂到 706）+ 反复弹「已升级」
+// toast。改用对「会落盘的内容」做深比较：真无变更就不写盘、不 ++revision。
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+// 语义相等里要跳过的 bookkeeping 元字段——它们由「保存/迁移动作本身」产生（updatedAt 来自
+// Date.now()、revision 由 ++ 累加），不是内容。否则两份内容全等、仅 updatedAt 差 1ms 的 payload
+// 会被判为不等：① migratedRecordNeedsPersist 误判「需写盘」→ 又一次保存（自激振荡，正是 line 47-53
+// 刻意要避免的）；② 比较两份新建 default payload 的测试因跨毫秒边界 flaky。与下方 migratedRecord
+// NeedsPersist 注释「刻意不比较 revision/savedAt/updatedAt」同一意图，这里把它落到实现层（任意深度）。
+const SEMANTIC_EQUALS_IGNORED_KEYS = new Set(['updatedAt', 'createdAt', 'savedAt', 'revision'])
+
+function semanticKeys(record: Record<string, unknown>): string[] {
+  return Object.keys(record).filter((key) => record[key] !== undefined && !SEMANTIC_EQUALS_IGNORED_KEYS.has(key))
+}
+
+/**
+ * 结构化深比较：plain object（忽略 key 顺序、跳过值为 undefined 的键、跳过 bookkeeping 元字段）
+ * / array / 基本类型。只服务 workbenchPayloadSemanticEquals（内容语义相等），故在此跳过 bookkeeping。
+ */
+function deepValueEquals(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    return a.every((item, index) => deepValueEquals(item, b[index]))
+  }
+  if (isPlainRecord(a) && isPlainRecord(b)) {
+    const keysA = semanticKeys(a)
+    const keysB = semanticKeys(b)
+    if (keysA.length !== keysB.length) return false
+    return keysA.every((key) => Object.prototype.hasOwnProperty.call(b, key) && deepValueEquals(a[key], b[key]))
+  }
+  return false
+}
+
+/** 两份 payload 语义是否一致（引用无关、key 顺序无关）。 */
+export function workbenchPayloadSemanticEquals(a: WorkbenchProjectPayload, b: WorkbenchProjectPayload): boolean {
+  return deepValueEquals(a, b)
+}
+
+/**
+ * 迁移后的记录是否「真的需要写盘」。只看会被持久化且语义相关的字段：
+ * - name（用户可见）
+ * - payload（画布/时间轴/文档/分类等全部内容）
+ * 刻意不比较 revision/savedAt/updatedAt 这类 bookkeeping 元字段——它们由保存动作本身产生，
+ * 不该反过来触发又一次保存（否则就是自激振荡）。
+ */
+export function migratedRecordNeedsPersist(
+  original: WorkbenchProjectRecordV1,
+  upgraded: WorkbenchProjectRecordV1,
+): boolean {
+  if (Object.is(original, upgraded)) return false
+  if (original.name !== upgraded.name) return true
+  return !workbenchPayloadSemanticEquals(original.payload, upgraded.payload)
+}
+
+/** 这次打开移除了几张分镜表节点；取走即清（只认这一轮 hydration 的 guard）。 */
+export function consumeRetiredStoryboardTableCount(guard: ProjectHydrationGuard): number {
+  const value = retiredTableCounts.get(guard) ?? 0
+  retiredTableCounts.delete(guard)
+  return value
+}
+
+/** Returns + clears only the diagnostic owned by this exact hydration epoch. */
+export function consumeCategoryMigrationDiagnostic(guard: ProjectHydrationGuard): CategoryMigrationDiagnostic | null {
+  const value = categoryMigrationDiagnostics.get(guard) ?? null
+  categoryMigrationDiagnostics.delete(guard)
+  return value
+}
+
+const LAST_ACTIVE_PROJECT_KEY = 'nomi-workbench-last-active-project-v1'
+
+type Dependencies = {
+  setActiveProject: (project: LocalProjectSummary | null) => void
+  isActiveProject: (projectId: string) => boolean
+}
+
+
+function writeLastActiveProjectId(projectId: string): void {
+  if (typeof window === 'undefined') return
+  const id = projectId.trim()
+  if (!id) return
+  window.localStorage.setItem(LAST_ACTIVE_PROJECT_KEY, id)
+}
+
+export type WorkbenchProjectPersistenceService = {
+  hydrateProject: (projectId: string, guard: ProjectHydrationGuard) => Promise<WorkbenchProjectRecordV1 | null>
+  /** 改名 + 把当前内存内容落盘。项目名只在这里（和项目库改名）写；自动保存绝不写名字。 */
+  renameProjectAndPersist: (project: LocalProjectSummary, payload: WorkbenchProjectPayload) => Promise<WorkbenchProjectRecordV1>
+  bindProjectPersistence: (input: {
+    project: LocalProjectSummary
+    isHydrating: () => boolean
+    canPersist: () => boolean
+    onSaved: (record: WorkbenchProjectRecordV1) => void
+    onSaveError: (error: unknown) => void
+  }) => () => Promise<void>
+}
+
+export function createWorkbenchProjectPersistenceService(deps: Dependencies): WorkbenchProjectPersistenceService {
+  const renameProjectAndPersist = async (project: LocalProjectSummary, payload: WorkbenchProjectPayload): Promise<WorkbenchProjectRecordV1> => {
+    await renameLocalProject(project.id, project.name)
+    const localSaved = await saveLocalProject(project.id, payload)
+    if (deps.isActiveProject(localSaved.id)) {
+      writeLastActiveProjectId(localSaved.id)
+      deps.setActiveProject(localSaved)
+    }
+    return localSaved
+  }
+
+  const bindProjectPersistence = (input: {
+    project: LocalProjectSummary
+    isHydrating: () => boolean
+    canPersist: () => boolean
+    onSaved: (record: WorkbenchProjectRecordV1) => void
+    onSaveError: (error: unknown) => void
+  }): (() => Promise<void>) => {
+    return subscribeWorkbenchProjectPersistence({
+      projectId: input.project.id,
+      isHydrating: input.isHydrating,
+      canPersist: input.canPersist,
+      saveProject: async (_projectId, payload) => {
+        // 只写内容。名字不是自动保存的字段：input.project 是「打开那一刻」的快照，名字可能早被别的路径改过。
+        const localSaved = await saveLocalProject(input.project.id, payload)
+        if (input.canPersist()) writeLastActiveProjectId(localSaved.id)
+        return localSaved
+      },
+      onSaved: input.onSaved,
+      onSaveError: input.onSaveError,
+    })
+  }
+
+  const hydrateProject = async (
+    projectId: string,
+    guard: ProjectHydrationGuard,
+  ): Promise<WorkbenchProjectRecordV1 | null> => {
+    abandonHydratingProjectOwnership()
+    clearActiveWorkbenchProjectSaveTarget()
+    guard.assertCurrent()
+    const project = await measureProjectOpenStage('read-project', () => readLocalProjectAsync(projectId))
+    guard.assertCurrent()
+    if (!project) return null
+    const { diagnostic, mediaDimensionsUpgraded, retiredTables } = await measureProjectOpenStage('migrate', async () => {
+      const mediaUpgraded = await upgradeWorkbenchProjectMediaUrls(project)
+      guard.assertCurrent()
+      const { record: catUpgraded, diagnostic } = migrateProjectRecord(mediaUpgraded)
+      const { record: v60Upgraded0 } = migrateProjectV51ToV60(catUpgraded)
+      const { record: v60Upgraded, retired: retiredTables } = retireStoryboardTableViews(v60Upgraded0)
+      // A1.5：历史导入/切图/裁剪/截图的 image 节点改判为 asset（素材卡）。
+      const assetUpgraded = normalizeLegacyImageAssetKinds(v60Upgraded)
+      const mediaDimensionsUpgraded = await backfillCanvasMediaDimensions(assetUpgraded)
+      return { diagnostic, mediaDimensionsUpgraded, retiredTables }
+    })
+    // 镜头编号存储身份化（审计 A2）：存量项目缺 shotIndex 的镜头节点按
+    // (y, x, id) 确定性回填一次；此后编号不再随布局/添加节点漂移。
+    const shotBackfill = backfillShotIndexes(mediaDimensionsUpgraded.payload.generationCanvas.nodes)
+    // 「第 N 版」同理：旧项目的版本没有号，按持久顺序（最早 = 1）补一次并写盘，之后号跟着版本走。
+    const versionBackfill = backfillNodeResultVersionNumbers(shotBackfill.nodes)
+    const upgraded = shotBackfill.changed || versionBackfill.changed
+      ? {
+          ...mediaDimensionsUpgraded,
+          payload: {
+            ...mediaDimensionsUpgraded.payload,
+            generationCanvas: {
+              ...mediaDimensionsUpgraded.payload.generationCanvas,
+              nodes: versionBackfill.nodes,
+            },
+          },
+        }
+      : mediaDimensionsUpgraded
+    // 语义相等判定（不再用引用相等）：多道迁移即便换了顶层引用，只要落盘内容没变就
+    // 不写盘、不 ++revision、不弹「已升级」toast。修 revision 单调漂移根因。
+    const changed = migratedRecordNeedsPersist(project, upgraded)
+    if (changed && !diagnostic.alreadyMigrated && (diagnostic.migratedNodes > 0 || diagnostic.removedNodes > 0 || diagnostic.categoriesSeeded)) {
+      categoryMigrationDiagnostics.set(guard, diagnostic)
+    }
+    if (changed && retiredTables > 0) retiredTableCounts.set(guard, retiredTables)
+    if (changed) {
+      await measureProjectOpenStage('save-migrated', () => saveLocalProject(upgraded.id, upgraded.payload))
+    }
+    // A turn begun while the read was pending still targets the outgoing project.
+    abandonHydratingProjectOwnership()
+    guard.assertCurrent()
+    measureProjectOpenStageSync('restore-store', () => restoreWorkbenchProjectPayload(upgraded.payload, upgraded.id))
+    // S5-b-1:重放快照没盖到的事件尾巴(崩溃恢复),完成后以含尾后态发 genesis。
+    await measureProjectOpenStage('replay-events', () => replayCanvasEventTailAndSealGenesis(upgraded.id, upgraded.payload, guard))
+    guard.assertCurrent()
+    // Event-tail replay crosses IPC and the restored canvas is already visible. A turn may
+    // start in that window with the outgoing project's identity; close the hydration epoch
+    // once more before publishing the new active project.
+    abandonHydratingProjectOwnership()
+    writeLastActiveProjectId(upgraded.id)
+    guard.assertCurrent()
+    // 上次删掉的版本、App 直接退出没来得及删的文件：现在撤销日志是空的，没有哪一步能退回去了。
+    // 不挡打开（清扫在后台走），判定读的是刚载入、含事件尾巴的画布与时间轴。
+    if (upgraded.payload.pendingAssetDeletions?.length) {
+      void sweepPersistedAssetDeletions(upgraded.id, upgraded.payload.pendingAssetDeletions, () => {
+        // 还是这个项目开着才存（清扫期间换了项目就不碰下一个项目的盘；那一笔下次打开再扫）。
+        if (isGuardCurrent(guard)) useGenerationCanvasStore.getState().commitPersistedChange()
+      })
+        .catch((error: unknown) => logRendererError('pending-asset-deletion-sweep-failed', error))
+    }
+    return upgraded
+  }
+
+  return {
+    hydrateProject,
+    renameProjectAndPersist,
+    bindProjectPersistence,
+  }
+}

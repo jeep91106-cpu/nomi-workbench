@@ -1,0 +1,68 @@
+import { describe, expect, it } from 'vitest'
+import { buildClipFromGenerationNode } from './buildClipFromGenerationNode'
+import { canDragGenerationNodeToTimeline } from './timelineDragAffordance'
+import type { GenerationCanvasNode } from './generationCanvasTypes'
+
+function makeNode(overrides: Partial<GenerationCanvasNode> = {}): GenerationCanvasNode {
+  return {
+    id: 'node-1',
+    kind: 'image',
+    title: 'Generated asset',
+    prompt: 'A frame',
+    position: { x: 0, y: 0 },
+    size: { width: 320, height: 180 },
+    status: 'success',
+    result: {
+      id: 'result-1',
+      type: 'image',
+      url: 'file:///asset.png',
+      createdAt: 1,
+    },
+    history: [],
+    ...overrides,
+  }
+}
+
+describe('timeline drag affordance', () => {
+  it('marks generated image and video assets with a result url as draggable to the timeline', () => {
+    expect(canDragGenerationNodeToTimeline(makeNode({ kind: 'image' }))).toBe(true)
+    expect(canDragGenerationNodeToTimeline(makeNode({ kind: 'video', result: { id: 'video-1', type: 'video', url: 'file:///asset.mp4', durationSeconds: 4, createdAt: 1 } }))).toBe(true)
+    expect(canDragGenerationNodeToTimeline(makeNode({ kind: 'panorama' }))).toBe(false)
+  })
+
+  it('does not advertise dragging for failed, readonly, or empty nodes', () => {
+    expect(canDragGenerationNodeToTimeline(makeNode({ status: 'error' }))).toBe(false)
+    expect(canDragGenerationNodeToTimeline(makeNode({ result: undefined }))).toBe(false)
+    expect(canDragGenerationNodeToTimeline(makeNode(), { readOnly: true })).toBe(false)
+  })
+
+  it('does not advertise stale results while generation prevents adoption', () => {
+    for (const status of ['queued', 'running', 'error'] as const) {
+      const node = makeNode({ status })
+      expect(buildClipFromGenerationNode(node)).toBeNull()
+      expect(canDragGenerationNodeToTimeline(node)).toBe(false)
+    }
+  })
+
+  it('accepts imported and derived media by result type, including audio, but rejects non-media', () => {
+    for (const kind of ['asset', 'image', 'video'] as const) {
+      for (const type of ['image', 'video', 'audio'] as const) {
+        expect(canDragGenerationNodeToTimeline(makeNode({ kind, result: { id: type, type, url: 'file:///media', createdAt: 1 } }))).toBe(true)
+      }
+    }
+    for (const type of ['text', 'model3d'] as const) {
+      expect(canDragGenerationNodeToTimeline(makeNode({ result: { id: type, type, url: 'file:///not-media', createdAt: 1 } }))).toBe(false)
+    }
+  })
+
+  it('can turn generated image and video assets into timeline clips', () => {
+    const imageClip = buildClipFromGenerationNode(makeNode(), { fps: 30, startFrame: 12 })
+    expect(imageClip).toMatchObject({ type: 'image', startFrame: 12, endFrame: 102, url: 'file:///asset.png' })
+
+    const videoClip = buildClipFromGenerationNode(makeNode({
+      kind: 'video',
+      result: { id: 'video-1', type: 'video', url: 'file:///asset.mp4', durationSeconds: 4, createdAt: 1 },
+    }), { fps: 24, startFrame: 48 })
+    expect(videoClip).toMatchObject({ type: 'video', startFrame: 48, endFrame: 144, url: 'file:///asset.mp4' })
+  })
+})

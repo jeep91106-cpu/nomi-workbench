@@ -1,0 +1,123 @@
+{
+  "version": 2,
+  "entries": [
+    {
+      "label": "smoke:waitForFunction",
+      "rule": "font-size",
+      "owner": "design-system (docs/design/nomi-design-system.md §字号, micro=11px)",
+      "reason": "PR #662 B 起的 micro=11px 已核验例外；10-08 外壳重设计（#1136）后换成新外壳的 11px 元素：左栏六个短字（文稿 / 目录 / 素材 / 流程 / Skill / 提示词，拍板稿 Chrome 板）、阶段步骤器进度（0/1）、节点卡上的生成方式 / 变体等既有 micro 元素。仍禁止扩大到新元素或更小字号。",
+      "findings": [
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "0/1"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "文稿"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "目录"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "素材"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "流程"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "Skill"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "提示词"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "生成方式"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "div"
+          ],
+          "text": [
+            "用即梦接入，纯文字生成图像"
+          ],
+          "fontSizes": [
+            11
+          ]
+        },
+        {
+          "target": [
+            "span"
+          ],
+          "text": [
+            "变体"
+          ],
+          "fontSizes": [
+            11
+          ]
+        }
+      ]
+    }
+  ]
+}

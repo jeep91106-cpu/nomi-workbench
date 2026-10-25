@@ -1,0 +1,188 @@
+import { z } from 'zod'
+import { generationNodeStatusSchema } from '../../../../electron/shared/canvas/generationNodeStatus'
+import { CATEGORY_IDS } from './generationCanvasTypes'
+import { GENERATION_NODE_KINDS } from './generationNodeKinds'
+import { CANVAS_PREVIEW_STATES } from '../../../../electron/shared/canvas/canvasMediaPreview'
+
+export const generationNodeKindSchema = z.enum(GENERATION_NODE_KINDS)
+
+export { generationNodeStatusSchema }
+export const generationNodeTaskKindSchema = z.enum(['text', 'image', 'video', 'audio', 'model3d', 'workflow', 'asset', 'unknown'])
+export const generationNodeRunStatusSchema = generationNodeStatusSchema.exclude(['idle']).or(z.literal('cancelled'))
+export const categoryIdSchema = z.enum(CATEGORY_IDS)
+
+export const generationNodeProgressSchema = z.object({
+  runId: z.string().optional(),
+  taskId: z.string().optional(),
+  taskKind: generationNodeTaskKindSchema.optional(),
+  phase: z.string().optional(),
+  message: z.string().optional(),
+  percent: z.number().optional(),
+  updatedAt: z.number(),
+})
+
+export const generationProvenanceSchema = z.object({
+  provider: z.string().optional(),
+  modelKey: z.string().optional(),
+  modelVersion: z.string().optional(),
+  prompt: z.string().optional(),
+  negativePrompt: z.string().optional(),
+  seed: z.number().optional(),
+  params: z.record(z.unknown()).optional(),
+  vendorRequestId: z.string().optional(),
+  cost: z.object({
+    amount: z.number().finite().nonnegative(),
+    currency: z.string(),
+    unit: z.enum(['estimate', 'actual']),
+  }).optional(),
+  timestamp: z.number(),
+  agentRunId: z.string().optional(),
+}).strict()
+
+export const generationNodeResultSchema = z.object({
+  id: z.string().min(1),
+  /** 「第 N 版」：节点内持久序号，1 = 最早；删了留空号（model/nodeResultLifecycle.ts）。 */
+  versionNo: z.number().int().positive().optional(),
+  type: z.enum(['image', 'video', 'text', 'audio', 'model3d']),
+  url: z.string().optional(),
+  thumbnailUrl: z.string().optional(),
+  previewState: z.enum(CANVAS_PREVIEW_STATES).optional(),
+  text: z.string().optional(),
+  model: z.string().optional(),
+  durationSeconds: z.number().optional(),
+  taskId: z.string().optional(),
+  taskKind: generationNodeTaskKindSchema.optional(),
+  assetId: z.string().optional(),
+  assetRefId: z.string().optional(),
+  raw: z.unknown().optional(),
+  createdAt: z.number(),
+  provenance: generationProvenanceSchema.optional(),
+})
+
+export const generationNodeRunRecordSchema = z.object({
+  id: z.string().min(1),
+  status: generationNodeRunStatusSchema,
+  attempt: z.object({ vendorKey: z.string().min(1), modelKey: z.string().min(1) }).optional(),
+  projectId: z.string().optional(),
+  taskId: z.string().optional(),
+  taskKind: generationNodeTaskKindSchema.optional(),
+  assetId: z.string().optional(),
+  assetRefId: z.string().optional(),
+  progress: generationNodeProgressSchema.optional(),
+  resultId: z.string().optional(),
+  textDocumentDigest: z.string().regex(/^sha256-[a-f0-9]{64}$/).optional(),
+  error: z.string().optional(),
+  raw: z.unknown().optional(),
+  startedAt: z.number(),
+  updatedAt: z.number(),
+  completedAt: z.number().optional(),
+  durationSeconds: z.number().optional(),
+})
+
+export const generationCanvasNodeSchema = z.object({
+  id: z.string().min(1),
+  kind: generationNodeKindSchema,
+  typeId: z.string().min(1).optional(),
+  pluginState: z.object({
+    pluginId: z.string().min(1),
+    pluginVersion: z.string().min(1),
+    typeId: z.string().min(1),
+    schemaVersion: z.number().int().positive(),
+    state: z.record(z.unknown()),
+  }).optional(),
+  title: z.string(),
+  position: z.object({
+    x: z.number(),
+    y: z.number(),
+  }),
+  size: z.object({
+    width: z.number(),
+    height: z.number(),
+  }).optional(),
+  prompt: z.string().optional(),
+  references: z.array(z.string()).optional(),
+  result: generationNodeResultSchema.optional(),
+  history: z.array(generationNodeResultSchema).optional(),
+  /** 版本卡片是否铺开在画布上（按节点存进项目）。 */
+  resultStackOpen: z.boolean().optional(),
+  /** 铺开时往哪边铺（点开那一刻定下，之后不变）。 */
+  resultStackSide: z.enum(['left', 'right']).optional(),
+  /** 出过的最大版本号（删掉的也算），新的一版 = 它 + 1（model/nodeResultLifecycle.ts）。 */
+  resultVersionMax: z.number().int().nonnegative().optional(),
+  progress: generationNodeProgressSchema.optional(),
+  runs: z.array(generationNodeRunRecordSchema).optional(),
+  status: generationNodeStatusSchema.optional(),
+  error: z.string().optional(),
+  meta: z.record(z.unknown()).optional(),
+  categoryId: categoryIdSchema.optional(),
+  groupId: z.string().optional(),
+  derivedFrom: z.string().optional(),
+  // E.2C-15 新增字段
+  regeneratedFrom: z.string().optional(),
+  shotIndex: z.number().int().nonnegative().optional(),
+  renderKind: z
+    .enum(['shot-frame', 'character-card', 'scene-card', 'prop-card', 'audio-strip'])
+    .optional(),
+  // Phase C5: Tiptap document body for inline-editable text nodes. passthrough so
+  // unknown marks/attrs survive; optional so legacy nodes without it still parse.
+  contentJson: z.object({ type: z.literal('doc') }).passthrough().optional(),
+})
+
+const generationCanvasEdgeModeSchema = z.enum([
+  'reference',
+  'first_frame',
+  'last_frame',
+  'style_ref',
+  'character_ref',
+  'composition_ref',
+])
+
+export const nodeGroupSchema = z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  categoryId: categoryIdSchema,
+  nodeIds: z.array(z.string()),
+  color: z.string().optional(),
+  colorToken: z.string().optional(),
+  frameBounds: z.object({
+    x: z.number(),
+    y: z.number(),
+    w: z.number(),
+    h: z.number(),
+  }).optional(),
+  // 框头部的一句灰字说明（2026-09-06 框工具第一档）；旧快照无 → undefined。
+  description: z.string().optional(),
+  collapsed: z.boolean().optional(),
+  // 分镜组幂等章（多镜物化通道写入）。缺了它读盘会被 zod 剥掉：分镜组变成普通组，落画布补组也找不回已建的组。
+  materializationOperationId: z.string().optional(),
+  // 组入参声明（真边仍是普通 node→node 边）；旧快照无 → undefined。
+  inputLinks: z.array(z.object({
+    sourceNodeId: z.string().min(1),
+    mode: generationCanvasEdgeModeSchema.optional(),
+  })).optional(),
+  // 组出参声明：编组作为来源时，每个成员都向 target 物化普通真边；旧快照无 → undefined。
+  outputLinks: z.array(z.object({
+    targetNodeId: z.string().min(1),
+  })).optional(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+})
+
+export const generationCanvasEdgeSchema = z.object({
+  id: z.string().min(1),
+  source: z.string().min(1),
+  target: z.string().min(1),
+  mode: generationCanvasEdgeModeSchema.optional(),
+  targetParamKey: z.string().min(1).optional(),
+  // 落入同一 target 的放入顺序（数组参考 character1..N 的真相源；旧快照无 → undefined，排序退化为原序）。
+  order: z.number().optional(),
+  // 溯源：由哪个组的输入/输出声明物化而来（只用于撤边时不误伤手工边）。
+  viaGroupId: z.string().optional(),
+})
+
+export const generationCanvasSnapshotSchema = z.object({
+  nodes: z.array(generationCanvasNodeSchema),
+  edges: z.array(generationCanvasEdgeSchema),
+  selectedNodeIds: z.array(z.string()),
+  groups: z.array(nodeGroupSchema).default([]),
+})

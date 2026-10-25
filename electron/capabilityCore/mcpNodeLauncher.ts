@@ -1,0 +1,394 @@
+// MCP stdio entry that runs under Electron's bundled Node runtime. It never creates an
+// NSApplication: an existing Nomi is reached over loopback RPC, and a missing Nomi is started once.
+//
+// **库指纹握手**（2026-08-18 §P3-F）：发现实例后不再「谁写了就连谁」。读广告（instanceAdvert 校验）后按 verdict
+// 分诊：库匹配 + 活 + 心跳新鲜 → 连（happy path）；库不匹配/心跳陈旧/旧版 v1 → **快速失败**（≤10s，给人话，绝不
+// 静默串到别人的库）；进程死/没广告 → 冷启（唯一还走满 60s 的路）。这台机器上真有并发会话依赖 ~/.nomi 里的活
+// 广告，本模块的隔离与快速失败就是为了杜绝 2026-08-17 那次「我的项目连进走查库」。
+import { spawn, type ChildProcess } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio'
+
+import { createNomiMcpServer, MCP_REQUEST_SIGNAL, type McpInvokeOptions } from './mcpProtocol'
+import { MCP_CANCELLED_IN_FLIGHT_EVENT, MCP_TRANSPORT_ERROR_EVENT } from './mcpStdioDiagnostics'
+import { recordDetectedMcpClient } from './mcpDetectedClients'
+// 直接吃纯 locale 模块，不经 i18n.ts——后者顶层 `import { app } from 'electron'`，本 launcher 打包后跑在
+// 无 electron 的裸 Node 里，引 i18n 会 MODULE_NOT_FOUND。这条 electron-free 由 mcpLauncherClosure.test.ts 钉死。
+import { normalizeDesktopLocale, type DesktopLocale } from '../desktopLocale'
+import { readPersistedLocale } from '../settings/localePreference'
+import {
+  instanceAdvertFileName,
+  parseAdvert,
+  validateAdvert,
+  type AdvertVerdict,
+  type InstanceAdvertisement,
+} from './instanceAdvert'
+import {
+  createMcpConnectionContext,
+  type McpConnectionContext,
+} from './mcpConnectionContext'
+import { callMcpLoopbackRpc, createLoopbackGenerationConfirmation } from './mcpLoopbackRpcCall'
+
+const CAPABILITY_DIR_ENV = 'NOMI_CAPABILITY_DIR'
+const PROJECTS_DIR_ENV = 'NOMI_PROJECTS_DIR'
+const SETTINGS_DIR_ENV = 'NOMI_SETTINGS_DIR'
+const CLIENT_ENV = 'NOMI_MCP_CLIENT'
+const CLIENT_PROOF_ENV = 'NOMI_MCP_CLIENT_PROOF'
+const APP_COMMAND_ENV = 'NOMI_MCP_APP_COMMAND'
+const APP_ARGS_ENV = 'NOMI_MCP_APP_ARGS'
+const BACKGROUND_LAUNCH_ENV = 'NOMI_LAUNCH_BACKGROUND'
+const BOOT_TIMEOUT_MS = 60_000
+// 快速失败预算（§P3-F 承诺）：库不匹配/陈旧/旧版这类「已知连不上」必须在此预算内报人话，绝不拖到 60s 盲等。
+// 实现上在**冷启前**同步命中即抛（毫秒级 ≪ 预算），远快于它；此常量既是文档也是并发用例断言的上界。
+export const FAST_FAIL_BUDGET_MS = 10_000
+
+function capabilityDir(): string {
+  return String(process.env[CAPABILITY_DIR_ENV] || '').trim()
+    || path.join(os.homedir(), '.nomi', 'capability-core')
+}
+
+/**
+ * 这个 launcher 期望连的项目库根，尽 bare-Node 所能与 runtimePaths.getProjectLocationState 同序推导：
+ *   · NOMI_PROJECTS_DIR（环境覆盖）→ 确切期望库，返回 { root, isDefault:false }，读命名空间文件、做库全等校验；
+ *   · 否则 NOMI_SETTINGS_DIR 下 project-location.json 的自定义根（若该 env 在）→ 同上；
+ *   · 都没有 → 默认库：bare-Node 算不出 documents 下的默认绝对路径，返回 { root:null, isDefault:true }，读默认
+ *     instance.json，靠命名空间隔离（只有 default-source app 会写它）兜底，跳过库全等。
+ * 返回 root=null 表示「默认库、无法算出确切绝对路径」（交给 validateAdvert 的 null 语义）。
+ */
+function expectedLibrary(): { root: string | null; isDefault: boolean } {
+  const envRoot = String(process.env[PROJECTS_DIR_ENV] || '').trim()
+  if (envRoot) return { root: envRoot, isDefault: false }
+  const settingsDir = String(process.env[SETTINGS_DIR_ENV] || '').trim()
+  if (settingsDir) {
+    try {
+      const stored = JSON.parse(fs.readFileSync(path.join(settingsDir, 'project-location.json'), 'utf8')) as {
+        projectsRoot?: unknown
+      }
+      const custom = typeof stored.projectsRoot === 'string' ? stored.projectsRoot.trim() : ''
+      if (custom) return { root: custom, isDefault: false }
+    } catch {
+      /* 无自定义根设置 → 落默认 */
+    }
+  }
+  return { root: null, isDefault: true }
+}
+
+/** 期望库对应的广告文件绝对路径（默认库 → instance.json；自定义库 → instance-<hash>.json）。 */
+function advertPath(library: { root: string | null; isDefault: boolean }): string {
+  return path.join(capabilityDir(), instanceAdvertFileName(library.root ?? '', library.isDefault))
+}
+
+/** 读并校验广告 → verdict（happy path=match）。文件缺失/坏 → malformed。 */
+function readAdvertVerdict(library: { root: string | null; isDefault: boolean }): AdvertVerdict {
+  let raw: string
+  try {
+    raw = fs.readFileSync(advertPath(library), 'utf8')
+  } catch {
+    return { kind: 'malformed' }
+  }
+  let parsed: Partial<InstanceAdvertisement> | null
+  try {
+    parsed = parseAdvert(JSON.parse(raw))
+  } catch {
+    return { kind: 'malformed' }
+  }
+  return validateAdvert(parsed, library.root)
+}
+
+/** happy-path 探测：仅当 verdict=match 时返回可连实例，否则 null（分诊/快速失败交给 ensureLiveInstance）。 */
+function readLiveInstance(): InstanceAdvertisement | null {
+  const verdict = readAdvertVerdict(expectedLibrary())
+  return verdict.kind === 'match' ? verdict.instance : null
+}
+
+/**
+ * 把「连不上」的 verdict 翻成给人看的中文错误（bare-Node，无 Electron app.getLocale()；launcher 现有错误就是纯
+ * 中文串，保持一致——locale plumbing 见 resolveLauncherLocale，此处快速失败文案缺省 zh-CN）。mismatch 同时点名
+ * 两个库（连到的 vs 你要的）+ 两条出路。返回 null = 该 verdict 不是「连不上」（match/dead/malformed 不在此列）。
+ */
+function fastFailMessage(verdict: AdvertVerdict, expectedRoot: string | null): string | null {
+  switch (verdict.kind) {
+    case 'mismatch':
+      return [
+        'Nomi 连到的不是你的项目库。',
+        `这个 Nomi 实例服务的库：${verdict.instance.projectsRoot}`,
+        `你这个客户端要用的库：${expectedRoot ?? '（默认库）'}`,
+        '两条出路：① 重启 Nomi（让它挂回你的库）；② 关掉正占用它的另一个会话/走查窗口，再重试。',
+      ].join('\n')
+    case 'stale':
+      return [
+        'Nomi 实例失联了（进程还在但已停止心跳，可能卡死或挂起）。',
+        '请重启 Nomi 后重试。',
+      ].join('\n')
+    case 'legacy':
+      return 'Nomi 实例信息是旧版格式，重启 Nomi 后重试。'
+    default:
+      return null
+  }
+}
+
+function appArgs(): string[] {
+  try {
+    const value = JSON.parse(String(process.env[APP_ARGS_ENV] || '[]'))
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+// 一次拉起的 Nomi 子进程及其生命周期。launcher 不拥有「Nomi 是否活着」——广告才是真相；这里只记「我拉起的那个
+// 进程现在什么状态」，让 ensureLiveInstance 能在它退出（崩溃 / 闲置自退 / 退出中）后重新拉起，而不是白等。
+type BootedApp = {
+  child: ChildProcess
+  /** 本次拉起后是否见过它的广告 match：见过 + 现在没广告 = 它在退出中（清广告先于进程结束）。 */
+  sawLive: boolean
+  exit: { code: number | null; signal: NodeJS.Signals | null } | null
+  failure: string
+}
+let booted: BootedApp | null = null
+let lastSpawnAt = 0
+let spawnsSinceLive = 0
+let failedExitsSinceLive = 0
+
+// 退出中的实例（广告已清、进程还拖着）最多等这么久；超过算失联，不再白等 60s。
+const EXITING_WAIT_MS = 15_000
+// 连续这么多次「拉起即非零退出」（从未 match）→ 判定启动失败，不再重试。
+const MAX_FAILED_EXITS = 3
+const RESPAWN_BACKOFF_MS = [0, 1_000, 2_000, 4_000, 8_000]
+
+function bootedAlive(app: BootedApp | null): boolean {
+  return Boolean(app && app.exit === null && app.child.exitCode === null && app.child.signalCode === null)
+}
+
+function spawnNomi(): BootedApp {
+  const command = String(process.env[APP_COMMAND_ENV] || '').trim()
+  if (!command) throw new Error('Nomi MCP launcher is missing its app command. Reconnect this client in Nomi settings.')
+  const env = { ...process.env }
+  delete env.ELECTRON_RUN_AS_NODE
+  delete env.NOMI_MCP_STDIO
+  delete env[APP_COMMAND_ENV]
+  delete env[APP_ARGS_ENV]
+  delete env[CLIENT_ENV]
+  delete env[CLIENT_PROOF_ENV]
+  env[BACKGROUND_LAUNCH_ENV] = '1'
+  const app: BootedApp = { child: spawn(command, appArgs(), { env, stdio: 'ignore' }), sawLive: false, exit: null, failure: '' }
+  app.child.on('error', (error) => { app.failure = error.message })
+  app.child.on('exit', (code, signal) => {
+    // Another MCP helper may have won Nomi's single-instance race. Its sibling exits normally
+    // before the winning process advertises RPC, so keep polling instead of failing this client.
+    app.exit = { code, signal }
+  })
+  booted = app
+  lastSpawnAt = Date.now()
+  spawnsSinceLive += 1
+  return app
+}
+
+/**
+ * 没有活广告时：我拉起的子进程不在跑 → 重新拉起（间隔退避，避免输掉单实例竞争的兄弟进程被空转重拉）。
+ * 同步判定 + 模块级状态 = 同一 launcher 内并发调用天然单飞。返回 void；启动失败直接抛人话。
+ */
+function respawnIfNeeded(): void {
+  if (bootedAlive(booted)) return
+  if (booted?.exit) {
+    const { code, signal } = booted.exit
+    if (code !== 0 || signal) failedExitsSinceLive += 1
+    if (failedExitsSinceLive >= MAX_FAILED_EXITS) {
+      throw new Error(`Nomi 启动失败：连续 ${failedExitsSinceLive} 次拉起后立刻退出（code=${code} signal=${signal}）。请手动打开一次 Nomi 看有没有报错，再重试。`)
+    }
+    booted = { ...booted, exit: null, failure: '' } // 已计入，避免下一轮重复计数
+  }
+  const wait = RESPAWN_BACKOFF_MS[Math.min(spawnsSinceLive, RESPAWN_BACKOFF_MS.length - 1)]
+  if (Date.now() - lastSpawnAt < wait) return
+  spawnNomi()
+}
+
+// 结果/进度文案 locale：bare-Node launcher 优先读 GUI 写入的 preferences.language；Nomi 未运行或偏好缺失时
+// 才读系统 locale。provider 可注入（单测），并保留 zh-CN 作为无信号兜底。
+export function resolveLauncherLocale(
+  readSystemLocale: () => string = () => Intl.DateTimeFormat().resolvedOptions().locale,
+  readPreference: () => DesktopLocale | null = () => readPersistedLocale(),
+): DesktopLocale {
+  try {
+    const preferred = readPreference()
+    if (preferred) return preferred
+  } catch {
+    // A corrupt/unavailable preference must not prevent the OS fallback.
+  }
+  try {
+    return normalizeDesktopLocale(readSystemLocale())
+  } catch {
+    return 'zh-CN'
+  }
+}
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * 找到可连实例，或按 verdict 快速失败/冷启：
+ *   · match → 直接连。
+ *   · mismatch / stale / legacy → 立刻抛人话（同步命中，远快于 FAST_FAIL_MS），绝不盲等、绝不串库。
+ *   · dead / malformed → 没有活实例，走（重）拉起：循环里每一轮都看「我拉起的子进程还活着吗」——退了（崩溃 / 闲置
+ *     10 分钟自退 / 输掉单实例竞争）就重新拉起；还在拖着退出（广告已清、进程未结束）就等它结束再拉起，不白等 60s。
+ *     轮询期间若冒出 mismatch/stale/legacy（并发会话抢注）也即时快速失败。
+ */
+async function ensureLiveInstance(
+  signal?: AbortSignal,
+  /** 刚被「连接被拒」证伪的实例：广告还在、pid 看着还活（Linux/macOS 上被杀未回收的僵尸进程 kill(pid,0) 仍成功），但端口已无人监听。 */
+  refused?: InstanceAdvertisement,
+): Promise<InstanceAdvertisement> {
+  const aborted = () => (signal?.reason instanceof Error ? signal.reason : new Error('MCP request cancelled'))
+  if (signal?.aborted) throw aborted()
+  const library = expectedLibrary()
+  const deadline = Date.now() + BOOT_TIMEOUT_MS
+  let exitingSince = 0
+  let attempted = false
+  for (;;) {
+    if (signal?.aborted) throw aborted()
+    const verdict = readAdvertVerdict(library)
+    const isRefused = verdict.kind === 'match' && refused !== undefined
+      && verdict.instance.pid === refused.pid && verdict.instance.port === refused.port
+    if (verdict.kind === 'match' && !isRefused) {
+      if (booted) booted.sawLive = true
+      spawnsSinceLive = 0
+      failedExitsSinceLive = 0
+      return verdict.instance
+    }
+    const fastFail = fastFailMessage(verdict, library.root)
+    if (fastFail) throw new Error(fastFail) // 库不匹配/陈旧/旧版：别串库、别盲等，立即人话失败（含冷启途中并发抢注）
+    if (booted?.failure) throw new Error(`Nomi 启动失败：${booted.failure}`)
+    if (attempted && Date.now() >= deadline) break
+    attempted = true
+    if (booted && bootedAlive(booted) && (booted.sawLive || isRefused)) {
+      // 见过它活、现在没广告：它在退出中。等它结束（下一轮就会重拉），但不无限等。
+      exitingSince ||= Date.now()
+      if (Date.now() - exitingSince > EXITING_WAIT_MS) {
+        throw new Error('Nomi 实例失联：它已停止服务（广告已清）但进程迟迟没有退出。请在任务管理器结束 Nomi 后重试。')
+      }
+    } else {
+      exitingSince = 0
+      respawnIfNeeded()
+    }
+    await delay(200)
+  }
+  if (bootedAlive(booted)) {
+    throw new Error('Nomi 正在启动，但 60 秒内还没就绪（进程仍在运行，可能卡在启动）。请看一眼 Nomi 窗口，或稍后再试。')
+  }
+  const detail = booted?.exit ? ` Nomi launcher exited before MCP was ready (code=${booted.exit.code} signal=${booted.exit.signal})` : ''
+  throw new Error(`Nomi 启动失败：60 秒内没有拉起可用实例。请先手动打开一次 Nomi，再重试该 MCP 操作。${detail}`)
+}
+
+function isConnectionRefused(error: unknown): boolean {
+  const cause = error instanceof Error ? (error.cause as { code?: unknown; errors?: Array<{ code?: unknown }> } | undefined) : undefined
+  return cause?.code === 'ECONNREFUSED' || Boolean(cause?.errors?.some((item) => item?.code === 'ECONNREFUSED'))
+}
+
+async function callViaRpc(
+  instance: InstanceAdvertisement,
+  method: string,
+  params: Record<string, unknown>,
+  options?: McpInvokeOptions,
+): Promise<unknown> {
+  // 裸 Node 的原生 fetch：不读系统代理，本机回环必直连（appFetch 对回环同样直连，见 systemProxy 的 LOCAL_BYPASS_RULES），两边等价。
+  return callMcpLoopbackRpc({
+    instance,
+    fetchImpl: fetch,
+    clientProof: String(process.env[CLIENT_PROOF_ENV] || '').trim(),
+    connection: launcherConnection(),
+    method,
+    params,
+    options,
+  })
+}
+
+// 首次无 GUI 时从持久化偏好解析；在线请求会通过 loopback RPC 刷新，避免用户切语言后旧缓存继续生效。
+let launcherLocale = resolveLauncherLocale()
+async function refreshLauncherLocale(instance: InstanceAdvertisement): Promise<void> {
+  try {
+    const result = await callViaRpc(instance, 'nomi_get_locale', {})
+    if (result && typeof result === 'object' && typeof (result as { locale?: unknown }).locale === 'string') {
+      launcherLocale = normalizeDesktopLocale((result as { locale: string }).locale)
+    }
+  } catch {
+    // Offline or older GUI: keep persisted/system resolution.
+  }
+}
+let connection: McpConnectionContext | null = null
+// Mint lazily but at most once for this stdio transport. Lazy construction
+// keeps pure helper imports side-effect free; the first real RPC still fails
+// closed when the installed client proof is absent or invalid.
+function launcherConnection(): McpConnectionContext {
+  connection ??= createMcpConnectionContext({
+    client: process.env[CLIENT_ENV],
+    proof: process.env[CLIENT_PROOF_ENV],
+  })
+  return connection
+}
+
+async function invokeLiveRpc(
+  instance: InstanceAdvertisement,
+  method: string,
+  params: Record<string, unknown>,
+  options?: McpInvokeOptions,
+): Promise<unknown> {
+  const requestSignal = (params as Record<PropertyKey, unknown>)[MCP_REQUEST_SIGNAL] as AbortSignal | undefined
+  return callViaRpc(instance, method, params, requestSignal ? { ...options, signal: requestSignal } : options)
+}
+
+const launcherGenerationConfirmation = createLoopbackGenerationConfirmation({
+  rpcIfOpen: (method, params) => {
+    const instance = readLiveInstance()
+    return instance ? callViaRpc(instance, method, params) : undefined
+  },
+  authenticatedClient: () => launcherConnection().authenticatedClient,
+})
+
+const mcp = createNomiMcpServer({
+  invoke: async (method, params, options) => {
+    const requestSignal = (params as Record<PropertyKey, unknown>)[MCP_REQUEST_SIGNAL] as AbortSignal | undefined
+    let instance = await ensureLiveInstance(requestSignal)
+    // 广告看着活、端口却拒连 = 实例刚死（进程未回收的窗口）。请求没送达，重发安全：换一个活实例再试一次。
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await refreshLauncherLocale(instance)
+        return await invokeLiveRpc(instance, method, params, options)
+      } catch (error) {
+        if (attempt > 0 || !isConnectionRefused(error)) throw error
+        instance = await ensureLiveInstance(requestSignal, instance)
+      }
+    }
+  },
+  invokeIfOpen: async (method, params, options) => {
+    const instance = readLiveInstance()
+    if (!instance) return undefined
+    return invokeLiveRpc(instance, method, params, options)
+  },
+  isAppOpen: () => Boolean(readLiveInstance()),
+  getAuthenticatedClient: () => launcherConnection().authenticatedClient,
+  // 打包态：裸 Node 没有自己的 Electron 主进程，不能弹应用内卡，也铸不了收据：两条确认都经回环 RPC 交给
+  // GUI 主进程（它持有 macKey，是唯一能签 client_elicitation 收据的一方）。实现与另两个装配点共用一份。
+  confirmGenerationInNomi: launcherGenerationConfirmation.confirmGenerationInNomi,
+  verifyClientGenerationConfirmation: launcherGenerationConfirmation.verifyClientGenerationConfirmation,
+  getLocale: () => launcherLocale,
+  // 打包态（裸 Node）与开发态（Electron stdio）共用同一套检测档案。
+  // mcpDetectedClients 是 bare-Node safe，不引 electron，可安全接入。
+  onClientDetected: (name) => { recordDetectedMcpClient(name) },
+})
+
+// stdin/stdout 分帧、读缓冲上限、stdin 关闭即断连都归 SDK 的 StdioServerTransport。裸 Node 够不着 logger
+// （它要 electron 的 app.getPath），所以诊断直写 stderr，事件名与 Electron 那条共用同一个常量。
+mcp.server.onerror = (error) => {
+  process.stderr.write(`[nomi-mcp] ${MCP_TRANSPORT_ERROR_EVENT} message=${JSON.stringify(error.message)}\n`)
+}
+// 断连时 SDK 中止全部在途请求的信号（别把付费生成留在后台跑），然后本进程退出、不留孤儿。
+mcp.onClose((inFlightAtClose) => {
+  if (inFlightAtClose > 0) process.stderr.write(`[nomi-mcp] ${MCP_CANCELLED_IN_FLIGHT_EVENT} count=${inFlightAtClose}\n`)
+  if (process.env.NOMI_MCP_EXIT_BOOTSTRAPPED_APP === '1' && booted?.child.pid) {
+    try { booted.child.kill('SIGTERM') } catch { /* best effort test cleanup */ }
+  }
+  process.exit(0)
+})
+void mcp.connect(new StdioServerTransport())

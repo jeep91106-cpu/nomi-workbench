@@ -1,0 +1,379 @@
+import { createHash } from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
+import { describe, expect, it } from 'vitest'
+
+// Structural assertions inspect code, not examples of the old implementation in comments.
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+const readCode = (file: string): string => stripComments(fs.readFileSync(file, 'utf8'))
+const settingsSource = readCode(path.join(process.cwd(), 'src/workbench/settings/SettingsDialog.tsx'))
+const projectLocationSource = readCode(path.join(process.cwd(), 'src/workbench/settings/ProjectLocationSection.tsx'))
+const aiModelsSource = readCode(path.join(process.cwd(), 'src/workbench/settings/AiModelsSection.tsx'))
+const taskCenterSource = readCode(path.join(process.cwd(), 'src/workbench/taskCenter/TaskCenterPanel.tsx'))
+const studioSource = readCode(path.join(process.cwd(), 'src/workbench/NomiStudioApp.tsx'))
+const controllerSource = readCode(path.join(process.cwd(), 'src/workbench/settings/useSettingsDialogController.ts'))
+const aboutSource = readCode(path.join(process.cwd(), 'src/workbench/settings/AboutSection.tsx'))
+const settingsDirectory = path.join(process.cwd(), 'src/workbench/settings')
+
+// 这张表锁的是「别无意间改动了这几块」。**有意的、已拍板的改动就该更新基线**，
+// 并在下面补一条正向断言说明改了什么——只挪哈希不加断言，等于把锁降级成橡皮图章。
+// 2026-08-21：AiModelsSection 增加上传边界说明（KIE 视频优先、公共托管先提醒），故更新其哈希。
+// 2026-08-25：同一块从「推销 KIE」改成「逐媒体类型说出当前真实通道 + 配置直达」，再次更新哈希；
+//             对应正向断言见下面 reports the live upload channel per media kind 那条。
+// 2026-08-26：CanvasGestureSection 仅将 import 改为共享 utils 模块；下方锁定设置与两个画布同源。
+// 2026-08-31：上传通道可见性同步覆盖 Nomi relay 的 public-provider 标记，更新 AiModelsSection 基线；
+//             对应正向断言仍锁定实际渲染条件，避免只挪哈希掩盖配置入口变化。
+// 2026-09-01：AboutSection 增加反馈与分享入口，更新其基线；对应正向断言见 AboutSection 自身的
+//             dispatch 逻辑，避免把用户已拍板的入口误报为意外漂移。
+// 2026-09-01（二）：反馈与分享改为**内嵌在设置弹窗内**（原 dispatch+关设置 会冒成独立浮层，
+//             用户反馈「点开变成独立框」）。AboutSection 现在切内嵌视图并渲染 FeedbackShareContent，
+//             故再次更新其基线；对应正向断言见下方 embeds feedback and sharing inside the About section。
+// 2026-09-02：这一屏的供应商名与模型名此前直连 provider.name / model.labelZh，英文界面上照原样
+//             显示中文（实测 34 处，连词典里已有译文的「本地 ComfyUI」「可灵 3.0」也是中文——
+//             说明缺的不是词条而是这条路没过翻译边界）。三处渲染点接上 translateModelDisplayText，
+//             故更新 AiModelsSection 基线；对应正向断言见下方 translates vendor and model display
+//             names through the model-display boundary。
+// 2026-09-06：「优先供应商」排序区归位到本 tab（设计系统 §1.7.2：接入决定「有没有」归「模型」，
+//             「已接好的几家里默认走哪家」是策略，和紧邻的「新建卡片默认模型」同族）。原实现挂在
+//             「模型」tab 的 ModelSettingsHome 里，那是第二个「默认用什么」的家。故更新
+//             AiModelsSection 基线；对应正向断言见下方 hosts the vendor preference order。
+// 2026-09-08：动效 token 拆包——`--nomi-transition-fast` 把「140ms + 缓动」打包成一个值，
+//             而 `transition-duration` 只吃时长，整条声明非法被丢弃、计算值是 `0s`（全 App 77 处
+//             写了过渡却完全没有过渡）。拆成 `--nomi-duration-fast` + `--nomi-ease-fast` 后，
+//             本文件那颗手势选项钮的 className 从旧的打包写法（`duration-[…]` 里塞整个
+//             `--nomi-transition-fast`）改成 `duration-nomi-fast ease-nomi-fast`，故更新其基线。
+//             **这次只有这一行变**，
+//             对应正向断言见下方 uses the split motion tokens on the gesture options——锁住它不许
+//             退回打包写法（退回=按钮 hover 又变回硬切，而所有快照仍然全绿）。
+// 2026-09-11：「模型框里显示哪些、排在哪」区块挂进本 tab，紧贴「默认走哪家」下面（用户当天拍板的
+//             两张表：上面那张管每行高亮哪个供应商标签，下面这张管有哪几行、什么顺序）。故更新
+//             AiModelsSection 基线；对应正向断言见下方 hosts the model box order right below the
+//             vendor preference——锁住两块必须同屏相邻（分开放 = 用户要去两个地方找同一件事）。
+// 2026-09-10 DC24: remove repeated teaching; retain actionable upload/privacy and gesture details.
+// Positive cross-surface coverage: quietDefaults.test.ts.
+const APPROVED_NON_MODEL_SECTION_SHA256 = {
+  // 2026-09-04：检查反馈 tone 改为从公共 toast 函数参数推导，避免重复词表 owner。
+  // 2026-09-09：目录操作错误回现有status；保留共享tone类型，正向回归见下方local feedback。
+  'ProjectLocationSection.tsx': '8859c5bd425d82b8880c26d89218e36c274b1a7d6003b00a3e64de39bb535689',
+  // 2026-09-02: AiModelsSection 按渲染边界收口供应商/模型展示名（translateModelDisplayText）。
+  // B4: user explicitly removed the global budget setting; the positive absence assertion is below.
+  // 2026-09-14：删「默认模型策略」整栏（说明文字 + 161 个白名单复选框 + 深链聚焦）；已接入即放行。
+  // 2026-09-21：目录读失败不再把供应商/模型清空（同形裸 catch 横扫）。清空等于替用户断言
+  //             「你没有这些」，而真相只是「这一次没读到」——用户那句「重装之后配置都没了」
+  //             就是这么来的。正向断言见下方 keeps the last catalog when a read fails。
+  // 2026-09-22（#831）：「已接入 Kie」的判据从 key 字面量改成经 builtinVendorIdentity 解析身份，
+  //             这样兄弟连接（`kie--x`）也认得出。两刀都只改判据，布局与文案一个字没动。
+  // 2026-10-10：用户拍板「蓝色描边都删掉」，设置各区块只把 `border-nomi-accent` 系类名换成灰线 / 透明边
+  //             （输入框聚焦 `focus:border-nomi-ink-40`、当前项 `border-transparent`；布局与文案一个字没动），
+  //             故更新相关文件哈希；协调会话在交付报告里知情。
+  // 2026-10-16（卡顿波 P-compose）：供应商列表改读异步目录 IPC（同步通道已删：主进程忙时「点设置没反应」），
+  //             读失败照旧保留上一份；布局与文案一个字没动，协调会话在交付报告里知情。
+  'AiModelsSection.tsx': 'f2a2ecefc176ac15bd3729707f5fc8412f180eddc30bfb5f82f46c281073c4bc',
+  // 2026-09-03：toggleHost 参数类型从 SettingsHostKey（四值联合）泛化为 string（支持自定义 profile key）；
+  // 新增 CustomMcpClientCard UI TODO 注释（底层能力已就绪，UI 面另排样张拍板）。
+  // 2026-09-09：声音归通用设置的单一入口，移除这里的旧开关；下方断言保留系统通知策略。
+  // 2026-09-14：删「默认制作模式」三段与「支出与风险边界」整栏（#781），并删掉独立的「可信发起方」栏——开关并进 MCP 连接页每张客户端卡（#783）。
+  'AutomationPermissionsSection.tsx': '721c88e732d8c03887adf19b69e6795f048db08c73701033fd33dc3972e5d83e',
+  // 2026-10-15：当前项文字由强调色改 text-nomi-ink（去蓝色描边，仅类名；协调会话知情）。
+  'CanvasGestureSection.tsx': '2a867bb86fe566667cc0c15d5cee11ef1e2c29bc447de5c8c5e3b53022058759',
+  // 2026-09-15：两处非布局改动——① 那行注释原来提到 FeedbackShareDialog，而那份文件本次被删
+  // （失败面那条路不再套带标题的 modal 外壳，直接呈现反馈卡）；② `FeedbackShareContent` 的
+  // `variant` prop 只剩一个合法值，删掉之后这里的 `variant="embedded"` 也跟着去掉。
+  // 布局、区块顺序、文案一个字没动。更新这颗钉子是因为它钉的是整份文件的内容。
+  // 2026-10-09 协调会话批准：关于页更新入口收进共享弹窗，同一件事只留一个界面（关于页只报一句状态 + 「查看」，
+  //             下载 / 重启 / 去官网 / 重试 / 发版说明都在 UpdateDialog 里，功能一个没少）。
+  //             截图见 docs/evidence/2026-10-09-update-reminder/；正向断言见下方 hands every update action in the About section over to the shared update dialog。
+  'AboutSection.tsx': '6b1c647f0a9cef977541d4cf4f91eb961fa159f5241ae2f65a15b98f4af25523',
+} as const
+
+describe('settings dialog structure', () => {
+  // 2026-08-12 由五 tab 扩到六 tab（用户拍板）。原五 tab 拍板为什么不再成立：
+  // 定它那会儿「模型」= 几个 API key，塞进「AI 与模型」够用；现在多实例 ComfyUI + 自定义工作流
+  // 已长成一个要整页的子系统。而原 ai tab 里的东西服务的是 MCP 代跑护栏（trustedHosts /
+  // allowedProviders / maxSpend），不是「我的模型」——名不副实正是群里「改 api url 翻半天
+  // 找不到」的根因，故拆出「模型」tab 并把原 tab 改名「AI 策略」。
+  it('uses the approved six-tab information architecture', () => {
+    for (const id of ["'file'", "'models'", "'ai'", "'automation'", "'general'", "'about'"]) {
+      expect(settingsSource).toContain(`id: ${id}`)
+    }
+    // 模型的家 = 直接渲染既有 OnboardingDrawer，不为设置另写一份模型列表（P1 无并行实现）。
+    expect(settingsSource).toContain('<OnboardingDrawer pageRequest={modelPageRequest} />')
+    expect(settingsSource).toContain('<AiModelsSection')
+    expect(settingsSource).toContain('<AutomationPermissionsSection')
+    expect(settingsSource).toContain('sm:flex-row')
+    expect(settingsSource).toContain('overflow-x-auto')
+    expect(settingsSource).toContain('data-settings-tab-id={id}')
+    expect(settingsSource).toContain('active.offsetLeft - (nav.clientWidth - active.offsetWidth) / 2')
+    // 2026-09-14：「默认模型策略」白名单整栏已删（审计 §⑥ 4/7），深链 section 'production-policy' 随之消失。
+    expect(settingsSource).not.toContain("'production-policy'")
+    expect(aiModelsSource).not.toContain('data-settings-field="hard-budget"')
+    expect(aiModelsSource).not.toContain('data-settings-field="production-provider"')
+    expect(aiModelsSource).not.toContain('settings.ai.policy.')
+  })
+
+  it('keeps notification policy in settings instead of duplicating it in task center', () => {
+    expect(taskCenterSource).not.toContain('PrefToggle')
+    expect(taskCenterSource).not.toContain('writeTaskCenterPrefs')
+    expect(settingsSource).toContain('automationPolicy')
+  })
+
+  it('places sound preferences next to telemetry without a second sound control in automation', () => {
+    const automation = readCode(path.join(settingsDirectory, 'AutomationPermissionsSection.tsx'))
+    expect(automation).not.toContain('notificationSound')
+    expect(automation).toContain('settings.systemNotifications')
+    expect(settingsSource).toContain('<AttentionSoundSection />')
+    expect(settingsSource.indexOf('<AttentionSoundSection />')).toBeLessThan(settingsSource.indexOf('<TelemetrySection />'))
+  })
+
+  it('keeps cross-device folder setup inside File & saving', () => {
+    expect(settingsSource).toContain('<ProjectLocationSection />')
+    expect(projectLocationSource).toContain('data-settings-project-sync')
+    expect(projectLocationSource).toContain("settings.file.projectLocationConfigured")
+    expect(projectLocationSource).toContain("settings.file.projectLocationCheck")
+    expect(projectLocationSource).toContain("settings.file.projectLocationSyncTitle")
+    expect(projectLocationSource).toContain("settings.file.projectLocationSyncSteps")
+    expect(projectLocationSource).toContain('aria-expanded={showSyncSteps}')
+    expect(projectLocationSource).toContain('data-project-location-check-feedback')
+    expect(projectLocationSource).toContain('data-feedback-tone')
+    expect(projectLocationSource).toContain("import type { ToastType } from '../../ui/toast'")
+    expect(projectLocationSource).toContain('tone: ToastType')
+    expect(projectLocationSource).toContain('role="status"')
+    expect(projectLocationSource).toContain('aria-live="polite"')
+    expect(projectLocationSource).toContain('https://www.verysync.com/')
+    expect(projectLocationSource).toContain('https://www.jianguoyun.com/s/downloads')
+    expect(settingsSource).not.toContain('settings.file.autoSave')
+  })
+
+  it('keeps directory failures in the visible status beside retry controls', () => {
+    expect(projectLocationSource).not.toMatch(/\b(?:toast|showInfoToast|alertDialog)\(/)
+    expect(projectLocationSource).toContain("setCheckFeedback({ tone: 'error', messageKey: ERROR_KEY[result.error] })")
+    expect(projectLocationSource).toContain("setCheckFeedback({ tone: 'error', messageKey: 'settings.file.projectLocationErrorUnknown' })")
+    expect(projectLocationSource).toContain('setCheckFeedback(null)')
+    expect(projectLocationSource).toContain('t(checkFeedback.messageKey)')
+    expect(projectLocationSource).toContain('void checkDirectory()')
+    for (const action of ['pick', 'reveal', 'reset']) expect(projectLocationSource).toContain(`void run(api.${action})`)
+    expect(projectLocationSource).toContain('disabled={unavailable || managed}')
+    expect(projectLocationSource).toContain('if (!result.canceled) setLocation(result.location)')
+  })
+
+  it('keeps each of the five non-model sections in its own settings tab', () => {
+    const sections = {
+      file: 'ProjectLocationSection', ai: 'AiModelsSection', automation: 'AutomationPermissionsSection',
+      general: 'CanvasGestureSection', about: 'AboutSection',
+    }
+    for (const [tab, section] of Object.entries(sections)) {
+      const start = settingsSource.indexOf(`tab === '${tab}' ? (`)
+      expect(start, tab).toBeGreaterThan(-1)
+      const next = settingsSource.indexOf(") : tab === '", start + 1)
+      const content = settingsSource.slice(start, next === -1 ? undefined : next)
+      expect(content, `${section} belongs to ${tab}`).toContain(`<${section}`)
+      expect(settingsSource.match(new RegExp(`<${section}\\b`, 'g')), section).toHaveLength(1)
+    }
+  })
+
+  it('keeps model management in one settings host', () => {
+    expect(studioSource).not.toContain('OnboardingFloatingPanel')
+    expect(studioSource).not.toContain('modelCatalogOpened')
+    expect(controllerSource).toContain("window.addEventListener('nomi-open-model-catalog'")
+    expect(controllerSource).toContain("openSettings({ tab: 'models' })")
+    // 2026-08-25：从「只切到模型 tab」升级成「可带 vendorKey 直达那家的 Key 输入页」。
+    // 原样式为什么不再成立：用户点设置里的「去配置 KIE」后被丢在模型列表页，Kie.ai 那行当时
+    // 连「上传」二字都不提，于是得出「Nomi 没配置 KIE 上传」——入口断在这里。
+    expect(settingsSource).toContain('onOpenModelCatalog={(vendorKey) => {')
+    expect(settingsSource).toContain("selectTab('models')")
+    expect(settingsSource).toContain('setModelPageRequest((current) => ({ vendorKey, token: (current?.token ?? 0) + 1 }))')
+  })
+
+  // 2026-09-01：反馈与分享从「dispatch 全局事件 + 关设置 → 冒出独立浮层」改为**内嵌在设置弹窗内**
+  // （获批样张 docs/design/mockups/2026-09-01-feedback-share-center*.png 画的就是它长在设置右栏里）。
+  // 旧形态为什么是 bug：用户反馈「点开变成独立框，不在设置页面里」——那正是 dispatch+onClose 的产物。
+  // 现在 About 区块在 about↔feedback 之间切视图、直接渲染 FeedbackShareContent，不再关设置、不再 dispatch。
+  it('embeds feedback and sharing inside the About section instead of a detached dialog', () => {
+    expect(aboutSource).toContain("t('about.feedbackShare')")
+    // 入口切内嵌视图，不再 dispatch 全局事件、不再关掉设置弹窗。
+    expect(aboutSource).toContain("setView('feedback')")
+    expect(aboutSource).toContain('<FeedbackShareContent onBackToAbout=')
+    expect(aboutSource).not.toContain("window.dispatchEvent(new CustomEvent('nomi-open-feedback-share'))")
+  })
+
+  it('keeps the origin/main frame and sidebar for every settings tab', () => {
+    expect(settingsSource).toContain('data-settings-dialog')
+    expect(settingsSource).toContain('data-settings-tab={tab}')
+    expect(settingsSource).toContain('className="fixed inset-0 flex items-center justify-center bg-black/45 p-2 sm:p-6"')
+    expect(settingsSource).toContain('max-w-[760px]')
+    expect(settingsSource).toContain('sm:h-[min(560px,calc(100svh-48px))]')
+    expect(settingsSource).toContain('sm:w-[196px]')
+    expect(settingsSource).not.toContain('sm:max-w-[900px]')
+    expect(settingsSource).not.toContain('sm:h-[min(540px')
+    expect(settingsSource).not.toContain('sm:w-[184px]')
+  })
+
+  it('keeps main padding and single-column content outside the unpadded model workspace', () => {
+    expect(settingsSource).toContain('data-settings-content')
+    expect(settingsSource).toContain('data-settings-model-workspace')
+    expect(settingsSource).toContain("tab === 'models' ? 'overflow-hidden p-0' : 'overflow-y-auto p-4 sm:p-6'")
+    expect(settingsSource).toContain('flex h-full min-h-0 flex-col overflow-hidden')
+    expect(settingsSource).not.toContain('data-settings-page-grid')
+    expect(settingsSource).not.toContain('SETTINGS_TWO_COLUMN_GRID_CLASS')
+    expect(settingsSource).not.toContain('min-[972px]')
+    expect(fs.existsSync(path.join(settingsDirectory, 'settingsLayout.tsx'))).toBe(false)
+  })
+
+  // 「新建卡片默认模型」挂在 AI 策略页顶部；2026-09-14 起同屏不再有第二个「默认模型」块（白名单栏已删）。
+  it('mounts the new-card default model picker at the top of the AI policy tab', () => {
+    expect(aiModelsSource).toContain('<DefaultGenerationModelsSection')
+    expect(aiModelsSource).not.toContain('data-settings-section="production-policy"')
+  })
+
+  // 2026-08-25 用户拍板：这块从「推销 KIE」改成「说出现在实际走哪条通道」。
+  // 旧形态（标题「视频参考上传：推荐 KIE（免费）」）为什么不再成立：它只是一句推荐，
+  // 用户看完仍答不出「我配了没有 / 我的素材现在往哪传」——本次改动的起因就是用户据此
+  // 误判成「Nomi 根本没接 KIE 上传」，而代码里早接好了，缺的只是他的 key 和这块可见性。
+  it('reports the live upload channel per media kind instead of just recommending KIE', () => {
+    expect(aiModelsSource).toContain('data-settings-upload-guidance')
+    expect(aiModelsSource).toContain('data-upload-channel={channel.kind}')
+    expect(aiModelsSource).toContain("settings.ai.upload.channel.title")
+    expect(aiModelsSource).toContain("settings.ai.upload.channel.configure")
+    expect(aiModelsSource).toContain("settings.ai.upload.anonymousPrompt")
+    // 现状必须来自 main 的真解析器；渲染层一旦自己排优先级，这张卡迟早开始说谎。
+    expect(aiModelsSource).toContain('assetTransport?.describeChannels()')
+    // 「已接入」按它是否真的在收文件判，不按 key 存不存在判——否则徽章和下面的通道行会互相打架。
+    // #831：同域名可以有多条 Kie 连接（`kie--x`），所以这里问的是**身份**而不是 key 字面量——
+    // 比字面量的话，第二条 Kie 连接接好了徽章也不亮，下面的通道行却说它在收文件。
+    expect(aiModelsSource).toContain("builtinVendorKeyOfKey(channel.vendorKey) === 'kie'")
+    expect(aiModelsSource).toContain("electron/shared/builtinVendorIdentity")
+    // 公开可访问的通道必须走警示样式，不能和私有链接长一样。
+    expect(aiModelsSource).toContain(
+      "channel.visibility === 'public-anonymous' || channel.visibility === 'public-provider'",
+    )
+    expect(aiModelsSource).not.toContain('settings.ai.upload.kieTitle')
+  })
+
+  // 2026-09-02：这一屏两份清单（允许的供应商 / 允许的模型）显示的是 catalog 里的原始展示名，
+  // 那些中文是**刻意稳定的档案键**（老项目和 catalog 行持久化了它们），所以必须在渲染点过
+  // translateModelDisplayText 才能变成英文。锁住这三处，是因为「忘了过边界」不会让任何测试变红——
+  // 词典再全也没用，界面照样是中文（2026-09-02 走查在这屏抓到 34 处）。
+  it('translates vendor and model display names through the model-display boundary', () => {
+    expect(aiModelsSource).toContain("import { translateModelDisplayText } from '../../i18n/modelDisplayText'")
+    // 2026-09-14 起这一屏只剩「优先供应商」排序条目仍渲染供应商名（勾选行随白名单栏一起删了），它必须过边界。
+    expect(aiModelsSource).toContain('name: translateModelDisplayText(provider.name)')
+    // 不许再出现直连原始字段的裸渲染。
+    expect(aiModelsSource).not.toContain('<span className="truncate">{provider.name}</span>')
+    expect(aiModelsSource).not.toContain('name: provider.name')
+  })
+
+  // 2026-09-06：「同一个模型好几家都能跑时默认走哪家」是**策略**（设计系统 §1.7.2 的分界线：
+  // 接入决定「有没有」→「模型」tab，策略决定「怎么用」→ 本 tab），和紧邻的「新建卡片默认模型」
+  // 同族。锁住它住在这里，是因为「搬回模型 tab」不会让任何测试变红，却会重新造出第二个
+  // 「默认用什么」的家（§1.5.2 一功能一个家）。
+  it('hosts the vendor preference order next to the default-model policy', () => {
+    expect(aiModelsSource).toContain("import { VendorPreferenceOrderSection } from './VendorPreferenceOrderSection'")
+    expect(aiModelsSource).toContain('<VendorPreferenceOrderSection entries={configuredVendorEntries} />')
+    // 只列真的调得动的家：排一个 needs-key / disabled 的家，排了也走不了。
+    expect(aiModelsSource).toContain("provider.state !== 'needs-key' && provider.state !== 'disabled'")
+    const modelHome = readCode(path.join(process.cwd(), 'src/ui/onboarding/ModelSettingsHome.tsx'))
+    expect(modelHome, '优先供应商不该在「模型」tab 再有一个家').not.toContain('VendorPreference')
+  })
+
+  // 2026-09-11：「模型框里显示哪些、排在哪」必须和「默认走哪家」同屏相邻。
+  // 用户心里这两块是同一件事（「模型框里我看到什么」）：一块定每行高亮哪个供应商标签，
+  // 一块定有哪几行、什么顺序。把它挪去别的 tab 不会让任何快照变红，却会让用户去两个地方
+  // 找同一件事（§1.5.2 一功能一个家）。
+  it('hosts the model box order right below the vendor preference', () => {
+    expect(aiModelsSource).toContain("import { ModelBoxOrderSection } from './ModelBoxOrderSection'")
+    expect(aiModelsSource).toContain('<ModelBoxOrderSection />')
+    const vendorAt = aiModelsSource.indexOf('<VendorPreferenceOrderSection')
+    const modelBoxAt = aiModelsSource.indexOf('<ModelBoxOrderSection />')
+    expect(vendorAt, '「默认走哪家」必须在前（每行标签的顺序是它定的）').toBeGreaterThan(-1)
+    expect(modelBoxAt, '「显示哪些、排在哪」紧跟其后').toBeGreaterThan(vendorAt)
+    const modelHome = readCode(path.join(process.cwd(), 'src/ui/onboarding/ModelSettingsHome.tsx'))
+    expect(modelHome, '模型框整理不该在「模型」tab 再有一个家').not.toContain('ModelBoxOrder')
+  })
+
+  // 2026-09-08：哈希只证明「变了/没变」，证不了「变成对的」。这条锁住动效 token 的拆包形态：
+  // 旧的打包写法（把 140ms 与缓动塞进 `--nomi-transition-fast` 一个值再喂给 duration）
+  // 计算值是 0s（非法声明被丢弃），
+  // 退回它不会让任何快照变红，但按钮会重新变成硬切。
+  it('uses the split motion tokens on the gesture options', () => {
+    const gestureSource = fs.readFileSync(path.join(settingsDirectory, 'CanvasGestureSection.tsx'), 'utf8')
+    expect(gestureSource).toContain('duration-nomi-fast ease-nomi-fast')
+    expect(gestureSource, '打包成一个值的旧 token 会让 transition-duration 非法、计算值 0s').not.toContain('--nomi-transition-fast')
+  })
+
+  /**
+   * 哈希只证明「变了」，证不了「变成对的」。这一条钉住 2026-09-21 那次改动的**语义**：
+   * 读目录失败时**不许**把已经在屏上的供应商/模型清成空。
+   * 退回 `setProviders([])` / `setModels([])` 不会让任何快照变红，但用户会再一次看到空白页
+   * 并得出「我的配置没了」这个错误结论。
+   */
+  it('keeps the last catalog when a read fails', () => {
+    expect(aiModelsSource, '读失败不许清空供应商').not.toContain('setProviders([])')
+    expect(aiModelsSource, '读失败不许清空模型').not.toContain('setModels([])')
+    expect(aiModelsSource).toContain('if (Array.isArray(values)) setModels(values)')
+  })
+
+  // 2026-10-09（#1135 更新提醒）：About 里原来自带一整套下载 / 重启 / 重试 / 发版说明 UI（与更新弹窗各说各话），
+  // 改为只报一句状态 + 「查看」，下载 / 重启 / 去官网 / 重试的唯一入口是共享的 UpdateDialog。
+  // （基线哈希已于 2026-10-09 经协调会话批准更新，见上方 APPROVED_NON_MODEL_SECTION_SHA256 的注释。）
+  it('hands every update action in the About section over to the shared update dialog', () => {
+    expect(aboutSource).toContain('updater.openDialog()')
+    expect(aboutSource).toContain('updater.retry')
+    for (const removed of ['updater.download', 'updater.install', 'updater.openDownload', 'updater.notes']) {
+      expect(aboutSource, removed).not.toContain(removed)
+    }
+  })
+
+  it('keeps all five non-model sections at their explicitly approved content baseline', () => {
+    for (const [fileName, expectedHash] of Object.entries(APPROVED_NON_MODEL_SECTION_SHA256)) {
+      const source = fs.readFileSync(path.join(settingsDirectory, fileName), 'utf8').replaceAll('\r\n', '\n')
+      expect(createHash('sha256').update(source).digest('hex'), fileName).toBe(expectedHash)
+    }
+  })
+
+  it('shares one gesture preference between settings and both canvases', () => {
+    const sharedModule = path.join(process.cwd(), 'src/utils/canvasGesturePreference.ts')
+    const consumers = [
+      'src/workbench/settings/CanvasGestureSection.tsx',
+      'src/ui/onboarding/workflowPage/WorkflowGraphCanvas.tsx',
+      'src/workbench/generationCanvas/reactFlow/GenerationCanvasReactFlowViewport.tsx',
+    ]
+    for (const consumer of consumers) {
+      const file = path.join(process.cwd(), consumer)
+      const source = readCode(file)
+      const preferenceImport = source.match(/import\s*\{([^}]+)\}\s*from\s*['"]([^'"]*canvasGesturePreference)['"]/)
+      expect(preferenceImport?.[1], consumer).toContain('useCanvasGestureScheme')
+      expect(path.resolve(path.dirname(file), `${preferenceImport?.[2]}.ts`), consumer).toBe(sharedModule)
+    }
+    expect(fs.existsSync(sharedModule)).toBe(true)
+    expect(fs.existsSync(path.join(process.cwd(), 'src/workbench/generationCanvas/components/canvasGesturePreference.ts'))).toBe(false)
+  })
+
+  it('lets model subpages own their header without colliding with the dialog close action', () => {
+    expect(settingsSource).not.toContain("{t('settings.tab.models')}</h2>")
+    expect(settingsSource).toContain('data-settings-close')
+    expect(settingsSource).toContain('[&_[data-model-settings-page]>header]:pr-14')
+    expect(settingsSource).toContain('[&>div:not([data-model-settings-page])>:first-child]:pr-14')
+  })
+
+  it('only delegates Escape to the model drawer when a page above home is open', () => {
+    // The drill-down guard has to mean "there is a level to pop", not "the models tab is
+    // rendered". Model settings home carries the same data-model-settings-page marker, so a bare
+    // [data-model-settings-page] predicate makes the branch always true on that tab and Escape can
+    // never close an aria-modal dialog. Keep the home exclusion attached to the guard.
+    const guard = settingsSource.match(/if \(tab === 'models' && dialog\.querySelector\((.+?)\)\)/)
+    expect(guard?.[1]).toContain(':not([data-model-settings-page="home"])')
+    const homeSurface = fs.readFileSync(path.join(process.cwd(), 'src/ui/onboarding/ModelSettingsHome.tsx'), 'utf8')
+    expect(homeSurface).toContain('data-model-settings-page="home"')
+  })
+
+  it('keeps the lazy model workspace mounted after its first visit', () => {
+    expect(settingsSource).toContain('modelsMounted')
+    expect(settingsSource).toContain("if (nextTab === 'models') setModelsMounted(true)")
+    expect(settingsSource).toContain("hidden={tab !== 'models'}")
+    expect(settingsSource).toContain("style={{ display: tab !== 'models' ? 'none' : undefined }}")
+    expect(settingsSource).toContain('<React.Suspense')
+    expect(settingsSource).toContain('<OnboardingDrawer pageRequest={modelPageRequest} />')
+  })
+})

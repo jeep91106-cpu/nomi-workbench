@@ -1,0 +1,762 @@
+/**
+ * 素材库内容（唯一素材面 · 挂在左侧栏「素材库」tab）。
+ *
+ * 复用 useAssetPool（画布节点 + 项目文件去重合流，单一真相源），
+ * 块复用 AssetThumb（形态自明：图=缩略图、视频=播放三角、音频=波形）。
+ *
+ * 右侧浮动抽屉壳已删（2026-07-22 方案一重执行）：`nomi-open-asset-library` 事件全仓无发送方，
+ * 是素材库 v1 纯抽屉时代的孤儿面——素材库唯一的门＝侧栏 tab（一个能力一个门）。
+ */
+import React, { type JSX } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useVirtualizer } from '@tanstack/react-virtual'
+import { IconPhoto, IconX } from '@tabler/icons-react'
+import { cn } from '../../utils/cn'
+import { getDesktopBridge } from '../../desktop/bridge'
+import { useAssetPool } from './useAssetPool'
+import { assetTimeValue, mergeAssetRefs, useAllProjectAssets } from './useAllProjectAssets'
+import { assetsForFolderScope, folderCountsForAssets, useAssetFolderInteractions, useAssetFolders } from './useAssetFolders'
+import { filterAssets, type AssetRef } from './assetTypes'
+import { ASSET_LIBRARY_DRAG_MIME, serializeAssetLibraryDrag } from './assetLibraryDrag'
+import { importAudioFilesToLibrary } from './importAudioToLibrary'
+import { importLocalMediaFilesToGenerationCanvas } from '../generationCanvas/adapters/assetImportAdapter'
+import { useGenerationCanvasStore } from '../generationCanvas/store/generationCanvasStore'
+import { useWorkbenchStore } from '../workbenchStore'
+import { visibleInsertionPoint } from '../generationCanvas/store/canvasVisibleArea'
+import { confirmDialog, DesignEmptyState, listenOutsidePress, NomiLoadingMark, promptDialog, TooltipProvider } from '../../design'
+import { FindReferenceSection } from './FindReferenceSection'
+import type { ReferencePlatform } from '../../../electron/shared/contracts/referenceSearch'
+import { acceptAttrForSurface } from '../../../electron/shared/contracts/mediaImportPolicy'
+import { notify } from '../../ui/notificationPolicy'
+import { FeedbackButton } from '../../ui/community/FeedbackButton'
+import { rejectionOf, reportAudioImport, reportMediaImport, unsupportedKindRejection, type AssetImportRejectionReport } from './assetImportRejection'
+import {
+  AssetGridCell,
+  FolderGridCell,
+} from './AssetLibraryPanelParts'
+import { AssetLibraryToolbar } from './AssetLibraryToolbar'
+import { AssetPreviewDialog } from './AssetPreviewDialog'
+import type { FilterValue } from './assetLibraryPanelFilters'
+import { assetProvenanceOf, countAssetProvenance } from './assetProvenance'
+import { useAssetLibraryFilters } from './useAssetLibraryFilters'
+import { filterCanvasLibraryAssets, filterPlayableAssets } from './assetLibrarySources'
+import { deleteAssetResult, type DeleteAssetResultOutcome } from './deleteAssetResult'
+import { readPendingAssetDeletionsVersion, subscribePendingAssetDeletions, withoutFilesAwaitingTrash } from './pendingAssetDeletions'
+import { addAssetToTimelineEnd, assetRefFromDragPayload } from '../timeline/addAssetToTimeline'
+import { materializeAssetLibraryItems } from './assetLibraryMaterialize'
+import { useAssetLibraryLocalImport } from './assetLibraryLocalImport'
+import { logRendererError } from '../../desktop/rendererLog'
+import {
+  assetToDragPayload,
+  assetsForLibraryDrag,
+  assetBelongsToProject,
+  canManageAssetFolders,
+  nextAssetSelection,
+  resolveAssetLibraryItemAction,
+  shouldRunAssetItemAction,
+  sourceOptionsForUsage,
+  type AssetLibrarySourceFilter,
+  type AssetLibraryUsageContext,
+  type AssetGridActivationEvent,
+} from './assetLibraryUsage'
+import { markLibraryUsed, sortByLibraryUsage, useLibraryUsageVersion } from '../library/libraryDiscovery'
+import { runPasteShareLinkImport } from './pasteShareLinkImport'
+import { isProjectExecutionContextCurrent, isProjectImportCancellation, withProjectAction } from '../project/projectCanvasReadSurface'
+
+const DEFAULT_GRID_COLS = 3
+const ESTIMATED_ROW_HEIGHT = 121
+const COMPACT_ESTIMATED_ROW_HEIGHT = 113
+
+// 从准入 owner 派生：这个面收哪些 kind 由 MEDIA_IMPORT_SURFACES 声明（不许自己写 accept 字面量）。
+const UPLOAD_ACCEPT = acceptAttrForSurface('asset-library')
+
+// 上传文件分流住在 ./uploadClassification（R9：面板是壳）；re-export 保住既有 import 面。
+export { classifyUploadFiles, type UploadClassification } from './uploadClassification'
+import { classifyUploadFiles } from './uploadClassification'
+
+type AssetLibraryContentProps = {
+  projectId: string | null
+  compact?: boolean
+  showHeader?: boolean
+  /**
+   * 放行音频素材（默认 false = 只列图/视频，生成页侧栏的既有行为）。
+   * 剪辑页左栏传 true：音频是配乐来源——此前全 App 没有任何地方拖得出音频素材，
+   * 时间轴那句「拖音频到此当配乐」等于无源（唯一现实路径是画布音频节点走节点把手）。
+   */
+  includeAudio?: boolean
+  /** Explicit consumer semantics: asset management on canvas, direct placement in Preview. */
+  usageContext?: AssetLibraryUsageContext
+  onClose?: () => void
+  className?: string
+}
+
+export function AssetLibraryContent({
+  projectId,
+  compact = false,
+  showHeader = true,
+  includeAudio = false,
+  usageContext = 'canvas',
+  onClose,
+  className,
+}: AssetLibraryContentProps): JSX.Element {
+  const { t } = useTranslation()
+  const [feedback, setFeedback] = React.useState<Record<string, string[]>>({})
+  const feedbackOwner = projectId ?? ''
+  const present = React.useCallback((message: string) => {
+    setFeedback((current) => ({ ...current, [feedbackOwner]: message
+      ? [...new Set([...(current[feedbackOwner] ?? []), message])] : [] }))
+  }, [feedbackOwner])
+  // 导入被拒是四个失败面之一；这条内联行是它唯一的常驻落点，所以那颗「反馈」钮挂在这儿，
+  // 而不是把 notify 从 inline 改成 background（那会把安静的内联提示变成飘出来的 toast）。
+  // 码与人话都由 `assetImportRejection.ts` 派生——这里不做第二份判断。
+  const [rejection, setRejection] = React.useState<AssetImportRejectionReport | null>(null)
+  const report = React.useCallback((message: string, type: 'info' | 'warning' | 'error' = 'warning') => {
+    notify({ identity: `asset-library:${feedbackOwner}`, reason: 'operation', message, type, level: 'inline', present })
+  }, [feedbackOwner, present])
+  const uploadInputRef = React.useRef<HTMLInputElement>(null)
+  const filterButtonRef = React.useRef<HTMLButtonElement | null>(null)
+  const filterMenuRef = React.useRef<HTMLDivElement | null>(null)
+  const [previewAsset, setPreviewAsset] = React.useState<AssetRef | null>(null)
+  const [sourceFilter, setSourceFilter] = React.useState<AssetLibrarySourceFilter>('all')
+  const filters = useAssetLibraryFilters()
+  const [filterOpen, setFilterOpen] = React.useState(false)
+  const [query, setQuery] = React.useState('')
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(() => new Set())
+  // 文件夹（素材面收敛 2026-07-22 转正）：只在「项目素材」tab 生效,搜索时退成全量平铺。
+  const [activeFolderId, setActiveFolderId] = React.useState<string | null>(null)
+  const [newFolderOpen, setNewFolderOpen] = React.useState(false)
+  const usageVersion = useLibraryUsageVersion()
+  const lastSelectedIdRef = React.useRef<string | null>(null)
+  const selectedIdsRef = React.useRef(selectedIds)
+  selectedIdsRef.current = selectedIds
+  const sourceOptions = sourceOptionsForUsage(usageContext)
+
+  const {
+    canvasAssets,
+    projectAssets: workspaceProjectAssets,
+    refresh: refreshProjectAssets,
+  } = useAssetPool(projectId)
+  const {
+    assets: allProjectAssets,
+    loading: allProjectAssetsLoading,
+    partial: allProjectAssetsPartial,
+    refresh: refreshAllProjectAssets,
+  } = useAllProjectAssets()
+  const localImport = useAssetLibraryLocalImport({ projectId, refreshProjectAssets, refreshAllProjectAssets, present })
+  const folderApi = useAssetFolders(projectId)
+  // 已经删了、只等撤销窗口过去才进回收站的文件，两个页签都不再列；⌘Z 撤回那一版 = 又有人用，照常列，
+  // 所以画布一变就重新问一次。真进了回收站以后由删除广播刷新列表。
+  const pendingDeletionVersion = React.useSyncExternalStore(subscribePendingAssetDeletions, readPendingAssetDeletionsVersion, readPendingAssetDeletionsVersion)
+  const listedFiles = React.useCallback((assets: readonly AssetRef[]): readonly AssetRef[] => {
+    void pendingDeletionVersion
+    void canvasAssets
+    return withoutFilesAwaitingTrash(assets)
+  }, [canvasAssets, pendingDeletionVersion])
+  const allSourceAssets = React.useMemo(
+    () => (includeAudio ? filterPlayableAssets(listedFiles(allProjectAssets)) : filterCanvasLibraryAssets(listedFiles(allProjectAssets))),
+    [allProjectAssets, includeAudio, listedFiles],
+  )
+  const currentProjectAssets = React.useMemo(
+    () => mergeAssetRefs(canvasAssets, listedFiles(workspaceProjectAssets)),
+    [canvasAssets, listedFiles, workspaceProjectAssets],
+  )
+  const projectSourceAssets = React.useMemo(
+    () => (includeAudio ? filterPlayableAssets(currentProjectAssets) : filterCanvasLibraryAssets(currentProjectAssets)),
+    [currentProjectAssets, includeAudio],
+  )
+  const sourceFilteredAssets = React.useMemo(
+    () => {
+      void usageVersion
+      return sortByLibraryUsage(sourceFilter === 'project' ? projectSourceAssets : allSourceAssets, 'asset', (asset) => asset.id, assetTimeValue)
+    },
+    [allSourceAssets, projectSourceAssets, sourceFilter, usageVersion],
+  )
+  const filterBaseAssets = React.useMemo(
+    () => filterAssets(sourceFilteredAssets, { query }),
+    [sourceFilteredAssets, query],
+  )
+  const provenanceCounts = React.useMemo(() => countAssetProvenance(filterBaseAssets), [filterBaseAssets])
+  const filterCounts = React.useMemo(() => {
+    const next = new Map<FilterValue, number>()
+    next.set('all', filterBaseAssets.length)
+    for (const asset of filterBaseAssets) next.set(asset.kind, (next.get(asset.kind) ?? 0) + 1)
+    return next
+  }, [filterBaseAssets])
+
+  // 素材回流：写入层（writeAsset/moveAssetFile）落盘即广播，捕捞/拖拽/上传/agent 任何导入路径
+  // 都触发本面板刷新（原 M0 捕捞窗私有 onImported 的接任者，收敛后信号挂在唯一咽喉）。
+  React.useEffect(() => {
+    const bridge = getDesktopBridge()
+    if (!bridge?.assets?.onUpdated) return
+    return bridge.assets.onUpdated((payload) => {
+      if ((payload as { projectId?: string } | null)?.projectId !== projectId) return
+      // 「所有项目」那一份由它自己的 owner（useAllProjectAssets）听同一个广播作废，这里只管本项目这份。
+      refreshProjectAssets()
+    })
+  }, [projectId, refreshProjectAssets])
+  const visible = React.useMemo(
+    () => filterBaseAssets.filter(
+      (asset) => filters.visibleKinds.has(asset.kind) && filters.visibleProvenances.has(assetProvenanceOf(asset)),
+    ),
+    [filterBaseAssets, filters.visibleKinds, filters.visibleProvenances],
+  )
+  const itemAction = resolveAssetLibraryItemAction(
+    usageContext,
+    sourceFilter === 'project' ? 'project' : 'all',
+  )
+  const projectSelectionEnabled = itemAction === 'select'
+  const folderManagementEnabled = canManageAssetFolders(usageContext)
+  // 文件夹作用域：项目素材 tab + 无搜索词时生效（root=未分类;夹内=归属素材;搜索=全量平铺）。
+  const folderViewActive = sourceFilter === 'project' && query.trim() === ''
+  const scopedAssets = React.useMemo(
+    () => (folderViewActive ? assetsForFolderScope(visible, folderApi.state.assignments, activeFolderId) : visible),
+    [activeFolderId, folderApi.state.assignments, folderViewActive, visible],
+  )
+  const folderCounts = React.useMemo(
+    () => folderCountsForAssets(projectSourceAssets, folderApi.state.assignments),
+    [folderApi.state.assignments, projectSourceAssets],
+  )
+  const visibleFolders = folderViewActive && !activeFolderId ? folderApi.state.folders : []
+  const activeFolder = activeFolderId ? folderApi.state.folders.find((folder) => folder.id === activeFolderId) ?? null : null
+  React.useEffect(() => {
+    if (activeFolderId && !activeFolder) setActiveFolderId(null)
+  }, [activeFolder, activeFolderId])
+  const visibleAssetsRef = React.useRef(scopedAssets)
+  visibleAssetsRef.current = scopedAssets
+  const visibleIds = React.useMemo(() => scopedAssets.map((asset) => asset.id), [scopedAssets])
+  const selectedAssets = React.useMemo(
+    () => scopedAssets.filter((asset) => selectedIds.has(asset.id)),
+    [selectedIds, scopedAssets],
+  )
+  const selectedProjectAssets = React.useMemo(
+    () => (projectSelectionEnabled ? selectedAssets : []),
+    [projectSelectionEnabled, selectedAssets],
+  )
+
+  // 虚拟化：按行渲染，只挂当前视口内的格子（图多时不再一次性渲染上百个 DOM 节点）。
+  //
+  // 根因坑（实测定位）：滚动容器用 flex-1 取高度，面板刚打开时它高度还是 0，虚拟器此刻
+  // 测到 scrollRect={0,0} → range=null → 一个格子都不挂；之后 flex 撑到 258px，但用对象
+  // useRef 时「ref 挂载/尺寸变化不会触发 React 重渲」，虚拟器没机会重算，于是一直空白
+  // （直到搜索等无关操作偶然触发重渲才恢复）。
+  // 解法：滚动元素用「callback-ref 写进 state」——元素挂载那一刻就强制一次重渲，虚拟器
+  // 立刻拿到带高度的元素重算。useState 的 setter 引用稳定，不会反复 detach/attach。
+  const [scrollEl, setScrollEl] = React.useState<HTMLDivElement | null>(null)
+  const gridCols = compact ? 2 : DEFAULT_GRID_COLS
+  const estimatedRowHeight = compact ? COMPACT_ESTIMATED_ROW_HEIGHT : ESTIMATED_ROW_HEIGHT
+  const rowCount = Math.ceil(scopedAssets.length / gridCols)
+  const rowVirtualizer = useVirtualizer({
+    count: rowCount,
+    getScrollElement: () => scrollEl,
+    estimateSize: () => estimatedRowHeight,
+    overscan: 3,
+  })
+
+  const handleUploadFiles = React.useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    present('')
+    const all = Array.from(event.currentTarget.files || [])
+    event.currentTarget.value = ''
+    const { mediaFiles, audioFiles, unsupported } = classifyUploadFiles(all)
+    if (mediaFiles.length) withProjectAction((projectContext) => {
+      const activeCategoryId = useWorkbenchStore.getState().activeCategoryId
+      void importLocalMediaFilesToGenerationCanvas(mediaFiles, { projectContext, basePosition: visibleInsertionPoint(activeCategoryId) ?? { x: 120, y: 90 } })
+        .then((result) => {
+          if (result.cancelled) return
+          refreshProjectAssets()
+          refreshAllProjectAssets()
+          reportMediaImport(result, report, setRejection)
+          // 落点可见性（2026-08-07 飞书反馈「上传传到另一个位置没看到」）：以前是写死 (120, 90) 再请求 fit
+          // 把画布挪过去；2026-09-25 起直接落在用户此刻看得见的地方，不挪画布。落不下（整批太大）的部分
+          // 由画布边缘提示告诉用户在哪。选中首个新节点保留——那是「这就是刚导入的」的原地回执。
+          const firstNode = result.created[0]?.node
+          if (firstNode) useGenerationCanvasStore.getState().selectNode(firstNode.id)
+        })
+        .catch((error) => {
+          logRendererError('asset-import-failed', error)
+          report(t('assetLibrary.importFailed'), 'error')
+          setRejection(rejectionOf('failed', 1))
+        })
+    })
+    if (audioFiles.length) withProjectAction((project) => {
+      void importAudioFilesToLibrary(audioFiles, project)
+        .then((result) => {
+          if (!isProjectExecutionContextCurrent(project)) return
+          refreshProjectAssets()
+          refreshAllProjectAssets()
+          reportAudioImport(result, report, setRejection)
+        })
+        .catch((error) => {
+          if (!isProjectExecutionContextCurrent(project) || isProjectImportCancellation(error)) return
+          logRendererError('asset-audio-import-failed', error)
+          report(t('assetLibrary.audioImportFailed'), 'error')
+          setRejection(rejectionOf('failed', 1))
+        })
+    })
+    if (unsupported.length) {
+      for (const f of unsupported) report(t('assetLibrary.rejectedUnsupportedUnknown', { name: f.name || t('assetLibrary.unnamedFile') }), 'warning')
+      // 策略拒收：用户想导的那个文件真的没进来，所以给反馈入口（重复素材不给，那份已在库里）。
+      // 摘要用**第一个**被挡住的文件名，与上面那句内联行逐字同源（2026-09-17 W-02）。
+      setRejection(unsupportedKindRejection(unsupported[0]?.name || ''))
+    }
+  }, [refreshAllProjectAssets, refreshProjectAssets, present, report, t])
+
+  /** 工具栏那颗 🔗 = 「找参考」的家（一功能一个家）：开合内嵌面板，不弹层。 */
+  const handleToggleFind = React.useCallback(() => {
+    setImportedInFind(0)
+    setFindOpen((open) => !open)
+  }, [])
+
+  // 贴链接导入（TikHub）：分享链接 → 无水印直链 → 落成项目视频素材。落库后回流刷新，
+  // 素材即出现在库里供用户用现有节点拆解。失败态三段式在 pasteShareLinkImport 里。
+  /**
+   * 贴链接导入。`presetText` 有值时**跳过弹框**（用户已经在找参考面板里把链接输进来了）——
+   * 这是卡点表「能不能少一步」砍掉的那一步：看到即可用，不再多开一层弹层。
+   */
+  const handlePasteLink = React.useCallback((presetText?: string) => {
+    void runPasteShareLinkImport(projectId, {
+      prompt: presetText ? async () => presetText : promptDialog,
+      present,
+      t,
+      onImported: () => {
+        refreshProjectAssets()
+        refreshAllProjectAssets()
+      },
+      onNeedKey: () => {
+        // TikHub 卡的家在设置「模型」tab 的「数据源」区（2026-09-01 归位：它是数据源接入，不是 AI 策略）。
+        window.dispatchEvent(new CustomEvent('nomi-open-settings', { detail: { tab: 'models', section: 'tikhub-connector' } }))
+      },
+    })
+  }, [projectId, refreshAllProjectAssets, refreshProjectAssets, present, t])
+
+  const isEmpty = scopedAssets.length === 0 && visibleFolders.length === 0
+  // 「找参考」面板：由工具栏那颗 🔗 开合。平台是**项目级设定**（设计拍板），
+  // 当前先用会话态承载，接进项目设置是随后一步——UI 契约已经按「项目设定」画好。
+  const [findOpen, setFindOpen] = React.useState(false)
+  // 这一趟「找参考」拿了几条：决定返回条上写什么、以及回去后落在哪个筛选态。
+  const [importedInFind, setImportedInFind] = React.useState(0)
+  const [referencePlatform, setReferencePlatform] = React.useState<ReferencePlatform>('douyin')
+  const sourceEmpty = sourceFilteredAssets.length === 0
+
+  React.useEffect(() => {
+    if (!filterOpen) return
+    const stopListeningOutside = listenOutsidePress(
+      (target) => target instanceof Node && Boolean(filterMenuRef.current?.contains(target) || filterButtonRef.current?.contains(target)),
+      () => setFilterOpen(false),
+    )
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setFilterOpen(false)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      stopListeningOutside()
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [filterOpen])
+
+  React.useEffect(() => {
+    const visibleIdSet = new Set(visibleIds)
+    setSelectedIds((current) => {
+      const next = new Set([...current].filter((id) => visibleIdSet.has(id)))
+      return next.size === current.size ? current : next
+    })
+    if (lastSelectedIdRef.current && !visibleIdSet.has(lastSelectedIdRef.current)) lastSelectedIdRef.current = null
+  }, [visibleIds])
+
+  const selectAsset = React.useCallback((asset: AssetRef, event: AssetGridActivationEvent): void => {
+    const visibleIds = visibleAssetsRef.current.map((candidate) => candidate.id)
+    const anchorId = lastSelectedIdRef.current
+    setSelectedIds((current) => {
+      const next = nextAssetSelection(current, visibleIds, asset.id, anchorId, event)
+      return next === current ? current : new Set(next)
+    })
+    lastSelectedIdRef.current = asset.id
+  }, [])
+
+  const activateAsset = React.useCallback((asset: AssetRef, event: AssetGridActivationEvent): void => {
+    if (!shouldRunAssetItemAction(itemAction, event.detail)) return
+    if (itemAction === 'append') {
+      // 别的项目的素材先复制进本项目（与拖放同一个关口 materializeAssetLibraryItems），
+      // 时间轴只写本项目自己的地址。
+      withProjectAction((project) => {
+        void materializeAssetLibraryItems([assetToDragPayload(asset)], project).then(({ items }) => {
+          const local = items[0] ? assetRefFromDragPayload(items[0]) : null
+          if (!local) {
+            if (isProjectExecutionContextCurrent(project)) report(t('assetLibrary.copyIntoProjectFailed', { count: 1 }), 'warning')
+            return
+          }
+          return addAssetToTimelineEnd(local, project).then((added) => {
+            if (added) markLibraryUsed('asset', asset.id)
+          })
+        })
+      })
+      return
+    }
+    if (itemAction === 'preview') {
+      setPreviewAsset(asset)
+      if (assetBelongsToProject(asset, projectId)) markLibraryUsed('asset', asset.id)
+      return
+    }
+    selectAsset(asset, event)
+  }, [itemAction, projectId, report, selectAsset, t])
+
+  // 对勾是开关：点一下加进 / 移出选择，不动其它已选——和 ⌘/Ctrl 点同一条选择逻辑（selectAsset 唯一 owner）。
+  // 此前对勾只是装饰，点它等于普通点击＝换选：选不了第二张，也取消不了（2026-09-25 用户反馈）。
+  const toggleAssetSelection = React.useCallback((asset: AssetRef): void => {
+    selectAsset(asset, { metaKey: false, ctrlKey: true, shiftKey: false, detail: 1 })
+  }, [selectAsset])
+
+
+  // 两个 tab 同一份拖拽载荷：落在画布 / 时间轴＝用它（别的项目的先复制进来，见 assetLibraryMaterialize），
+  // 落在文件夹＝归类。不再按 tab 分两种拖拽（此前项目素材 tab 只发归类专用的 MIME，拖到画布没反应）。
+  const handleAssetDragStart = React.useCallback((asset: AssetRef, event: React.DragEvent<HTMLDivElement>): void => {
+    present('')
+    const currentSelection = selectedIdsRef.current
+    const selectedForDrag = assetsForLibraryDrag(visibleAssetsRef.current, currentSelection, asset)
+    if (!currentSelection.has(asset.id)) {
+      setSelectedIds(new Set([asset.id]))
+      lastSelectedIdRef.current = asset.id
+    }
+    const rect = event.currentTarget.getBoundingClientRect()
+    const dragAnchor = {
+      xRatio: rect.width > 0 ? Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)) : 0.5,
+      yRatio: rect.height > 0 ? Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)) : 0.5,
+    }
+    const payloads = selectedForDrag.map((candidate, index) =>
+      assetToDragPayload(candidate, index === 0 ? dragAnchor : undefined),
+    )
+    event.dataTransfer.setData(ASSET_LIBRARY_DRAG_MIME, serializeAssetLibraryDrag(payloads))
+    event.dataTransfer.effectAllowed = 'copy'
+    event.dataTransfer.setData('text/plain', payloads.length > 1 ? `${payloads.length} 个素材` : asset.name)
+  }, [present])
+
+  // 落夹 / 删夹 handler 抽在 useAssetFolderInteractions（R9 防巨壳）。
+  const { handleFolderDropAssets, handleDeleteFolder } = useAssetFolderInteractions({ folderApi, setActiveFolderId })
+  const assetDragHint = usageContext === 'timeline'
+    ? t('timelineEditor.dragToTimeline')
+    : projectSelectionEnabled
+      ? t('assetLibrary.dragHintFolder')
+      : undefined
+  const assetPreviewAction = React.useMemo(() => itemAction === 'select' ? (asset: AssetRef) => {
+    setPreviewAsset(asset)
+    if (assetBelongsToProject(asset, projectId)) markLibraryUsed('asset', asset.id)
+  } : undefined, [itemAction, projectId])
+
+  // 两扇删除门（项目素材多选、全部素材单张）共用这一份回报：删掉的由列表变化回执（不另弹），
+  // 只说没删成的——还被别处用着的（说原因和下一步）、进回收站失败的。不再有「一张都没认出来」的兜底话。
+  const reportDeletion = React.useCallback((outcomes: readonly DeleteAssetResultOutcome[]): void => {
+    const keptInUse = outcomes.reduce((total, outcome) => total + outcome.keptInUseCount, 0)
+    const failedFiles = outcomes.reduce((total, outcome) => total + outcome.failedFileCount, 0)
+    if (keptInUse > 0) report(t('assetLibrary.keptInUse', { count: keptInUse }), 'warning')
+    if (failedFiles > 0) report(t('assetLibrary.failedFiles', { count: failedFiles }), 'warning')
+  }, [report, t])
+
+  const deleteSelectedProjectAssets = React.useCallback(async (): Promise<void> => {
+    present('')
+    const loaded = withProjectAction((project) => project) ?? null
+    if (!projectId) {
+      report(t('assetLibrary.deleteNoProject'), 'warning')
+      return
+    }
+    if (selectedProjectAssets.length === 0) {
+      report(t('assetLibrary.selectToDelete'), 'warning')
+      return
+    }
+    const confirmed = await confirmDialog({
+      title: t('assetLibrary.confirmDeleteTitle', { count: selectedProjectAssets.length }),
+      message: t('assetLibrary.confirmDeleteMessage'),
+      confirmLabel: t('assetLibrary.delete'),
+      danger: true,
+    })
+    if (!confirmed || (loaded && !isProjectExecutionContextCurrent(loaded))) return
+    try {
+      // 串行：同一关闭项目的多张结果必须一张张基于最新 record 改，Promise.all 会各读同一旧快照后互相覆盖。
+      // 删完不用手动重拉：文件进回收站时主进程广播 assets.onUpdated（两个页签都听它），
+      // 摘掉的结果由画布 store 直接反映，延后真删的文件由待删清单藏起来。
+      const outcomes: DeleteAssetResultOutcome[] = []
+      for (const asset of selectedProjectAssets) outcomes.push(await deleteAssetResult(asset, loaded))
+      setSelectedIds(new Set())
+      reportDeletion(outcomes)
+    } catch (error) {
+      logRendererError('asset-delete-failed', error)
+      report(t('assetLibrary.deleteFailed'), 'error')
+    }
+  }, [projectId, reportDeletion, selectedProjectAssets, present, report, t])
+
+  const deleteOneAsset = React.useCallback(async (asset: AssetRef): Promise<void> => {
+    present('')
+    const loaded = withProjectAction((project) => project) ?? null
+    if (!assetBelongsToProject(asset, projectId)) {
+      report(t('assetLibrary.externalAssetNoDelete'), 'info')
+      return
+    }
+    const confirmed = await confirmDialog({
+      title: t('assetLibrary.confirmDeleteTitle', { count: 1 }),
+      message: t('assetLibrary.confirmDeleteMessage'),
+      confirmLabel: t('assetLibrary.delete'),
+      danger: true,
+    })
+    if (!confirmed || (loaded && !isProjectExecutionContextCurrent(loaded))) return
+    try {
+      const outcome = await deleteAssetResult(asset, loaded)
+      setPreviewAsset((current) => current?.id === asset.id ? null : current)
+      reportDeletion([outcome])
+    } catch (error) {
+      logRendererError('asset-result-delete-failed', error)
+      report(t('assetLibrary.deleteFailed'), 'error')
+    }
+  }, [projectId, reportDeletion, present, report, t])
+
+  return (
+    <TooltipProvider delayDuration={180} skipDelayDuration={80}>
+      <div tabIndex={0} onDragOver={localImport.onDragOver} onDragLeave={localImport.onDragLeave} onDrop={localImport.onDrop} onPaste={localImport.onPaste} className={cn('flex min-h-0 flex-1 flex-col overflow-hidden outline-none', className, localImport.isDragOver && 'ring-2 ring-inset ring-nomi-ink-30')}>
+        {/* 头部 */}
+        {showHeader ? (
+          <div className={cn('flex items-center gap-2 px-4 pt-3.5 pb-3 border-b border-nomi-line')}>
+            <b className={cn('text-title font-bold text-nomi-ink')}>{t('assetLibrary.title')}</b>
+            <span className={cn('text-caption text-nomi-ink-40')}>· {scopedAssets.length}</span>
+            <span className={cn('flex-1')} />
+            {onClose ? (
+              <button
+                type="button"
+                className={cn(
+                  'w-7 h-7 grid place-items-center rounded-nomi-sm cursor-pointer border-0 bg-transparent',
+                  'text-nomi-ink-40 hover:text-nomi-ink hover:bg-nomi-ink-05',
+                  'transition-[background,color] duration-nomi-fast ease-nomi-fast',
+                )}
+                aria-label={t('assetLibrary.close')}
+                onClick={onClose}
+              >
+                <IconX size={16} stroke={2} />
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        <input
+          ref={uploadInputRef}
+          className={cn('absolute w-px h-px overflow-hidden opacity-0 pointer-events-none')}
+          type="file"
+          accept={UPLOAD_ACCEPT}
+          multiple
+          aria-label={t('assetLibrary.filePicker')}
+          onChange={handleUploadFiles}
+        />
+
+        {(feedback[feedbackOwner] ?? []).length > 0 ? (
+          <div role="status" aria-live="polite" className="shrink-0 border-b border-nomi-line px-3 py-2 text-caption text-nomi-ink-60" data-asset-library-feedback>
+            {feedback[feedbackOwner].map((message) => <p key={message}>{message}</p>)}
+            {rejection ? (
+              <div className="mt-1 flex flex-wrap items-center gap-1.5" data-asset-library-rejection={rejection.errorKind}>
+                <FeedbackButton request={{ intent: 'problem', surface: 'import', stage: 'upload', ...(projectId ? { projectId } : {}), ...rejection }} />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        <AssetLibraryToolbar
+          compact={compact}
+          uploadInputRef={uploadInputRef}
+          onPasteLink={handleToggleFind}
+          findOpen={findOpen}
+          sourceOptions={sourceOptions}
+          sourceFilter={sourceFilter}
+          onSourceFilterChange={setSourceFilter}
+          onResetSelection={() => {
+            setSelectedIds(new Set())
+            lastSelectedIdRef.current = null
+          }}
+          onResetKinds={filters.showAllKinds}
+          onCloseFilter={() => setFilterOpen(false)}
+          onResetFolder={() => setActiveFolderId(null)}
+          onCloseNewFolder={() => setNewFolderOpen(false)}
+          query={query}
+          onQueryChange={setQuery}
+          projectSelectionEnabled={projectSelectionEnabled}
+          selectedProjectAssetCount={selectedProjectAssets.length}
+          onDeleteSelected={() => {
+            void deleteSelectedProjectAssets()
+          }}
+          newFolderOpen={newFolderOpen}
+          onOpenNewFolder={() => setNewFolderOpen(true)}
+          onCreateFolder={folderApi.createFolder}
+          filterButtonRef={filterButtonRef}
+          filterMenuRef={filterMenuRef}
+          visibleKinds={filters.visibleKinds}
+          filterCounts={filterCounts}
+          visibleProvenances={filters.visibleProvenances}
+          provenanceCounts={provenanceCounts}
+          filterOpen={filterOpen}
+          filterActive={filters.filterActive}
+          activeFilterLabel={filters.activeFilterLabel}
+          onToggleFilter={() => setFilterOpen((open) => !open)}
+          onToggleKind={filters.toggleVisibleKind}
+          onShowAllKinds={filters.showAllKinds}
+          onToggleProvenance={filters.toggleVisibleProvenance}
+          folderViewActive={folderViewActive}
+          activeFolder={activeFolder}
+          folderManagementEnabled={folderManagementEnabled}
+          scopedAssetCount={scopedAssets.length}
+          onBackToAllAssets={() => setActiveFolderId(null)}
+          onDropToFolder={handleFolderDropAssets}
+        />
+
+        {/* 09-08 用户裁决：找参考接管素材区；返回条保留已有素材上下文。详见 FindReferenceSection。 */}
+        {findOpen ? (
+          <FindReferenceSection
+            projectId={projectId}
+            platform={referencePlatform}
+            assetCount={scopedAssets.length}
+            importedCount={importedInFind}
+            onPlatformChange={setReferencePlatform}
+            onShareLink={handlePasteLink}
+            onImported={() => {
+              setImportedInFind((count) => count + 1)
+              refreshProjectAssets()
+              refreshAllProjectAssets()
+            }}
+            onNeedKey={() => {
+              window.dispatchEvent(new CustomEvent('nomi-open-settings', { detail: { tab: 'models', section: 'tikhub-connector' } }))
+            }}
+            onBack={() => {
+              // 拿完回到「只看参考」，否则保持原筛选。
+              if (importedInFind > 0) {
+                filters.focusReferenceOnly()
+                setActiveFolderId(null)
+                setQuery('')
+              }
+              setImportedInFind(0)
+              setFindOpen(false)
+            }}
+          />
+        ) : (
+        <div ref={setScrollEl} className={cn('flex-1 overflow-y-auto', compact ? 'px-3 pb-3' : 'px-3.5 pb-4')}>
+          {sourceFilter === 'all' && allProjectAssetsPartial ? (
+            <div className="mb-2 rounded-nomi-sm border border-nomi-warning/25 bg-nomi-warning-soft px-2.5 py-2 text-micro text-nomi-warning" role="status">
+              {t('assetLibrary.partialResults')}
+            </div>
+          ) : null}
+          {visibleFolders.length > 0 ? (
+            <div
+              className="grid gap-2.5 pb-2.5"
+              style={{ gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))` }}
+              role="list"
+              aria-label={t('assetLibrary.foldersAria')}
+            >
+              {visibleFolders.map((folder) => (
+                <FolderGridCell
+                  key={folder.id}
+                  id={folder.id}
+                  label={folder.label}
+                  count={folderCounts.get(folder.id) ?? 0}
+                  manageable={folderManagementEnabled}
+                  onOpen={setActiveFolderId}
+                  onDelete={handleDeleteFolder}
+                  onDropAssets={(folderId, event) => handleFolderDropAssets(folderId, event)}
+                />
+              ))}
+            </div>
+          ) : null}
+          {sourceFilter === 'all' && allProjectAssetsLoading && allProjectAssets.length === 0 ? (
+            <div className="grid min-h-32 place-items-center gap-2 py-8 text-caption text-nomi-ink-40" role="status" aria-busy="true">
+              <NomiLoadingMark size={24} label={t('assetLibrary.loading')} />
+              <span>{t('assetLibrary.loading')}</span>
+            </div>
+          ) : isEmpty ? (
+            <DesignEmptyState
+              density="inline"
+              icon={<IconPhoto size={34} stroke={1.4} className="text-nomi-ink-30" />}
+              title={sourceEmpty ? (sourceFilter === 'project' ? t('assetLibrary.noProjectAssets') : t('assetLibrary.noAssets')) : t('assetLibrary.noMatches')}
+              description={
+                sourceEmpty
+                  ? t('assetLibrary.findReference.emptyDesc', {
+                      platform: t(`assetLibrary.findReference.platform.${referencePlatform}`),
+                    })
+                  : t('assetLibrary.noMatchesDescription')
+              }
+              action={
+                !sourceEmpty && filters.filterActive ? (
+                  // 卡点③：筛空了不能只留一句「没有匹配」——原因看不见，出口也得就手。
+                  <button
+                    type="button"
+                    data-reset-filters
+                    className="h-8 rounded-full border border-nomi-line bg-nomi-paper px-4 text-body-sm text-nomi-ink hover:bg-nomi-ink-05"
+                    onClick={filters.showAll}
+                  >
+                    {t('assetLibrary.showAllFilters')}
+                  </button>
+                ) : sourceEmpty && !findOpen ? (
+                  <button
+                    type="button"
+                    data-find-reference-cta
+                    className="h-8 rounded-full bg-nomi-ink px-4 text-body-sm font-medium text-nomi-paper hover:bg-nomi-accent"
+                    onClick={handleToggleFind}
+                  >
+                    {t('assetLibrary.findReference.entry')}
+                  </button>
+                ) : undefined
+              }
+            />
+          ) : compact ? (
+            <div style={{ columnCount: 3, columnGap: '10px' }}>
+              {scopedAssets.map((asset) => (
+                <AssetGridCell
+                  key={asset.id}
+                  asset={asset}
+                  compact
+                  selectable={projectSelectionEnabled}
+                  selected={selectedIds.has(asset.id)}
+                  dragHint={assetBelongsToProject(asset, projectId) ? assetDragHint : t('assetLibrary.externalAssetHint')}
+                  onSelect={activateAsset}
+                  onToggleSelect={projectSelectionEnabled ? toggleAssetSelection : undefined}
+                  onPreview={assetPreviewAction}
+                  onDragStartAsset={handleAssetDragStart}
+                  onDelete={usageContext === 'canvas' && sourceFilter === 'all' && assetBelongsToProject(asset, projectId) ? (assetToDelete) => void deleteOneAsset(assetToDelete) : undefined}
+                />
+              ))}
+            </div>
+          ) : (
+            <div style={{ height: rowVirtualizer.getTotalSize(), width: '100%', position: 'relative' }}>
+              {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                const start = virtualRow.index * gridCols
+                const rowAssets = scopedAssets.slice(start, start + gridCols)
+                return (
+                  <div
+                    key={virtualRow.key}
+                    data-index={virtualRow.index}
+                    className={cn('grid gap-2.5 pb-2.5')}
+                    style={{
+                      position: 'absolute',
+                      top: 0,
+                      left: 0,
+                      width: '100%',
+                      height: virtualRow.size,
+                      transform: `translateY(${virtualRow.start}px)`,
+                      gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {rowAssets.map((asset) => (
+                      <AssetGridCell
+                        key={asset.id}
+                        asset={asset}
+                        selectable={projectSelectionEnabled}
+                        selected={selectedIds.has(asset.id)}
+                        dragHint={assetBelongsToProject(asset, projectId) ? assetDragHint : t('assetLibrary.externalAssetHint')}
+                        onSelect={activateAsset}
+                        onToggleSelect={projectSelectionEnabled ? toggleAssetSelection : undefined}
+                        onPreview={assetPreviewAction}
+                        onDragStartAsset={handleAssetDragStart}
+                        onDelete={usageContext === 'canvas' && sourceFilter === 'all' && assetBelongsToProject(asset, projectId) ? (assetToDelete) => void deleteOneAsset(assetToDelete) : undefined}
+                      />
+                    ))}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
+        )}
+      </div>
+      {previewAsset ? (
+        <AssetPreviewDialog asset={previewAsset} onClose={() => setPreviewAsset(null)} />
+      ) : null}
+    </TooltipProvider>
+  )
+}

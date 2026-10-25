@@ -1,0 +1,740 @@
+// 节点参数控件的**纯模型逻辑**（从 NodeParameterControls.tsx 抽出 —— Rule 12/M5：让组件文件净减、
+// 关注点分离）。这里只有数据塑形：把 catalog/档案 meta 解析成可渲染的控件 / 参考槽描述，
+// 不含 React、不碰 store。组件只负责把这些描述画出来 + 收事件。
+import {
+  formatVideoOptionLabel,
+  parseModelParameterControls,
+  parseImageModelCatalogConfig,
+  parseVideoModelCatalogConfig,
+  type ImageModelCatalogConfig,
+  type ImageModelControlBinding,
+  type ModelParameterControl,
+  type VideoModelCatalogConfig,
+  type VideoModelControlBinding,
+} from '../../../../config/modelCatalogMeta'
+import { normalizeOrientation, type Orientation } from '../../../../utils/orientation'
+import { isComfyuiVendorKey } from '../../model/comfyuiVendor'
+import {
+  ASPECT_RATIO_META_KEYS,
+  aspectRatioControlKey,
+  aspectRatioControlsOf,
+  normalizeAspectRatioToWH,
+  sameAspectRatio,
+} from '../../../../../electron/shared/aspectRatioValue'
+import { resultUrl } from '../../runner/referenceUrl'
+import type { GenerationCanvasNode } from '../../model/generationCanvasTypes'
+import {
+  isParameterReferenceControl,
+  usesExplicitParameterReferenceDeclarations,
+  type ImageUrlSlot,
+} from '../../model/parameterReferenceSlots'
+import type { WorkbenchAssetDto } from '../../../api/assetUploadApi'
+
+export type SelectOption = string | {
+  value: string | number
+  label: string
+  priceLabel?: string
+}
+
+export type DurationOption = string | {
+  value: string | number
+  label: string
+  priceLabel?: string
+}
+
+export type DynamicCatalogControl = {
+  key: string
+  label: string
+  binding:
+    | ImageModelControlBinding
+    | VideoModelControlBinding
+    | 'parameter'
+  options: SelectOption[]
+  defaultValue?: string | number | boolean
+}
+
+export type DynamicParameterControl = ModelParameterControl & {
+  binding: 'parameter'
+}
+
+export type DynamicModelControl = DynamicParameterControl | DynamicCatalogControl
+
+export type FrameSlotLabels = {
+  firstFrame: string
+  lastFrame: string
+}
+
+/**
+ * 这个模型是不是「用户导入的 ComfyUI 工作流」。
+ *
+ * 判据取 meta.comfyWorkflowImport 这个键是否存在——它只由导入流程写入，内置档案模型不会有。
+ * 用途：这类模型的参数名是工作流作者随手起的（采样步数 / 帧率 / Float (duration)…），
+ * 底栏摘要 pill 把当前值串起来会显示成 `15 · 24`，没人认得出那是自己导入时勾的东西
+ * （群反馈 2026-08-20 G2#433）——所以要换成「工作流参数 · N 项」这种报名字的写法。
+ */
+export function isImportedComfyWorkflowModel(meta: unknown): boolean {
+  return Boolean(meta && typeof meta === 'object' && 'comfyWorkflowImport' in (meta as Record<string, unknown>))
+}
+
+export function shouldUseVideoFrameSlotFallback(input: {
+  isVideoLike: boolean
+  modelImageUrlSlots: readonly ImageUrlSlot[]
+  vendor?: string | null
+}): boolean {
+  if (!input.isVideoLike || input.modelImageUrlSlots.length > 0) return false
+  // ComfyUI imported workflows are graph-defined: 媒体输入已作为 image-url 参数逐条声明，
+  // 由上面的通用 buildImageUrlSlots 出槽。没声明就是真的没有——
+  // 猜首/尾帧只会造出无效请求（ComfyUI 侧根本没有「首帧/尾帧」这两个概念）。
+  // 判据走前缀（isComfyuiVendorKey），不能写字面量 === 'comfyui-local'：第 2+ 台实例的 key 是
+  // `comfyui-local-{slug}`，字面量只保得住第一台 —— 第二台起的**文生视频**工作流会在这里被判成
+  // 「不是 ComfyUI」→ 凭空补出首/尾帧参考槽 → 用户被诱导连一张图 → 提交时 runtime 以「没有图生视频通道」
+  // 拒发，正好把 2026-08-24 那条死锁在第二台机器上原样复活。
+  if (isComfyuiVendorKey(input.vendor)) return false
+  return true
+}
+
+export function imageCatalogReferenceSlot(config: ImageModelCatalogConfig | null): ImageUrlSlot[] {
+  return config?.supportsReferenceImages
+    ? [{ key: 'referenceImageUrl', label: '参考图', group: 'reference' }]
+    : []
+}
+
+export function getSlotNodeRef(meta: Record<string, unknown>, paramKey: string): string {
+  const direct = readMeta(meta, paramKey + '_nodeRef')
+  if (direct) return direct
+  if (paramKey === 'firstFrameUrl') return readMeta(meta, 'firstFrameRef')
+  if (paramKey === 'lastFrameUrl') return readMeta(meta, 'lastFrameRef')
+  if (paramKey === 'referenceImageUrl' || paramKey === 'imageUrl') return readMeta(meta, 'referenceImageRef')
+  return ''
+}
+
+export function getSlotThumbUrl(meta: Record<string, unknown>, paramKey: string, nodes: GenerationCanvasNode[]): string {
+  const direct = readMeta(meta, paramKey)
+  if (direct) return direct
+  const nodeRef = getSlotNodeRef(meta, paramKey)
+  if (!nodeRef) return ''
+  return resultPreviewUrl(nodes.find((n) => n.id === nodeRef))
+}
+
+const DURATION_ALIASES = ['durationSeconds', 'videoDuration', 'duration', 'video_duration', 'length', 'clip_length']
+const RESOLUTION_ALIASES = ['resolution', 'videoResolution', 'video_resolution', 'output_resolution', 'outputResolution', 'resolution_type', 'mode', 'upscale_factor']
+// `quality` has the same paid/output role as resolution, but it is an
+// independently selectable catalog parameter. Keep it out of the
+// equivalence map so dedupe does not erase a model's resolution control.
+const RESOLUTION_ROLE_ALIASES = [...RESOLUTION_ALIASES, 'quality']
+const QUANTITY_ALIASES = ['output_count', 'batch_size', 'num_images', 'number_of_images', 'n']
+const FORMAT_ALIASES = ['output_format', 'outputFormat', 'format', 'image_format']
+
+function buildAliasMap(groups: string[][]): Record<string, string[]> {
+  const map: Record<string, string[]> = {}
+  for (const group of groups) {
+    for (const key of group) {
+      map[key] = group.filter((k) => k !== key)
+    }
+  }
+  return map
+}
+
+const PARAMETER_CONTROL_BINDING_KEYS: Record<string, string[]> = buildAliasMap([
+  [...ASPECT_RATIO_META_KEYS],
+  DURATION_ALIASES,
+  RESOLUTION_ALIASES,
+  FORMAT_ALIASES,
+])
+
+/**
+ * 控件的**语义角色**——「这个声明出来的参数，在人话里叫什么」。
+ *
+ * 这不是新词表：上面那三组别名（比例 / 时长 / 清晰度）和 catalog 的 `binding` 早就是本仓
+ * 「哪个键表示哪件事」的唯一出处（去重、写回多键、视频比例默认覆盖都读它）。这里只是把
+ * 「读得出角色」这件事显式命名并导出，让底栏「哪几个参数直接露出」也走同一份声明，
+ * 而不是在 UI 里再抄一张 `['aspect_ratio','duration','resolution']`（R14.1：同一语义只能有一个 owner）。
+ *
+ * 刻意不收 `format`：输出格式（png/jpg）既不影响画面也不影响价格，它是长尾。
+ */
+export type ParameterRole = 'aspect' | 'duration' | 'resolution' | 'quantity'
+
+const PARAMETER_ROLE_BY_KEY: Record<string, ParameterRole> = {
+  ...Object.fromEntries(ASPECT_RATIO_META_KEYS.map((key) => [key, 'aspect' as const])),
+  ...Object.fromEntries(DURATION_ALIASES.map((key) => [key, 'duration' as const])),
+  ...Object.fromEntries(RESOLUTION_ROLE_ALIASES.map((key) => [key, 'resolution' as const])),
+  ...Object.fromEntries(QUANTITY_ALIASES.map((key) => [key, 'quantity' as const])),
+}
+
+const PARAMETER_ROLE_BY_BINDING: Partial<Record<DynamicCatalogControl['binding'], ParameterRole>> = {
+  aspectRatio: 'aspect',
+  imageSize: 'aspect',
+  size: 'aspect',
+  durationSeconds: 'duration',
+  resolution: 'resolution',
+  // orientation 不给角色：它和比例是同一件事的另一种说法，档案两个都声明时由去重决定留哪个，
+  // 角色表再认它一次就会出现两枚说同一件事的 chip。
+}
+
+/** 档案没有声明这个角色 → null（调用方据此「没有的不显示」，而不是补一个默认值假装有）。 */
+export function parameterControlRole(control: DynamicModelControl): ParameterRole | null {
+  if (!isParameterControl(control)) return PARAMETER_ROLE_BY_BINDING[control.binding] ?? null
+  if (!parameterIsAspectAlias(control) && ASPECT_RATIO_META_KEYS.includes(control.key as typeof ASPECT_RATIO_META_KEYS[number])) return 'resolution'
+  return PARAMETER_ROLE_BY_KEY[control.key] ?? null
+}
+
+export function readMeta(meta: Record<string, unknown> | undefined, key: string): string {
+  const value = meta?.[key]
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : ''
+}
+
+/**
+ * 节点 meta 里的当前模型寻址（modelKey + vendor 双键）。
+ * 与模型选择器同一条 fallback 链的**唯一出处**——NodeParameterControls 与报错卡
+ * （自定义调用入口）共用，防两处各抄一份后漂移（同 vendor 双键防误路由，见选择器注释）。
+ */
+export function nodeSelectedModelAddress(meta: Record<string, unknown> | undefined): {
+  modelKey: string
+  vendorKey: string
+} {
+  const modelKey =
+    readMeta(meta, 'modelKey') || readMeta(meta, 'modelAlias') || readMeta(meta, 'imageModel') || readMeta(meta, 'videoModel')
+  const vendorKey =
+    readMeta(meta, 'modelVendor') ||
+    readMeta(meta, 'vendor') ||
+    readMeta(meta, 'imageModelVendor') ||
+    readMeta(meta, 'videoModelVendor')
+  return { modelKey, vendorKey }
+}
+
+function readStringArray(meta: unknown, key: string): string[] {
+  if (!meta || typeof meta !== 'object') return []
+  const value = (meta as Record<string, unknown>)[key]
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+}
+
+function readDurationOptions(meta: unknown): DurationOption[] {
+  if (!meta || typeof meta !== 'object') return []
+  const value = (meta as Record<string, unknown>).durs
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item): DurationOption[] => {
+    if (!item || typeof item !== 'object') return []
+    const record = item as Record<string, unknown>
+    const value = typeof record.key === 'number' || typeof record.key === 'string' ? String(record.key) : ''
+    const label = typeof record.label === 'string' ? record.label : value ? `${value}s` : ''
+    return value && label ? [{ value, label }] : []
+  })
+}
+
+function readDefaultParam(meta: unknown, key: string): string {
+  if (!meta || typeof meta !== 'object') return ''
+  const defaultParams = (meta as Record<string, unknown>).defaultParams
+  if (!defaultParams || typeof defaultParams !== 'object') return ''
+  const value = (defaultParams as Record<string, unknown>)[key]
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : ''
+}
+
+export function resultPreviewUrl(node: GenerationCanvasNode | undefined): string {
+  // URL 口径单源 referenceUrl.resultUrl（本地持久文件优先，providerUrl 兜底）——显示 / 槽解析 / 生成
+  // 收集三处必须同一份，否则「显示有、生成兜不到」（#4）与「过期临时链发给服务商」两类 bug 复发。
+  return resultUrl(node?.result) || resultUrl(node?.history?.[0])
+}
+
+export function assetUrl(asset: WorkbenchAssetDto): string {
+  const data = asset.data && typeof asset.data === 'object' && !Array.isArray(asset.data)
+    ? asset.data as Record<string, unknown>
+    : {}
+  const url = typeof data.url === 'string' ? data.url.trim() : ''
+  if (url) return url
+  const imageUrl = typeof data.imageUrl === 'string' ? data.imageUrl.trim() : ''
+  if (imageUrl) return imageUrl
+  return typeof data.thumbnailUrl === 'string' ? data.thumbnailUrl.trim() : ''
+}
+
+export function optionKey(option: SelectOption): string {
+  return typeof option === 'string' ? option || 'auto' : String(option.value)
+}
+
+export function optionValue(option: SelectOption): string {
+  return typeof option === 'string' ? option : String(option.value)
+}
+
+export function optionLabel(option: SelectOption): string {
+  if (typeof option === 'string') return option || '自动'
+  return formatVideoOptionLabel(option.label, option.priceLabel)
+}
+
+export function controlValueToString(value: unknown): string {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return ''
+}
+
+/**
+ * 下拉选中的字符串 → 该选项**声明的** wire 值（数值 option → 发整数，如 duration 离散枚举 4/8/12；
+ * 字符串 option 如 "720p"/"16:9" 仍是字符串；ComfyUI 的 [False, True] 开关发布尔）。没匹配上原样返回。
+ * 根治「duration 用 select 发字符串被 vendor 400」——既要离散合法值（select 不能输非法），又要按原类型
+ * 传输。单源：option 自身的类型即真相；画布控件与 ComfyUI 导入预览都走这里，别另写一份。
+ */
+export function declaredOptionValue(values: readonly (string | number | boolean)[], selected: string): string | number | boolean {
+  return values.find((value) => controlValueToString(value) === selected) ?? selected
+}
+
+export function parseControlInput(control: ModelParameterControl, value: string): string | number | boolean | null {
+  if (control.type === 'boolean') return value === 'true'
+  if (control.type === 'number') {
+    if (!value.trim()) return null
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  if (control.type === 'select') return declaredOptionValue(control.options.map((option) => option.value), value)
+  return value
+}
+
+export function controlInitialValue(control: ModelParameterControl, meta: Record<string, unknown>): string {
+  const current = meta[control.key]
+  if (typeof current !== 'undefined') return controlValueToString(current)
+  if (typeof control.defaultValue !== 'undefined') return controlValueToString(control.defaultValue)
+  const firstOption = control.options[0]
+  return firstOption ? controlValueToString(firstOption.value) : ''
+}
+
+export function catalogControlInitialValue(control: DynamicCatalogControl, meta: Record<string, unknown>): string {
+  const current = meta[control.key]
+  if (typeof current !== 'undefined') return controlValueToString(current)
+  if (typeof control.defaultValue !== 'undefined') return controlValueToString(control.defaultValue)
+  const firstOption = control.options[0]
+  return firstOption ? optionValue(firstOption) : ''
+}
+
+export function isParameterControl(control: DynamicModelControl): control is DynamicParameterControl {
+  return control.binding === 'parameter'
+}
+
+/**
+ * 这个控件在参数面板里是不是渲成「一组摊开的候选项」。
+ *
+ * 判据就是**它有没有候选项**：有 → 面板里画的是可点的项（chip 一排/一列，或带搜索的列表）；
+ * 没有 → 滑杆 / 数字框 / 开关。单参数直出那条路（底栏 pill 只管一个参数时，点开直接给这组项、
+ * 不套面板壳）只对前者成立——把一根没有标题的滑杆直接弹在半空中，谁也不知道它在调什么。
+ */
+export function hasFlatOptions(control: DynamicModelControl): boolean {
+  return control.options.length > 0
+}
+
+function controlEquivalentKeys(key: string): string[] {
+  return [key, ...(PARAMETER_CONTROL_BINDING_KEYS[key] || [])]
+}
+
+/**
+ * 这几个键名**本身不说明**它管的是比例：`size` 在一家是 `16:9`，在另一家是 `720P` / `2K` / `1024x1024`。
+ * 它们只有在选项真是比例时才和 `aspect_ratio` / `ratio` 是同一件事（判据是比例的唯一 owner
+ * `electron/shared/aspectRatioValue.ts` 的 `optionsAreAspectRatios`，这里不另写一份）。
+ * 以前按键名一律算比例：Agnes 视频 2.5 的清晰度叫 `size`、比例叫 `aspect_ratio`，去重把比例控件吞掉，
+ * 用户在节点底栏和付费卡上都选不到比例（铁律 ⑪ 首跑 LAW11-ALIAS-DEDUPE）。
+ */
+const KEYS_NAMING_NO_ROLE = new Set(['size', 'imageSize', 'videoSize', 'video_size', 'image_size'])
+
+function parameterIsAspectAlias(control: ModelParameterControl): boolean {
+  if (!ASPECT_RATIO_META_KEYS.includes(control.key as typeof ASPECT_RATIO_META_KEYS[number])) return false
+  if (!KEYS_NAMING_NO_ROLE.has(control.key)) return true
+  return isAspectRatioControl({ ...control, binding: 'parameter' })
+}
+
+/** 控件的比例身份只由 shared 的值/标签语义判据决定，键名本身不作判断。 */
+export function isAspectRatioControl(control: DynamicModelControl): boolean {
+  if (control.binding === 'aspectRatio') return true
+  const adapted = aspectRatioControlsOf([{
+    key: control.key,
+    options: control.options.map((option) => typeof option === 'string'
+      ? { value: option, label: option }
+      : { value: option.value, label: option.label }),
+  }])
+  return aspectRatioControlKey(adapted) === control.key
+}
+
+/**
+ * 一个档案参数控件和哪些键是同一件事：别名表给出候选，`size` 一类还要看选项是不是比例。
+ * 两个方向都要收：选项不是比例的 `size` 只认它自己；名字就说明是比例的键（`aspect_ratio` / `ratio`…）
+ * 也不再把 `size` 一类算进同伙——那几个键是不是比例，只由它们**自己的选项**说了算。
+ * 两个都真是比例的控件（`size` 选项是 16:9…，又有 `aspect_ratio`）仍在 `aspect_ratio` 这些键上重叠，照旧去重。
+ */
+function parameterEquivalentKeys(control: ModelParameterControl): string[] {
+  if (!ASPECT_RATIO_META_KEYS.includes(control.key as typeof ASPECT_RATIO_META_KEYS[number])) return controlEquivalentKeys(control.key)
+  if (!parameterIsAspectAlias(control)) return [control.key]
+  if (KEYS_NAMING_NO_ROLE.has(control.key)) return controlEquivalentKeys(control.key)
+  return controlEquivalentKeys(control.key).filter((key) => !KEYS_NAMING_NO_ROLE.has(key))
+}
+
+function controlStoredKeys(control: DynamicModelControl): string[] {
+  if (isParameterControl(control)) return parameterEquivalentKeys(control)
+  if (control.binding === 'aspectRatio') return ['aspect_ratio', 'aspectRatio', 'aspect', 'size', 'imageSize']
+  if (control.binding === 'imageSize') return ['imageSize', 'size']
+  if (control.binding === 'durationSeconds') return ['durationSeconds', 'videoDuration']
+  if (control.binding === 'size') return ['aspect_ratio', 'aspectRatio', 'videoSize', 'size', 'aspect']
+  if (control.binding === 'resolution') return ['resolution', 'videoResolution']
+  return [control.key]
+}
+
+function hasControlForAnyKey(existingKeys: Set<string>, keys: readonly string[]): boolean {
+  return keys.some((key) => existingKeys.has(key))
+}
+
+function optionDefaultValue(options: readonly SelectOption[], preferred: string | number | boolean | undefined): string | number | boolean | undefined {
+  if (typeof preferred !== 'undefined' && String(preferred).trim()) return preferred
+  const firstOption = options[0]
+  return typeof firstOption === 'undefined' ? undefined : optionValue(firstOption)
+}
+
+function optionListHasValues(options: readonly SelectOption[]): boolean {
+  return options.length > 0
+}
+
+function catalogImageOptions(
+  config: ImageModelCatalogConfig | null,
+  source: 'aspectRatioOptions' | 'imageSizeOptions' | 'resolutionOptions',
+): SelectOption[] {
+  if (!config) return []
+  if (source === 'aspectRatioOptions') return config.aspectRatioOptions
+  if (source === 'resolutionOptions') return config.resolutionOptions
+  return config.imageSizeOptions
+}
+
+function catalogVideoOptions(
+  config: VideoModelCatalogConfig | null,
+  source: 'durationOptions' | 'sizeOptions' | 'resolutionOptions' | 'orientationOptions',
+): SelectOption[] {
+  if (!config) return []
+  if (source === 'durationOptions') return config.durationOptions
+  if (source === 'resolutionOptions') return config.resolutionOptions
+  if (source === 'orientationOptions') return config.orientationOptions
+  return config.sizeOptions
+}
+
+function imageBindingDefaultValue(
+  config: ImageModelCatalogConfig,
+  binding: ImageModelControlBinding,
+): string | undefined {
+  if (binding === 'aspectRatio') return config.defaultAspectRatio
+  if (binding === 'imageSize') return config.defaultImageSize
+  return undefined
+}
+
+function videoBindingDefaultValue(
+  config: VideoModelCatalogConfig,
+  binding: VideoModelControlBinding,
+): string | number | undefined {
+  if (binding === 'durationSeconds') return config.defaultDurationSeconds
+  if (binding === 'size') return config.defaultSize
+  if (binding === 'resolution') return config.defaultResolution
+  return config.defaultOrientation
+}
+
+function defaultImageCatalogControls(config: ImageModelCatalogConfig | null): DynamicCatalogControl[] {
+  if (!config) return []
+  const controls: DynamicCatalogControl[] = [
+    {
+      key: 'aspect_ratio',
+      label: '比例',
+      binding: 'aspectRatio',
+      options: config.aspectRatioOptions,
+      defaultValue: optionDefaultValue(config.aspectRatioOptions, config.defaultAspectRatio),
+    },
+    {
+      key: 'resolution',
+      label: '清晰度',
+      binding: 'resolution',
+      options: config.resolutionOptions,
+      defaultValue: optionDefaultValue(config.resolutionOptions, undefined),
+    },
+  ]
+  return controls.filter((control) => optionListHasValues(control.options))
+}
+
+function defaultVideoCatalogControls(config: VideoModelCatalogConfig | null): DynamicCatalogControl[] {
+  if (!config) return []
+  const controls: DynamicCatalogControl[] = [
+    {
+      key: 'durationSeconds',
+      label: '时长',
+      binding: 'durationSeconds',
+      options: config.durationOptions,
+      defaultValue: optionDefaultValue(config.durationOptions, config.defaultDurationSeconds),
+    },
+    {
+      key: 'aspect_ratio',
+      label: '画幅',
+      binding: 'size',
+      options: config.sizeOptions,
+      defaultValue: optionDefaultValue(config.sizeOptions, config.defaultSize),
+    },
+    {
+      key: 'resolution',
+      label: '分辨率',
+      binding: 'resolution',
+      options: config.resolutionOptions,
+      defaultValue: optionDefaultValue(config.resolutionOptions, config.defaultResolution),
+    },
+  ]
+  return controls.filter((control) => optionListHasValues(control.options))
+}
+
+function explicitImageCatalogControls(config: ImageModelCatalogConfig | null): DynamicCatalogControl[] {
+  if (!config) return []
+  return config.controls.flatMap((control): DynamicCatalogControl[] => {
+    const options = catalogImageOptions(config, control.optionSource)
+    if (!options.length) return []
+    return [{
+      key: control.key,
+      label: control.label,
+      binding: control.binding,
+      options,
+      defaultValue: optionDefaultValue(options, imageBindingDefaultValue(config, control.binding)),
+    }]
+  })
+}
+
+function explicitVideoCatalogControls(config: VideoModelCatalogConfig | null): DynamicCatalogControl[] {
+  if (!config) return []
+  return config.controls.flatMap((control): DynamicCatalogControl[] => {
+    const options = catalogVideoOptions(config, control.optionSource)
+    if (!options.length) return []
+    return [{
+      key: control.key,
+      label: control.label,
+      binding: control.binding,
+      options,
+      defaultValue: optionDefaultValue(options, videoBindingDefaultValue(config, control.binding)),
+    }]
+  })
+}
+
+// A free-form text/number control with no options, no default, and no
+// placeholder renders as an empty input box that carries no information and
+// no action value (e.g. kie's `callBackUrl` plumbing param). Drop it from the
+// node toolbar — boolean/select controls and anything with a default/options
+// stay. (Rule 2: 没有行动价值的信息 = 噪音 = 删)
+function isEmptyInputControl(control: ModelParameterControl): boolean {
+  if (control.type !== 'text' && control.type !== 'number') return false
+  if (control.options.length > 0) return false
+  const hasDefault = typeof control.defaultValue !== 'undefined' && String(control.defaultValue).trim() !== ''
+  const hasPlaceholder = typeof control.placeholder === 'string' && control.placeholder.trim() !== ''
+  return !hasDefault && !hasPlaceholder
+}
+
+function dedupeParamControls(controls: ModelParameterControl[]): ModelParameterControl[] {
+  const usedKeys = new Set<string>()
+  return controls.filter((control) => {
+    const keys = parameterEquivalentKeys(control)
+    if (hasControlForAnyKey(usedKeys, keys)) return false
+    keys.forEach((k) => usedKeys.add(k))
+    return true
+  })
+}
+
+export function buildDynamicControls(input: {
+  parameterControls: ModelParameterControl[]
+  imageCatalogConfig: ImageModelCatalogConfig | null
+  videoCatalogConfig: VideoModelCatalogConfig | null
+  isImageLike: boolean
+  isVideoLike: boolean
+  explicitMediaParametersOnly?: boolean
+}): DynamicModelControl[] {
+  const paramControls = dedupeParamControls(
+    // image-url-like params render as reference boxes at the top (buildImageUrlSlots),
+    // so they must NOT also appear in the bottom value row.
+    input.parameterControls.filter((c) => !isParameterReferenceControl(c, input.explicitMediaParametersOnly) && !isEmptyInputControl(c)),
+  )
+  const controls: DynamicModelControl[] = paramControls.map((control) => ({
+    ...control,
+    binding: 'parameter',
+  }))
+  const usedKeys = new Set(paramControls.flatMap((control) => parameterEquivalentKeys(control)))
+  const catalogControls = input.isImageLike
+    ? [
+        ...explicitImageCatalogControls(input.imageCatalogConfig),
+        ...defaultImageCatalogControls(input.imageCatalogConfig),
+      ]
+    : input.isVideoLike
+      ? [
+          ...explicitVideoCatalogControls(input.videoCatalogConfig),
+          ...defaultVideoCatalogControls(input.videoCatalogConfig),
+        ]
+      : []
+
+  catalogControls.forEach((control) => {
+    const keys = controlEquivalentKeys(control.key)
+    if (hasControlForAnyKey(usedKeys, keys)) return
+    controls.push(control)
+    keys.forEach((key) => usedKeys.add(key))
+  })
+  return controls
+}
+
+function defaultPatchForParameterControl(control: ModelParameterControl): Record<string, unknown> {
+  if (typeof control.defaultValue === 'undefined') return {}
+  return { [control.key]: control.defaultValue }
+}
+
+export function defaultPatchForCatalogControl(control: DynamicCatalogControl): Record<string, unknown> {
+  const value = optionDefaultValue(control.options, control.defaultValue)
+  if (typeof value === 'undefined') return {}
+  if (control.binding === 'aspectRatio') {
+    return {
+      [control.key]: value,
+      aspect_ratio: value,
+      aspectRatio: value,
+      aspect: value,
+      size: value,
+      imageSize: value,
+    }
+  }
+  if (control.binding === 'imageSize') {
+    return {
+      [control.key]: value,
+      imageSize: value,
+      size: value,
+    }
+  }
+  if (control.binding === 'durationSeconds') {
+    const durationSeconds = Number(value)
+    return Number.isFinite(durationSeconds)
+      ? { [control.key]: durationSeconds, durationSeconds, videoDuration: durationSeconds }
+      : {}
+  }
+  if (control.binding === 'size') {
+    const nextSize = String(value).trim().replace(/\s+/g, '')
+    return {
+      [control.key]: nextSize,
+      aspect_ratio: nextSize,
+      aspectRatio: nextSize,
+      videoSize: nextSize,
+      size: nextSize,
+      aspect: nextSize,
+    }
+  }
+  if (control.binding === 'resolution') {
+    return {
+      [control.key]: value,
+      resolution: value,
+      videoResolution: value,
+    }
+  }
+  if (control.binding === 'orientation') {
+    return { [control.key]: normalizeOrientation(value as Orientation) }
+  }
+  return { [control.key]: value }
+}
+
+export function defaultPatchForControls(controls: readonly DynamicModelControl[]): Record<string, unknown> {
+  return controls.reduce<Record<string, unknown>>((acc, control) => ({
+    ...acc,
+    ...(isParameterControl(control)
+      ? defaultPatchForParameterControl(control)
+      : defaultPatchForCatalogControl(control)),
+  }), {})
+}
+
+/** 参数控件点击后的纯 patch；比例标记由组件按 isAspectRatioControl 决定。 */
+export function parameterControlChangePatch(control: ModelParameterControl, rawValue: string): Record<string, unknown> {
+  const parsed = parseControlInput(control, rawValue)
+  const patch: Record<string, unknown> = { [control.key]: parsed }
+  const dynamic = { ...control, binding: 'parameter' as const }
+  if (!isAspectRatioControl(dynamic)) return patch
+  if (control.key === 'aspect_ratio') return patch
+  const option = control.options.find((candidate) => Object.is(candidate.value, parsed) || String(candidate.value) === rawValue)
+  patch.aspect_ratio = normalizeAspectRatioToWH(parsed) ?? normalizeAspectRatioToWH(option?.label ?? '') ?? null
+  return patch
+}
+
+/**
+ * 视频比例默认覆盖（2026-07-17 用户拍板：视频首选 16:9，输入全竖才 9:16——档案声明的默认让位于
+ * 这条产品规则）。在 controls 里找比例控件，匹配 preferred 的等价选项（normalize 后同 W:H），
+ * 生成写入 patch（含比例多键同步）。模型没有等价档位（如只有 1:1）→ 返回空，保留档案默认。
+ */
+export function videoAspectDefaultPatch(
+  controls: readonly DynamicModelControl[],
+  preferred: '16:9' | '9:16',
+): Record<string, unknown> {
+  for (const control of controls) {
+    if (isParameterControl(control)) {
+      if (!isAspectRatioControl({ ...control, binding: 'parameter' })) continue
+      const matched = control.options.find(
+        (o) => sameAspectRatio(controlValueToString(o.value), preferred) || sameAspectRatio(o.label, preferred),
+      )
+      if (!matched) return {}
+      const patch: Record<string, unknown> = { [control.key]: matched.value }
+      if (control.key !== 'aspect_ratio') patch.aspect_ratio = normalizeAspectRatioToWH(matched.value) ?? normalizeAspectRatioToWH(matched.label) ?? preferred
+      return patch
+    }
+    if (!isAspectRatioControl(control)) continue
+    const matched = control.options.find((o) => {
+      return sameAspectRatio(optionValue(o), preferred) || sameAspectRatio(typeof o === 'string' ? o : o.label, preferred)
+    })
+    if (!matched) return {}
+    return defaultPatchForCatalogControl({ ...control, defaultValue: optionValue(matched) })
+  }
+  return {}
+}
+
+export function removePreviousControlParams(
+  meta: Record<string, unknown>,
+  controls: readonly DynamicModelControl[],
+): Record<string, unknown> {
+  const removable = new Set(controls.flatMap(controlStoredKeys))
+  return Object.fromEntries(
+    Object.entries(meta).filter(([key]) => !removable.has(key)),
+  )
+}
+
+export function buildEffectiveImageCatalogConfig(meta: unknown): ImageModelCatalogConfig | null {
+  const parsed = parseImageModelCatalogConfig(meta)
+  if (parsed) return parsed
+  const legacySizes = readStringArray(meta, 'sizes')
+  if (!legacySizes.length) return null
+  const defaultImageSize = readDefaultParam(meta, 'size')
+  return {
+    ...(defaultImageSize ? { defaultImageSize } : {}),
+    aspectRatioOptions: [],
+    imageSizeOptions: legacySizes.map((value) => ({ value, label: value })),
+    resolutionOptions: [],
+    controls: [{ key: 'size', label: '比例', binding: 'aspectRatio', optionSource: 'imageSizeOptions' }],
+  }
+}
+
+export function buildEffectiveVideoCatalogConfig(meta: unknown): VideoModelCatalogConfig | null {
+  const parsed = parseVideoModelCatalogConfig(meta)
+  if (parsed) return parsed
+  const legacyRatios = readStringArray(meta, 'ratios')
+  const legacyDurations = readDurationOptions(meta).flatMap((option) => {
+    const rawValue = typeof option === 'string' ? option : String(option.value)
+    const value = Number(rawValue)
+    if (!Number.isFinite(value) || value <= 0) return []
+    return [{ value: Math.trunc(value), label: typeof option === 'string' ? `${Math.trunc(value)}s` : option.label }]
+  })
+  const legacyResolutions = readStringArray(meta, 'resolutions')
+  if (!legacyRatios.length && !legacyDurations.length && !legacyResolutions.length) return null
+  const defaultDuration = Number(readDefaultParam(meta, 'duration'))
+  const defaultSize = readDefaultParam(meta, 'ratio')
+  const defaultResolution = readDefaultParam(meta, 'resolution')
+  return {
+    ...(Number.isFinite(defaultDuration) && defaultDuration > 0 ? { defaultDurationSeconds: Math.trunc(defaultDuration) } : {}),
+    ...(defaultSize ? { defaultSize } : {}),
+    ...(defaultResolution ? { defaultResolution } : {}),
+    durationOptions: legacyDurations,
+    sizeOptions: legacyRatios.map((value) => ({ value, label: value })),
+    resolutionOptions: legacyResolutions.map((value) => ({ value, label: value })),
+    orientationOptions: [],
+    controls: [
+      { key: 'durationSeconds', label: '时长', binding: 'durationSeconds', optionSource: 'durationOptions' },
+      { key: 'aspect_ratio', label: '画幅', binding: 'size', optionSource: 'sizeOptions' },
+      { key: 'resolution', label: '分辨率', binding: 'resolution', optionSource: 'resolutionOptions' },
+    ],
+  }
+}
+
+export function buildModelControls(meta: unknown, isImageLike: boolean, isVideoLike: boolean): DynamicModelControl[] {
+  return buildDynamicControls({
+    parameterControls: parseModelParameterControls(meta),
+    imageCatalogConfig: buildEffectiveImageCatalogConfig(meta),
+    videoCatalogConfig: buildEffectiveVideoCatalogConfig(meta),
+    isImageLike,
+    isVideoLike,
+    explicitMediaParametersOnly: usesExplicitParameterReferenceDeclarations(meta),
+  })
+}

@@ -1,0 +1,349 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const handlers = new Map<string, (...args: unknown[]) => unknown>();
+
+// 已加固通道（assertTrustedSender）只认「当前登记的主窗口主帧」，
+// 所以测试要先立一个假主窗口，再用 trustedEvent 当事件传进 handler。
+const harness = vi.hoisted(() => {
+  const MAIN_FRAME_ROUTING_ID = 7;
+  const APP_ENTRY_URL = "file:///app/index.html";
+  const byContents = new Map<object, object>();
+  class FakeBrowserWindow {
+    readonly webContents: { mainFrame: { routingId: number }; isDestroyed(): boolean; getURL(): string };
+    constructor() {
+      this.webContents = {
+        mainFrame: { routingId: MAIN_FRAME_ROUTING_ID },
+        isDestroyed: () => false,
+        getURL: () => APP_ENTRY_URL,
+      };
+      byContents.set(this.webContents, this);
+    }
+    isDestroyed(): boolean {
+      return false;
+    }
+    static fromWebContents(contents: object): object | null {
+      return byContents.get(contents) ?? null;
+    }
+  }
+  return { FakeBrowserWindow, MAIN_FRAME_ROUTING_ID, APP_ENTRY_URL };
+});
+
+vi.mock("electron", () => ({
+  BrowserWindow: harness.FakeBrowserWindow,
+  ipcMain: {
+    handle: (channel: string, handler: (...args: unknown[]) => unknown) => handlers.set(channel, handler),
+  },
+}));
+
+import { registerProductionRunIpc } from "./productionRunIpc";
+import { setMainWindow } from "../appWindowRegistry";
+
+/** 立一个假主窗口并返回它发来的合法事件（未登记主窗口时守卫一律拒绝）。 */
+function trustedEvent(): { sender: unknown; senderFrame: unknown } {
+  const win = new harness.FakeBrowserWindow();
+  setMainWindow(win as never);
+  return {
+    sender: win.webContents,
+    senderFrame: { routingId: harness.MAIN_FRAME_ROUTING_ID, url: harness.APP_ENTRY_URL },
+  };
+}
+
+function fakeRun(projectId = "project-1") {
+  return {
+    runId: "run-1",
+    projectId,
+    revision: 2,
+    status: "running",
+    snapshotCursor: 3,
+  };
+}
+
+function repository() {
+  return {
+    list: vi.fn(() => [fakeRun()]),
+    read: vi.fn((_projectId: string, _runId: string) => fakeRun()),
+    create: vi.fn(() => fakeRun()),
+    execute: vi.fn((_projectId: string, _runId: string, _command: unknown) => ({ run: fakeRun(), events: [] })),
+    readEvents: vi.fn(() => []),
+  };
+}
+
+describe("production run IPC", () => {
+  beforeEach(() => handlers.clear());
+
+  it("presents only the addressed storyboard scope without granting spend authority", async () => {
+    const repo = repository();
+    repo.read.mockReturnValue({ ...fakeRun(), origin: { host: "nomi", sourceDocument: { documentId: "doc-1", revision: 3 } } } as ReturnType<typeof fakeRun>);
+    registerProductionRunIpc(repo as never);
+    await handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1", runId: "run-1",
+      command: { commandId: "present-storyboard", expectedRevision: 2, type: "generation.present",
+        payload: { sourceDocumentId: "doc-1", sourceDocumentRevision: 3, shotIds: ["shot-2"], approved: true }, humanGesture: true },
+    });
+    expect(repo.execute).toHaveBeenCalledWith("project-1", "run-1", expect.objectContaining({
+      type: "generation.present", expectedRevision: 2,
+      payload: { sourceDocumentId: "doc-1", sourceDocumentRevision: 3, shotIds: ["shot-2"] },
+    }));
+    expect(repo.execute.mock.calls[0][2]).not.toHaveProperty("humanGesture");
+  });
+
+  it.each([
+    { shotIds: [] }, { shotIds: ["shot-2", "shot-2"] }, { shotIds: undefined },
+    { sourceDocumentId: "another-document" }, { sourceDocumentRevision: 2 },
+  ])("rejects invalid or stale storyboard presentation before a write: %j", async (patch) => {
+    const repo = repository();
+    repo.read.mockReturnValue({ ...fakeRun(), origin: { host: "nomi", sourceDocument: { documentId: "doc-1", revision: 3 } } } as ReturnType<typeof fakeRun>);
+    registerProductionRunIpc(repo as never);
+    await expect(handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1", runId: "run-1",
+      command: { commandId: "present-storyboard", expectedRevision: 2, type: "generation.present",
+        payload: { sourceDocumentId: "doc-1", sourceDocumentRevision: 3, shotIds: ["shot-2"], ...patch } },
+    })).rejects.toThrow();
+    expect(repo.execute).not.toHaveBeenCalled();
+  });
+
+  it("does not redirect an external client's confirmation into the resident panel", async () => {
+    const repo = repository();
+    repo.read.mockReturnValue({ ...fakeRun(), origin: { host: "semantic-mcp", sourceDocument: { documentId: "doc-1", revision: 3 } } } as ReturnType<typeof fakeRun>);
+    registerProductionRunIpc(repo as never);
+    await expect(handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1", runId: "run-1",
+      command: { commandId: "present-storyboard", expectedRevision: 2, type: "generation.present",
+        payload: { sourceDocumentId: "doc-1", sourceDocumentRevision: 3, shotIds: ["shot-2"] } },
+    })).rejects.toThrow();
+    expect(repo.execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects the retired alternate placement command without writing", async () => {
+    const repo = repository();
+    registerProductionRunIpc(repo as never);
+    await expect(handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1", runId: "run-1",
+      command: { commandId: "place-canvas", expectedRevision: 2, type: "generation.place_canvas", payload: {}, humanGesture: true },
+    })).rejects.toThrow();
+    expect(repo.execute).not.toHaveBeenCalled();
+  });
+
+  it("registers the narrow list/read/create/command/events bridge", () => {
+    registerProductionRunIpc(repository() as never);
+    expect([...handlers.keys()]).toEqual([
+      "nomi:production-runs:list",
+      "nomi:production-runs:read",
+      "nomi:production-runs:create-draft",
+      "nomi:production-runs:command",
+      "nomi:production-runs:materialize-storyboard",
+      "nomi:production-runs:events",
+    ]);
+  });
+
+  it("normalizes create-draft input without accepting live authority", async () => {
+    const repo = repository();
+    registerProductionRunIpc(repo as never);
+
+    await handlers.get("nomi:production-runs:create-draft")?.(trustedEvent(), {
+      projectId: "project-1",
+      playbook: { name: "brand.promo", version: "1.0.0" },
+      origin: { host: "codex" },
+      approval: { approved: true },
+      maxSpend: 999,
+    });
+
+    expect(repo.create).toHaveBeenCalledWith({
+      projectId: "project-1",
+      playbook: { name: "brand.promo", version: "1.0.0" },
+      origin: { host: "codex" },
+    });
+  });
+
+  it("rejects malformed IDs and unknown renderer commands", async () => {
+    registerProductionRunIpc(repository() as never);
+    await expect(handlers.get("nomi:production-runs:read")?.(trustedEvent(), { projectId: "../escape", runId: "run-1" }))
+      .rejects.toThrow("Invalid project id");
+    await expect(handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1",
+      runId: "run-1",
+      command: {
+        commandId: "cmd-1",
+        expectedRevision: 2,
+        type: "budget.entry",
+        payload: {},
+        issuedAt: "2026-08-08T08:00:00.000Z",
+      },
+    })).rejects.toThrow("Production command is not available to the renderer");
+  });
+
+  // 2026-08-18 走查逮到：run.control 在白名单里，payload 构造器却没有它的分支，于是掉进
+  // 末尾那句 artifact.adopt 的兜底 return —— 用户在 Nomi 里点「取消制作」只会看到
+  // 「Invalid artifact id」。暂停/继续/取消从渲染端就没通过。根因是「默认分支替别人猜形状」，
+  // 所以既补 run.control，也把兜底改成响亮报错。
+  it("carries a renderer pause/resume/cancel through instead of mistaking it for an artifact command", async () => {
+    const repo = repository();
+    registerProductionRunIpc(repo as never);
+    const command = {
+      commandId: "cmd-cancel",
+      expectedRevision: 2,
+      type: "run.control",
+      payload: { action: "cancel" },
+      issuedAt: "2026-08-08T08:00:00.000Z",
+    };
+
+    await handlers.get("nomi:production-runs:command")?.(trustedEvent(), { projectId: "project-1", runId: "run-1", command });
+
+    expect(repo.execute).toHaveBeenCalledWith("project-1", "run-1", expect.objectContaining({
+      type: "run.control",
+      payload: { action: "cancel" },
+    }));
+    await expect(handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1",
+      runId: "run-1",
+      command: { ...command, commandId: "cmd-bogus", payload: { action: "explode" } },
+    })).rejects.toThrow("Invalid production control action");
+  });
+
+  it("rejects a project/run mismatch before executing a command", async () => {
+    const repo = repository();
+    repo.read.mockReturnValue(fakeRun("project-other"));
+    registerProductionRunIpc(repo as never);
+
+    await expect(handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1",
+      runId: "run-1",
+      command: {
+        commandId: "cmd-1",
+        expectedRevision: 2,
+        type: "run.status",
+        payload: { status: "pausing" },
+        issuedAt: "2026-08-08T08:00:00.000Z",
+      },
+    })).rejects.toThrow("Production run project mismatch");
+    expect(repo.execute).not.toHaveBeenCalled();
+  });
+
+  it("passes a validated revision and monotonic cursor to the repository", async () => {
+    const repo = repository();
+    registerProductionRunIpc(repo as never);
+    const command = {
+      commandId: "cmd-1",
+      expectedRevision: 2,
+      type: "run.status",
+      payload: { status: "pausing" },
+      issuedAt: "2026-08-08T08:00:00.000Z",
+    };
+
+    await handlers.get("nomi:production-runs:command")?.(trustedEvent(), { projectId: "project-1", runId: "run-1", command });
+    await handlers.get("nomi:production-runs:events")?.(trustedEvent(), { projectId: "project-1", runId: "run-1", afterCursor: 3 });
+
+    expect(repo.execute).toHaveBeenCalledWith("project-1", "run-1", command);
+    expect(repo.readEvents).toHaveBeenCalledWith("project-1", "run-1", 3);
+  });
+
+  it("reduces a gate decision to its decision fields before crossing into the repository", async () => {
+    const repo = repository();
+    registerProductionRunIpc(repo as never);
+
+    await handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1",
+      runId: "run-1",
+      command: {
+        commandId: "cmd-gate",
+        expectedRevision: 2,
+        type: "gate.decide",
+        payload: {
+          gateId: "gate-contract",
+          status: "approved",
+          approval: { maxSpend: 999999, allowedProviders: ["attacker"] },
+        },
+        issuedAt: "2026-08-08T08:00:00.000Z",
+      },
+    });
+
+    expect(repo.execute).toHaveBeenCalledWith("project-1", "run-1", {
+      commandId: "cmd-gate",
+      expectedRevision: 2,
+      type: "gate.decide",
+      payload: { gateId: "gate-contract", status: "approved" },
+      issuedAt: "2026-08-08T08:00:00.000Z",
+      // 真人手势章：这条命令已过 assertTrustedSender（Nomi 自己的窗口），付费门凭它放行。
+      humanGesture: true,
+    });
+  });
+
+  // 手势章必须是**这一层自己盖的**，不是从渲染层 payload 抄的——抄的话渲染进程被攻破就等于
+  // 拿到了付费门的万能钥匙。给一个显式 humanGesture: false 也照样盖成 true，证明它不看输入。
+  it("stamps the trusted human gesture itself instead of copying it from the renderer payload", async () => {
+    const repo = repository();
+    registerProductionRunIpc(repo as never);
+
+    await handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1",
+      runId: "run-1",
+      command: {
+        commandId: "cmd-gate-forged",
+        expectedRevision: 2,
+        type: "gate.decide",
+        humanGesture: false,
+        payload: { gateId: "gate-contract", status: "approved", humanGesture: true },
+        issuedAt: "2026-08-08T08:00:00.000Z",
+      },
+    });
+
+    expect(repo.execute).toHaveBeenCalledWith("project-1", "run-1", expect.objectContaining({
+      humanGesture: true,
+      payload: { gateId: "gate-contract", status: "approved" },
+    }));
+  });
+
+  it("lists the summary projection in service mode, never full Runs", async () => {
+    const summary = { runId: "run-1", projectId: "project-1", status: "draft", generationPlan: { state: "draft", cardHidden: true } };
+    const service = {
+      repository: { list: vi.fn(() => [summary]) },
+      readFull: vi.fn(() => fakeRun()),
+      command: vi.fn(),
+    };
+    registerProductionRunIpc(service as never);
+
+    await expect(handlers.get("nomi:production-runs:list")?.(trustedEvent(), { projectId: "project-1" })).resolves.toEqual([summary]);
+    expect(service.repository.list).toHaveBeenCalledWith("project-1");
+    expect(service.readFull).not.toHaveBeenCalled();
+    expect(service.command).not.toHaveBeenCalled();
+  });
+
+  it("preserves only validated storyboard bindings when crossing into the service", async () => {
+    const service = {
+      repository: { list: vi.fn(() => []) },
+      readFull: vi.fn(() => fakeRun()),
+      createDraft: vi.fn(() => fakeRun()),
+      command: vi.fn(async () => ({ run: fakeRun(), events: [] })),
+      readEvents: vi.fn(async () => ({ events: [], nextCursor: 3 })),
+    };
+    registerProductionRunIpc(service as never);
+
+    await handlers.get("nomi:production-runs:command")?.(trustedEvent(), {
+      projectId: "project-1",
+      runId: "run-1",
+      command: {
+        commandId: "cmd-attach",
+        expectedRevision: 2,
+        type: "plan.attach",
+        payload: {
+          artifactId: "artifact-storyboard-v1",
+          bindings: [{ nodeId: "shot-1", provider: "kie", model: "bytedance/seedance-2", stageId: "generate", secret: "drop-me" }],
+          jobs: [{ provider: "attacker" }],
+          gate: { status: "approved" },
+        },
+        issuedAt: "2026-08-08T08:00:00.000Z",
+      },
+    });
+
+    expect(service.command).toHaveBeenCalledWith("project-1", "run-1", {
+      commandId: "cmd-attach",
+      expectedRevision: 2,
+      type: "plan.attach",
+      payload: {
+        artifactId: "artifact-storyboard-v1",
+        bindings: [{ nodeId: "shot-1", provider: "kie", model: "bytedance/seedance-2", stageId: "generate" }],
+      },
+      issuedAt: "2026-08-08T08:00:00.000Z",
+    });
+  });
+});

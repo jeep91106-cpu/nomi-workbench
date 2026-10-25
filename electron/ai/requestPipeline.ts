@@ -1,0 +1,561 @@
+/**
+ * Shared request-building pipeline — the SINGLE source of truth for turning a
+ * (vendor, model, mapping-operation) into a concrete HTTP request.
+ *
+ * Both sides use it:
+ *   - production generation   (electron/runtime.ts :: buildProfileHttpRequest)
+ *   - onboarding test-curl    (electron/ai/onboarding/tools.ts :: execute_test_curl)
+ *
+ * Why this module exists (Plan B, docs/plan/2026-05-31-unify-request-pipeline.md):
+ * these two callers used to each carry their OWN template engine, auth-header
+ * logic, URL joiner and task-id extractor. They drifted, so a mapping that
+ * "passed the wizard test" could still 401/422 in production (the wizard built
+ * the request differently than prod). Unifying here makes test == prod.
+ *
+ * This file is intentionally ELECTRON-FREE so it can be unit-tested offline
+ * (see requestPipeline.test.ts). Do not import `electron` here.
+ */
+
+import type { VendorAuthType } from "../catalog/types";
+
+export type JsonRecord = Record<string, unknown>;
+
+/** How a vendor authenticates. Mirrors the catalog Vendor.authType field. */
+export type AuthType = VendorAuthType;
+
+/** A single HTTP call template (matches the catalog HttpOperation shape). */
+export interface HttpOperationLike {
+  method?: string;
+  path?: string;
+  /** "host-root" = 路径从主机根拼（先剥掉 baseUrl 尾部的 /vN）。见 catalog/types.ts 的 HttpOperation.pathFrom。 */
+  pathFrom?: "host-root";
+  headers?: Record<string, string>;
+  query?: Record<string, unknown>;
+  body?: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// internal primitives (private — not competing with runtime's general utils)
+// ---------------------------------------------------------------------------
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function trimVal(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return "";
+}
+
+function pickString(...values: unknown[]): string {
+  for (const value of values) {
+    const text = trimVal(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+/** Follow a dot-path (`data.resultJson.resultUrls.0`) into an object/array. */
+function followPath(root: unknown, path: string): unknown {
+  if (!path) return undefined;
+  const parts = path.split(".").map((p) => p.trim()).filter(Boolean);
+  let cur: unknown = root;
+  for (const part of parts) {
+    if (Array.isArray(cur)) {
+      const idx = Number(part);
+      if (!Number.isInteger(idx)) return undefined;
+      cur = cur[idx];
+    } else if (isRecord(cur)) {
+      cur = cur[part];
+    } else {
+      return undefined;
+    }
+  }
+  return cur;
+}
+
+// ---------------------------------------------------------------------------
+// template engine — `{{path.into.context}}`
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve one `{{...}}` expression against the context. Returns the raw value
+ * when the entire string is a single expression (so objects/arrays survive),
+ * otherwise interpolates into the string (null/undefined → "").
+ */
+export function renderTemplateString(input: string, context: JsonRecord): unknown {
+  const exact = input.match(/^\{\{\s*([^}]+)\s*\}\}$/);
+  if (exact) return followPath(context, exact[1]);
+  return input.replace(/\{\{\s*([^}]+)\s*\}\}/g, (_match, expr: string) => {
+    const value = followPath(context, expr);
+    if (value == null) return "";
+    return typeof value === "string" ? value : JSON.stringify(value);
+  });
+}
+
+function isExactTemplateString(input: unknown): input is string {
+  return typeof input === "string" && /^\{\{\s*([^}]+)\s*\}\}$/.test(input);
+}
+
+/** Deep-render an arbitrary value (string/array/object), dropping undefined. */
+export function renderTemplateValue(value: unknown, context: JsonRecord): unknown {
+  if (typeof value === "string") return renderTemplateString(value, context);
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => {
+      const rendered = renderTemplateValue(item, context);
+      if (typeof rendered === "undefined") return [];
+      return Array.isArray(rendered) && isExactTemplateString(item) ? rendered : [rendered];
+    });
+  }
+  if (isRecord(value)) {
+    const out: JsonRecord = {};
+    for (const [key, child] of Object.entries(value)) {
+      const rendered = renderTemplateValue(child, context);
+      if (typeof rendered !== "undefined") out[key] = rendered;
+    }
+    return out;
+  }
+  return value;
+}
+
+// ---------------------------------------------------------------------------
+// template context — the variables every mapping template can reference
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the one canonical template context. Both callers feed it the same
+ * shape so `{{...}}` placeholders resolve identically in test and production.
+ *
+ * Placeholders supported:
+ *   {{request.prompt}}, {{request.params.<key>}}
+ *   {{model.modelKey}}, {{model.model_key}}, {{model.model_alias}}
+ *   {{user_api_key}}            (onboarding standard)
+ *   {{account.api_key}}, {{account.account_key}}  (legacy hand-authored)
+ *   {{providerMeta.task_id}}, {{providerMeta.query_id}}
+ */
+export function buildTemplateContext(input: {
+  request: JsonRecord;
+  params: JsonRecord;
+  model: JsonRecord;
+  modelKey: string;
+  apiKey: string;
+  providerMeta?: JsonRecord;
+}): JsonRecord {
+  return {
+    request: { ...input.request, params: input.params },
+    model: {
+      ...input.model,
+      modelKey: input.modelKey,
+      model_key: input.modelKey,
+      model_alias: input.modelKey,
+    },
+    account: { account_key: input.apiKey, api_key: input.apiKey },
+    user_api_key: input.apiKey,
+    providerMeta: input.providerMeta ?? {},
+  };
+}
+
+// ---------------------------------------------------------------------------
+// auth + url
+// ---------------------------------------------------------------------------
+
+/** Auth headers by auth type. `query`/`none` carry no header. */
+/**
+ * 一把 key 怎么放进请求里 —— **整份**说法，不是四个可以各传各的散字段。
+ *
+ * 为什么是一个值对象（2026-09-21，R17「能让编译器拦的别留给人」）：这四个维度原来是
+ * `authHeaders(authType, apiKey, headerName?, scheme?)` 的四个位置参数，于是「少传一个」
+ * 在语法上完全合法。`authScheme` 是 2026-09-18 为 Higgsfield 的 `Authorization: Key id:secret`
+ * 加的第四个维度，写路收全了，读路的三处（接入向导列模型 / 模型发现 / 凭证页测连接）
+ * 谁也没补上最后一个实参——同一把 key 生成能跑、列模型 401，就是群里那句「key 是对的啊」。
+ * 收成一个对象之后，下一个维度加进来时编译器会在**全部**调用点报红。
+ */
+export type VendorAuthSpec = Readonly<{
+  authType: AuthType;
+  /** authType==="x-api-key" 时的头名，缺省 X-API-Key。 */
+  headerName?: string;
+  /** `Authorization` 里 key 前面的方案词，缺省 Bearer。 */
+  scheme?: string;
+  /** authType==="query" 时的参数名，缺省 api_key。 */
+  queryParam?: string;
+}>;
+
+export function authHeaders(auth: VendorAuthSpec, apiKey: string): Record<string, string> {
+  if (!apiKey || auth.authType === "none" || auth.authType === "query") return {};
+  if (auth.authType === "x-api-key") return { [auth.headerName || "X-API-Key"]: apiKey };
+  // 方案词由 vendor.authScheme 声明（见 catalog/types.ts）；缺省 Bearer，故既有供应商零变化。
+  const word = typeof auth.scheme === "string" && auth.scheme.trim() ? auth.scheme.trim() : "Bearer";
+  return { Authorization: `${word} ${apiKey}` };
+}
+
+/** Auth query params (only for authType === "query"). */
+export function authQueryParams(auth: VendorAuthSpec, apiKey: string): Record<string, string> {
+  if (!apiKey || auth.authType !== "query") return {};
+  return { [auth.queryParam || "api_key"]: apiKey };
+}
+
+/**
+ * 剥掉 baseUrl 尾部的版本段（/v1、/v3、/v10…），拿到主机根侧的前缀。
+ * 供 `HttpOperation.pathFrom === "host-root"` 用：厂商原生端点（如火山方舟 /api/v3/…）不在
+ * OpenAI 兼容的 /v1 命名空间下，而中转用户常把地址填成 `https://host/v1`，直接拼会成
+ * `/v1/api/v3/…` 打不中。只剥一层、只剥结尾，其余原样（`https://host/codex/v1` → `https://host/codex`）。
+ */
+export function hostRootBase(baseUrl: string): string {
+  return String(baseUrl || "").trim().replace(/\/+$/, "").replace(/\/v\d+$/i, "");
+}
+
+/** 把 URL/路径切成非空路径段（`https://h/api/v3` → ["api","v3"]；`/api/v3/x` → ["api","v3","x"]）。 */
+function pathSegments(value: string): string[] {
+  const withoutOrigin = value.replace(/^https?:\/\/[^/]+/i, "");
+  return withoutOrigin.split("/").filter(Boolean);
+}
+
+/**
+ * 从主机根拼原生端点路径（`HttpOperation.pathFrom === "host-root"` 唯一入口）。
+ *
+ * 两步：先 `hostRootBase` 剥掉尾部版本段，**再折叠 base 尾部与 path 头部的重叠段**。
+ * 第二步是必需的——`hostRootBase` 只剥一层 `/vN`，遇到火山官方口径的 `https://ark…/api/v3`
+ * 会剥成 `…/api`，`/api` 残留，再拼自带 `/api/v3` 前缀的原生路径就成了 `…/api/api/v3/…`：
+ * 探针把它和「查无此路由」哨兵一比完全同签名 → 判定「这家不提供原生端点」→ 整条原生报文失联，
+ * Seedream 改图被降级成 chat/completions 多模态（它不是聊天模型）、Seedance 图生视频同样降级。
+ * 这条重叠折叠规则与 `joinUrl` 里已有的版本段去重是同一条规则，此处按段泛化。
+ *
+ * | baseUrl | path | 结果 |
+ * |---|---|---|
+ * | `https://ark…volces.com`         | `/api/v3/images/generations` | `https://ark…/api/v3/images/generations` |
+ * | `https://ark…volces.com/api/v3`  | `/api/v3/images/generations` | `https://ark…/api/v3/images/generations` |
+ * | `https://relay.example.com/v1`   | `/api/v3/images/generations` | `https://relay.example.com/api/v3/…` |
+ * | `https://relay.example.com/codex/v1` | `/api/v3/images/generations` | `https://relay.example.com/codex/api/v3/…` |
+ */
+export function hostRootJoin(baseUrl: string, path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  const base = hostRootBase(baseUrl);
+  const baseSegs = pathSegments(base);
+  const pathSegs = pathSegments(path);
+  // 最长的「base 结尾 == path 开头」段重叠，按段边界比对（不做子串比对，免得 /api 误吃 /apixyz）。
+  let overlap = 0;
+  for (let k = Math.min(baseSegs.length, pathSegs.length); k > 0; k -= 1) {
+    if (baseSegs.slice(baseSegs.length - k).every((seg, i) => seg === pathSegs[i])) {
+      overlap = k;
+      break;
+    }
+  }
+  return joinUrl(base, `/${pathSegs.slice(overlap).join("/")}`);
+}
+
+/** Join a (possibly absolute) operation path onto the vendor base URL. */
+export function joinUrl(baseUrl: string, path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  const base = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!base) throw new Error("Base URL missing");
+  const p = path.startsWith("/") ? path : `/${path}`;
+  // Don't double-append when the base already ends with the path (users paste
+  // full URLs like https://api.example.com/v1).
+  if (base.endsWith(p)) return base;
+  // Collapse a duplicate version segment: if base already ends with a version
+  // segment (/v1, /v3, /api/v3, …/codex/v1 …) and the op path starts with /v1/,
+  // drop the path's redundant /v1 so we don't build ".../v1/v1/..." (a 404 at
+  // code-newcli-com, ".../v1/v1/images/generations") or ".../api/v3/v1/...".
+  // SINGLE source of truth — endpoint() in vendorEndpoint.ts delegates here.
+  if (p.startsWith("/v1/") && /\/v\d+$/.test(base)) {
+    return `${base}${p.slice(3)}`;
+  }
+  return `${base}${p}`;
+}
+
+/** Append query params to a URL, skipping null/empty values. */
+export function appendQueryParams(url: string, params: Record<string, unknown>): string {
+  const parsed = new URL(url);
+  for (const [key, value] of Object.entries(params)) {
+    if (!key || value == null) continue;
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      if (item == null || item === "") continue;
+      parsed.searchParams.append(key, String(item));
+    }
+  }
+  return parsed.toString();
+}
+
+function stringifyHeaders(headers: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!isRecord(headers)) return out;
+  for (const [key, value] of Object.entries(headers)) {
+    if (!key || value == null || value === "") continue;
+    out[key] = String(value);
+  }
+  return out;
+}
+
+/** Redact secret-bearing header values for logging/preview. */
+const REQUEST_REDACTED = "«redacted»";
+const SENSITIVE_REQUEST_FIELD = /(?:^|[-_])(?:authorization|auth|api[-_]?key|access[-_]?token|token|secret|password|credential|signature|sig)(?:$|[-_])/i;
+const PUBLIC_REQUEST_HEADERS = new Set(["accept", "content-type", "user-agent"]);
+const publicSystemHeadersByRequest = new WeakMap<Record<string, string>, ReadonlySet<string>>();
+
+export function isSensitiveRequestField(name: string): boolean {
+  return SENSITIVE_REQUEST_FIELD.test(name);
+}
+
+/**
+ * Header names are not a credential contract: gateways accept secrets under
+ * arbitrary names. Only explicitly public, system-generated representation
+ * headers may remain visible in diagnostics and request previews.
+ */
+export function markPublicSystemRequestHeaders<T extends Record<string, string>>(headers: T, names: readonly string[]): T {
+  const publicNames = new Set(
+    names.map((name) => name.trim().toLowerCase()).filter((name) => PUBLIC_REQUEST_HEADERS.has(name)),
+  );
+  if (publicNames.size > 0) publicSystemHeadersByRequest.set(headers, publicNames);
+  return headers;
+}
+
+function isPublicSystemRequestHeader(headers: Record<string, string>, name: string): boolean {
+  return publicSystemHeadersByRequest.get(headers)?.has(name.trim().toLowerCase()) ?? false;
+}
+
+export function sensitiveRequestHeaderValues(headers: Record<string, string>): string[] {
+  return Object.entries(headers)
+    .filter(([name, value]) => Boolean(value) && !isPublicSystemRequestHeader(headers, name))
+    .map(([, value]) => value);
+}
+
+function stringValues(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(stringValues);
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return [String(value)];
+  return [];
+}
+
+/** Exact values that became credentials in this concrete outbound request. */
+export function collectRequestSecretValues(input: {
+  apiKey?: string;
+  headers?: Record<string, string>;
+  authQuery?: Record<string, unknown>;
+  query?: Record<string, unknown>;
+}): string[] {
+  const apiKey = input.apiKey?.trim() ?? "";
+  const values = new Set<string>();
+  if (apiKey) values.add(apiKey);
+  for (const value of sensitiveRequestHeaderValues(input.headers || {})) values.add(value);
+  for (const value of Object.values(input.authQuery || {})) {
+    for (const item of stringValues(value)) if (item) values.add(item);
+  }
+  for (const [name, value] of Object.entries(input.query || {})) {
+    for (const item of stringValues(value)) {
+      if (item && (isSensitiveRequestField(name) || (apiKey && item.includes(apiKey)))) values.add(item);
+    }
+  }
+  return [...values].filter(Boolean).sort((left, right) => right.length - left.length);
+}
+
+/** Raw and wire-encoded forms an upstream can echo after URL serialization. */
+export function requestSecretVariants(secrets: readonly string[]): string[] {
+  const variants = new Set<string>();
+  for (const secret of secrets) {
+    if (!secret) continue;
+    let pending = new Set([secret]);
+    for (let depth = 0; depth < 3; depth += 1) {
+      const next = new Set<string>();
+      for (const value of pending) {
+        variants.add(value);
+        const component = encodeURIComponent(value);
+        const form = new URLSearchParams({ value }).toString().slice("value=".length);
+        variants.add(component);
+        variants.add(form);
+        next.add(component);
+        next.add(form);
+      }
+      pending = next;
+    }
+  }
+  return [...variants].filter(Boolean).sort((left, right) => right.length - left.length);
+}
+
+export function redactRequestSecrets(value: string, secrets: readonly string[], maximumLength = Number.POSITIVE_INFINITY): string {
+  let redacted = value;
+  for (const variant of requestSecretVariants(secrets)) {
+    if (variant.length < 4) {
+      const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      redacted = redacted.replace(new RegExp(`(^|[^A-Za-z0-9])${escaped}(?=$|[^A-Za-z0-9])`, "g"), `$1${REQUEST_REDACTED}`);
+    } else {
+      redacted = redacted.split(variant).join(REQUEST_REDACTED);
+    }
+  }
+  return redacted.slice(0, maximumLength);
+}
+
+export function redactRequestValue<T>(value: T, secrets: readonly string[]): T {
+  if (typeof value === "string") return redactRequestSecrets(value, secrets) as T;
+  if (Array.isArray(value)) return value.map((item) => redactRequestValue(item, secrets)) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      isSensitiveRequestField(key) && typeof item === "string" && item
+        ? REQUEST_REDACTED
+        : redactRequestValue(item, secrets),
+    ])) as T;
+  }
+  return value;
+}
+
+export function redactHeaders(headers: Record<string, string>, secrets: readonly string[] = []): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    out[key] = isPublicSystemRequestHeader(headers, key) ? redactRequestSecrets(value, secrets) : "[redacted]";
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// the request builder — single source of truth
+// ---------------------------------------------------------------------------
+
+export interface BuiltRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  query: Record<string, unknown>;
+  body: unknown;
+  preview: { method: string; url: string; headers: Record<string, string>; body: unknown };
+}
+
+/**
+ * Build a concrete HTTP request from a mapping operation + an already-built
+ * template context. Auth headers are applied first, then mapping headers
+ * override them (so an explicit mapping header always wins — and an empty
+ * `Authorization: Bearer {{user_api_key}}` can no longer silently beat the
+ * correct auth header, because the context now always carries user_api_key).
+ */
+export function buildHttpRequest(input: {
+  baseUrl: string;
+  authType: AuthType;
+  authHeaderName?: string;
+  /** Authorization 方案词（缺省 Bearer）；见 catalog/types.ts 的 Vendor.authScheme。 */
+  authScheme?: string | null;
+  authQueryParam?: string;
+  apiKey: string;
+  context: JsonRecord;
+  operation: HttpOperationLike;
+  /**
+   * Relay/proxy-gateway custom auth headers (vendor.meta.extraHeaders). Applied
+   * as a base layer alongside standard auth — an explicit mapping header of the
+   * same name still wins. This is what makes the image/video profile path carry
+   * the same gateway headers the text/AI-SDK path already injects.
+   */
+  extraHeaders?: Record<string, string>;
+}): BuiltRequest {
+  const { context, operation } = input;
+  // 这条出站路的整份鉴权说法，一处构造、头与 query 同吃（不许一个维度只到其中一边）。
+  const auth: VendorAuthSpec = {
+    authType: input.authType,
+    ...(input.authHeaderName ? { headerName: input.authHeaderName } : {}),
+    ...(input.authScheme ? { scheme: input.authScheme } : {}),
+    ...(input.authQueryParam ? { queryParam: input.authQueryParam } : {}),
+  };
+  const method = (pickString(operation.method) || "POST").toUpperCase();
+  const renderedPath = String(renderTemplateValue(operation.path || "/v1/tasks", context) || "/v1/tasks");
+  // 原生端点声明 pathFrom:"host-root" → 走 hostRootJoin（剥版本段 + 折叠 base/path 重叠段）。
+  // 缺省仍从 baseUrl 拼，既有档案零影响。
+  const url =
+    operation.pathFrom === "host-root" ? hostRootJoin(input.baseUrl, renderedPath) : joinUrl(input.baseUrl, renderedPath);
+
+  const renderedHeaders = stringifyHeaders(renderTemplateValue(operation.headers, context));
+  const headers: Record<string, string> = {
+    ...authHeaders(auth, input.apiKey),
+    ...(input.extraHeaders || {}),
+    ...renderedHeaders,
+  };
+
+  const body = renderTemplateValue(operation.body, context);
+  if (method !== "GET" && method !== "HEAD" && body != null && !Object.keys(headers).some((k) => k.toLowerCase() === "content-type")) {
+    headers["Content-Type"] = "application/json";
+    markPublicSystemRequestHeaders(headers, ["Content-Type"]);
+  }
+
+  const query = isRecord(renderTemplateValue(operation.query, context))
+    ? (renderTemplateValue(operation.query, context) as JsonRecord)
+    : {};
+  const outboundAuthQuery = authQueryParams(auth, input.apiKey);
+  const outboundQuery = { ...outboundAuthQuery, ...query };
+  const requestSecrets = collectRequestSecretValues({
+    apiKey: input.apiKey,
+    headers,
+    authQuery: outboundAuthQuery,
+    query: outboundQuery,
+  });
+
+  return {
+    method,
+    url,
+    headers,
+    query,
+    body,
+    preview: {
+      method,
+      url: redactRequestSecrets(appendQueryParams(url, outboundQuery), requestSecrets),
+      headers: redactHeaders(headers, requestSecrets),
+      body: redactRequestValue(body, requestSecrets),
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// response reading shared by both callers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the upstream task id from a create/query response. Probes (in order):
+ *   - an explicit dot-path (from response_mapping.task_id) when provided
+ *   - top-level id/taskId/task_id/jobId
+ *   - one level into a `data` envelope (kie: data.taskId) — the very common
+ *     "{ code, msg, data: {...} }" wrapper.
+ *
+ * The data-envelope probe is what makes async kie-style APIs poll the RIGHT
+ * id instead of a locally-fabricated fallback (which yields "recordInfo is null").
+ */
+export function extractTaskId(raw: unknown, explicitPath?: string): string {
+  if (!isRecord(raw)) return "";
+  if (explicitPath) {
+    const v = followPath(raw, explicitPath);
+    if (typeof v === "string" || typeof v === "number") return String(v);
+  }
+  const data = isRecord(raw.data) ? raw.data : undefined;
+  return pickString(
+    raw.id,
+    raw.taskId,
+    raw.task_id,
+    raw.jobId,
+    data?.id,
+    data?.taskId,
+    data?.task_id,
+    data?.jobId,
+  );
+}
+
+/**
+ * Many providers return HTTP 200 with a logical-error envelope instead of a real
+ * error status. Returns the logical error code if detected, else null. Two shapes:
+ *   - kie.ai / Java-Spring: `{ code: 4xx/5xx, msg: "..." }`
+ *   - RunningHub: `{ taskId:"", errorCode:"1014", errorMessage:"Access Denied..." }`
+ *     —— errorCode 非 0/空即逻辑错（2026-06-30 真机实测：1014=非企业共享key被拒、1007=缺参、1001=路径错）。
+ *     不限 <600（RunningHub 用 1xxx 业务码），否则非企业 key 的 1014 会被漏判 → 伪造本地 taskId 轮询成谜之失败。
+ */
+export function looksLikeLogicalError(body: unknown, successCodes: readonly (number | string)[] = []): number | string | null {
+  if (!isRecord(body)) return null;
+  const code = body.code;
+  // A declared mapping owns its exact code vocabulary.  Keep string codes
+  // distinct: APIMart's numeric 0/200 contract does not make "0" a success.
+  if (successCodes.length > 0 && (typeof code === "number" || typeof code === "string")) {
+    return successCodes.includes(code) ? null : code;
+  }
+  if (typeof code === "number" && code >= 400 && code < 600) return code;
+  // 与下行 errorCode 分支同口径 /^\d+$/：4 位业务码（如 "1004"）也是逻辑错，3 位正则会漏判成成功。
+  if (typeof code === "string" && /^\d+$/.test(code) && Number(code) >= 400) return Number(code);
+  // RunningHub 风格：errorCode 存在且非「成功」值（0 / "0" / 空）即逻辑错。
+  const ec = body.errorCode;
+  if (successCodes.length > 0) return null;
+  if (typeof ec === "number" && ec !== 0) return ec;
+  if (typeof ec === "string" && ec.trim() !== "" && ec.trim() !== "0" && /^\d+$/.test(ec.trim())) return Number(ec);
+  return null;
+}

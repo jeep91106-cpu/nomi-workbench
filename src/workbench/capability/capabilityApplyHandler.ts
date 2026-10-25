@@ -1,0 +1,703 @@
+import type { SpendQuoteLine } from '../../../electron/shared/contracts/spendQuote'
+import { useGenerationCanvasStore } from '../generationCanvas/store/generationCanvasStore'
+import {
+  MCP_PROJECT_ADDRESSABLE_CAPABILITY_OPS,
+  MCP_REALTIME_SURFACE_CAPABILITY_OPS,
+  capabilityProjectBindingError,
+} from './capabilityProjectBinding'
+import { useSpendConfirmStore } from '../generationCanvas/spend/spendConfirm'
+import { peekCatalogModelOptions } from '../../config/modelCatalogCache'
+import { confirmGenerationGateForAgent, type GenerationGateConfirmPayload } from './generationGateConfirm'
+import { getDesktopBridge } from '../../desktop/bridge'
+import i18n from '../../i18n'
+import { runStoryboardPlanner } from '../generationCanvas/agent/runStoryboardPlanner'
+import { runDirectionPlanner } from '../generationCanvas/agent/runDirectionPlanner'
+import { productionScriptSessionKey } from '../ai/agentSessionKey'
+import { runSingleShotAgent } from '../ai/agentLoopMode'
+import { useWorkbenchStore } from '../workbenchStore'
+import { arrangeStoryboardToTimeline } from '../generationCanvas/agent/sendStoryboardToTimeline'
+import { createTimelineExportManifest } from '../export/exportApi'
+import { exportTimelineToWebm } from '../export/timelineWebmExport'
+import { verifyShotsAndReport, isShotVerifyEnabled } from '../generationCanvas/agent/shotVerifyStore'
+import { assertDraftFilmReady, draftFilmTimelineFromState } from '../preview/timelineSubtitleTransitionContract'
+import { storyboardPlanToCreateNodesArgs } from '../generationCanvas/agent/storyboardPlan'
+import { projectPlanShotsOntoCreatedNodes } from '../creation/storyboard/exec/storyboardProjection'
+import { parseStoryboardPlan } from '../generationCanvas/agent/storyboardPlanSchema'
+import { resolveStoryboardImageDefault, resolveStoryboardVideoDefault } from '../generationCanvas/agent/availableModels'
+import { applyCanvasToolCall, resolveCanvasToolNodeId } from '../generationCanvas/agent/applyCanvasToolCall'
+import { readCanvasReadSource } from '../generationCanvas/agent/generationCanvasTools'
+import { captureCanvasReadResult } from '../generationCanvas/agent/canvasReadResultSeal'
+import {
+  captureCurrentProjectCanvasReadSurfaceBinding,
+  isProjectExecutionContextCurrent,
+  withProjectAction,
+  sealCurrentProjectCanvasReadSnapshot,
+  type ProjectExecutionContext,
+} from '../project/projectCanvasReadSurface'
+import { getDocumentSessionPort } from '../project/documentSessionPort'
+import {
+  SurfacePortWireError,
+  type CapturedCanvasReadSnapshotHandleWire,
+} from '../../../electron/shared/surfacePortBinding'
+import { handleMultiShotCanvasLandingOp } from './multiShotCanvasLanding'
+import { isCanvasDocument } from '../../../electron/shared/canvas/externalCanvasWrite'
+import { executeTimelineReadTarget, executeTimelineWriteTarget } from '../timeline/agent/timelineCapabilityTarget'
+import { executeAssetReadTarget, executeExportReadTarget } from '../timeline/agent/phase4CapabilityTargets'
+import { executeCanonicalCanvasPlanPatch } from './canonicalCanvasPlanPatch'
+import { handleMcpHostSurfaceOp } from './mcpHostSurfaceOps'
+import { presentStoryboard } from './storyboardPresent'
+import { directorPreviewBlocksOp } from './directorPreviewBlocksOp'
+import { extendAgentStoryboardDesign, patchAgentStoryboardDesign, upsertAgentStoryboardDesign } from '../creation/storyboard/agentStoryboardDesign'
+import { confirmCredentialProbeSpend, spendModelLine } from './credentialProbeSpendCard'
+
+// 能力核 A 模式实时桥 · 渲染层处理器。
+// 主进程把外部 MCP 的画布读/写/付费确认转发到这里（只在该项目正打开时路由），处理后回结果。单一真相源：画布读写复用 store 现成动作（readDocumentSnapshot / applyExternalGraph），
+// 付费确认复用全仓唯一的 useSpendConfirmStore（不另造并行 UI，P1）。
+
+type SpendConfirmPayload = {
+  projectId?: string
+  projectName?: string
+  nodeId?: string
+  intent?: string
+  vendor?: string
+  modelKey?: string
+  prompt?: string
+  /** 主进程带上：这次确认还会换来「本会话该项目后续生成免问」→ 卡上多写一句授权范围。 */
+  quote?: SpendQuoteLine
+  /**
+   * 这一张卡覆盖几次付费调用（批量确认）。>1 时卡上必须显示——用户点的是「这一批」，
+   * 只给一个总价，他无从知道自己刚批掉的是 1 次还是 13 次。
+   */
+  callCount?: number
+  /** 一次动作分几条腿（拆解 = 读图 + 转写）：给了就每条腿一行，取代单独那一行「模型」。 */
+  legs?: ReadonlyArray<{ role: 'vision' | 'transcribe'; vendor: string; modelKey: string }>
+}
+
+/** 卡上一条腿的模型名：目录里有就用显示名（「Gemini 3.5 Flash · APIMart」），没有就退回原始身份，绝不编一个。 */
+function legModelLabel(leg: { role: 'vision' | 'transcribe'; vendor: string; modelKey: string }): string {
+  const options = leg.role === 'vision' ? peekCatalogModelOptions('text') : peekCatalogModelOptions('audio', 'transcribe')
+  const match = options?.find((option) => option.vendor === leg.vendor && option.modelKey === leg.modelKey)
+  return match ? (match.vendorName ? `${match.label} · ${match.vendorName}` : match.label) : spendModelLine(leg.vendor, leg.modelKey)
+}
+
+// 方案门（Phase B）：外部 agent 批量落节点前的确认。projectId 由主进程网关带上（可能非当前项目）。
+type PlanConfirmPayload = {
+  projectId?: string
+  nodeCount?: number
+  titles?: string[]
+}
+
+function describeIntent(intent: string | undefined): string {
+  const normalized = String(intent || '')
+  if (normalized === 'image' || normalized === 'video' || normalized === 'audio' || normalized === 'text') {
+    return i18n.t(`runtime.capability.intent.${normalized}`)
+  }
+  return i18n.t('runtime.capability.intent.fallback')
+}
+
+async function runProductionTextPlanner(input: {
+  projectId?: string
+  goal?: string
+  instruction?: string
+  source?: string
+  outputFormat?: 'script' | 'storyboard'
+}): Promise<string> {
+  const projectId = input.projectId || ''
+  const prompt =
+    input.outputFormat === 'storyboard'
+      ? [
+          '你是分镜规划师。请根据下面的原分镜方案和修改要求，输出一份完整、可执行的 StoryboardPlan JSON。',
+          '只输出 JSON，不要 Markdown、解释或代码围栏。必须包含 title、anchors、shots；每个 shot 必须包含 index、durationSec、anchorIds、prompt。',
+          '允许的 shot 字段：shotId、shotKind(image|video)、durationSec、anchorIds、prompt、modelKey、modelVendor、modeId、params、ffDesc、motionDesc、variationType(large|medium|small)、camIdx、continuity、keyframe。',
+          'modelKey 与 modelVendor 是同一个模型身份的两半：原样保留就两个都保留；改 modelKey 必须同时给出新模型的 modelVendor，给不出就两个都删掉（交给默认模型），绝不能只改其中一个。',
+          `修改要求：${input.instruction || '保持原方案，只修正明显问题。'}`,
+          '原分镜方案：',
+          input.source || '',
+        ].join('\n')
+      : input.instruction
+        ? [
+            '你是短视频编剧。请在不改变事实的前提下，按修改要求改写下面的稿件。',
+            `修改要求：${input.instruction}`,
+            '原稿：',
+            input.source || input.goal || '',
+            '只输出改写后的完整稿件，不要解释。',
+          ].join('\n')
+        : [
+            '你是短视频编剧。请把下面的创作简报写成一份可审阅的完整初稿。',
+            '要求：有明确开场、发展、转折和结尾；每镜写清画面、动作、声音/对白和字幕；不要编造简报没有的产品事实。',
+            '创作简报：',
+            input.goal || '',
+            '只输出稿件正文，不要解释。',
+          ].join('\n')
+  // Ephemeral single-shot text planning never clears a UI conversation.
+  const response = await runSingleShotAgent({
+    featureKey: productionScriptSessionKey(projectId),
+    prompt,
+    displayPrompt: input.instruction ? '修改制作稿件' : '生成制作剧本',
+    ...(projectId ? { projectId } : {}),
+  })
+  const text = response.text?.trim()
+  if (!text) throw new Error('剧本规划没有返回可审阅内容')
+  return text
+}
+
+/**
+ * 主进程发起的付费确认：弹全仓唯一的确认对话框，真人点了才回 confirmed——卡不超时。
+ *
+ * 两种来源共用这一张卡（P1 不造第二张）：
+ *   · 外部 agent（MCP）驱动的生成 → 机器人图标 + 「AI 助手想生成…」；
+ *   · 用户自己在画布上点的那一下（视频拆解）→ 金币图标 + 说清「这一批要发几次调用」。
+ */
+async function confirmSpendFromMainProcess(info: SpendConfirmPayload): Promise<{ confirmed: boolean }> {
+  // 凭据验证（T-MO-10）：它不挂在任何节点上（用户此刻在接入页，不在画布），措辞与明细
+  // 另有一家（`credentialProbeSpendCard.ts`），但弹的仍是全仓唯一那张卡。
+  if (info.intent === 'credential-probe') return confirmCredentialProbeSpend(info)
+  const store = useGenerationCanvasStore.getState()
+  const node = store.nodes.find((item) => item.id === info.nodeId)
+  const nodeLabel =
+    node?.title?.trim() ||
+    (typeof node?.prompt === 'string' && node.prompt.trim()
+      ? node.prompt.trim().slice(0, 24)
+      : i18n.t('runtime.capability.newNode'))
+  // 参考图门 vs 生成门（Phase B）：定妆/场景卡（meta.referenceSheet）= 参考图门（相机图标+措辞），否则生成门。
+  const isReference = Boolean(node?.meta && (node.meta as Record<string, unknown>).referenceSheet === true)
+  const promptPreview = typeof info.prompt === 'string' && info.prompt.trim() ? info.prompt.trim().slice(0, 60) : ''
+  const projectName = typeof info.projectName === 'string' ? info.projectName.trim() : ''
+  // 拆解是**用户自己点的**那一下，不是 AI 代他花钱：金币图标、说清这一批要发几次调用。
+  const isDeconstruct = info.intent === 'deconstruct'
+  const callCount = typeof info.callCount === 'number' && info.callCount > 1 ? info.callCount : 0
+  const ok = await useSpendConfirmStore.getState().requestConfirm({
+    kind: isReference ? 'reference' : 'generation',
+    title: isDeconstruct
+      ? i18n.t('runtime.capability.deconstructTitle')
+      : isReference
+        ? i18n.t('runtime.capability.referenceTitle')
+        : i18n.t('runtime.capability.spendTitle', { intent: describeIntent(info.intent) }),
+    message: [
+      isDeconstruct
+        ? i18n.t('runtime.capability.deconstructMessage')
+        : promptPreview
+          ? i18n.t('runtime.capability.spendMessageWithPrompt', {
+              prompt: `${promptPreview}${info.prompt && info.prompt.length > 60 ? '…' : ''}`,
+            })
+          : i18n.t('runtime.capability.spendMessage'),
+    ].join('\n'),
+    confirmLabel: i18n.t(isDeconstruct ? 'runtime.capability.confirmDeconstruct' : 'runtime.capability.confirmGenerate'),
+    source: isDeconstruct ? 'user' : 'agent',
+    // 不印金额行（2026-09-26 用户拍板：官方额度上线前隐藏价格维度）。
+    details: [
+      // 批量确认必须报出「这一下批掉几次调用」，用户才看得出批量有多大。
+      ...(callCount ? [{ label: i18n.t('runtime.capability.callCount'), value: String(callCount) }] : []),
+      // 项目行放第一位：用户可能不在这个项目里，先让他知道花在哪个项目。
+      ...(projectName ? [{ label: i18n.t('runtime.capability.project'), value: projectName }] : []),
+      { label: i18n.t('runtime.capability.node'), value: nodeLabel },
+      ...(info.legs?.length
+        ? info.legs.map((leg) => ({ label: i18n.t(leg.role === 'vision' ? 'runtime.capability.visionModelLine' : 'runtime.capability.transcribeModelLine'), value: legModelLabel(leg) }))
+        : [{ label: i18n.t('runtime.capability.model'), value: spendModelLine(info.vendor, info.modelKey) }]),
+      ...(isDeconstruct ? [] : [{ label: i18n.t('runtime.capability.output'), value: describeIntent(info.intent) }]),
+    ],
+  })
+  return { confirmed: Boolean(ok) }
+}
+
+/** 外部 MCP 方案门（Phase B）：agent 要往画布落一套节点（≥2）前弹确认卡（免费可撤），复用同一漏斗（P1）。 */
+async function confirmPlanForAgent(info: PlanConfirmPayload): Promise<{ confirmed: boolean }> {
+  const count = typeof info.nodeCount === 'number' ? info.nodeCount : 0
+  const titles = Array.isArray(info.titles) ? info.titles.filter((t) => typeof t === 'string' && t.trim()) : []
+  const preview = titles.slice(0, 5).join('、') + (titles.length > 5 ? '…' : '')
+  const projectName = (() => {
+    if (!info.projectId) return ''
+    const active = withProjectAction((project) => project.binding.projectId) ?? null
+    return info.projectId === active ? '' : info.projectId // 非当前项目才显 id 提示（当前项目无需重复）
+  })()
+  const ok = await useSpendConfirmStore.getState().requestConfirm({
+    kind: 'plan',
+    title: i18n.t('runtime.capability.planTitle'),
+    message: i18n.t('runtime.capability.planMessage', { count }),
+    confirmLabel: i18n.t('runtime.capability.planConfirm'),
+    source: 'agent',
+    details: [
+      ...(projectName ? [{ label: i18n.t('runtime.capability.project'), value: projectName }] : []),
+      {
+        label: i18n.t('runtime.capability.planNodeCount'),
+        value: i18n.t('runtime.capability.planNodeCountValue', { count }),
+      },
+      ...(preview ? [{ label: i18n.t('runtime.capability.planIncludes'), value: preview }] : []),
+    ],
+  })
+  return { confirmed: Boolean(ok) }
+}
+
+/** 从 content 偏差的 `actual`（人话「第 N 档」）抠回 1-5 档分数；抠不出给 undefined。 */
+function scoreFromDeviationActual(actual: unknown): number | undefined {
+  const match = typeof actual === 'string' ? actual.match(/(\d+)/) : null
+  if (!match) return undefined
+  const n = Number(match[1])
+  return Number.isFinite(n) ? Math.max(1, Math.min(5, n)) : undefined
+}
+
+/**
+ * W1.5 路径②审片：production run 的 qa 阶段让渲染层对本次生成镜头判分。
+ * 复用**现成的** verifyShotsAndReport（判分+对账卡+回灌闭环），
+ * 这里只做参数适配（run 的镜头节点 id → 它的入参）+ 将本次调用返回的判决塑形回传。
+ * 判决 = content 偏差（每条 kind:'content' 回指 shotNodeId + 维度 field + 档位 actual + reason）；
+ * 被审但无偏差的镜头 = 过检。verify 关闭 / 无镜头 → skipped（driver 据此落「审片跳过」）。
+ */
+async function verifyShotsForProduction(shotNodeIds: readonly string[], loaded: ProjectExecutionContext | null): Promise<unknown> {
+  if (!isShotVerifyEnabled()) return { skipped: true, skipReason: '画面审片已在设置中关闭' }
+  if (!loaded) return { skipped: true, skipReason: '当前项目里找不到本次生成的镜头节点' }
+  const knownNodeIds = new Set(useGenerationCanvasStore.getState().nodes.map((node) => node.id))
+  const reviewedShotIds = shotNodeIds.filter((id) => knownNodeIds.has(id))
+  if (reviewedShotIds.length === 0) return { skipped: true, skipReason: '当前项目里找不到本次生成的镜头节点' }
+  // 现成闭环：内部 gather → 判分 → 写 shotVerify store。直接使用「本次」返回值，不能在 await
+  // 后读全局 store——同项目另一轮审片可能已经后发先至，读到的会是另一次结果。
+  const deviations = await verifyShotsAndReport(reviewedShotIds, loaded)
+  const flaggedByShot = new Map<string, Array<{ dimensionName?: string; score?: number; reason?: string }>>()
+  for (const deviation of deviations) {
+    if (deviation.kind !== 'content' || !deviation.shotNodeId) continue
+    const list = flaggedByShot.get(deviation.shotNodeId) ?? []
+    list.push({
+      dimensionName: typeof deviation.field === 'string' ? deviation.field : undefined,
+      score: scoreFromDeviationActual(deviation.actual),
+      reason: typeof deviation.reason === 'string' ? deviation.reason : undefined,
+    })
+    flaggedByShot.set(deviation.shotNodeId, list)
+  }
+  const nodesById = new Map(useGenerationCanvasStore.getState().nodes.map((node) => [node.id, node]))
+  const verdicts = reviewedShotIds.map((shotNodeId) => {
+    const flagged = flaggedByShot.get(shotNodeId) ?? []
+    const title = (nodesById.get(shotNodeId)?.title || '').trim()
+    return {
+      shotNodeId,
+      passed: flagged.length === 0,
+      ...(title ? { shotTitle: title } : {}),
+      ...(flagged.length ? { flagged } : {}),
+    }
+  })
+  return { reviewedShotIds, verdicts }
+}
+
+/** 处理一条主进程转发来的能力操作。未知操作抛错（主进程会把错误透传给 agent）。 */
+export async function handleCapabilityApply(op: string, payload: unknown): Promise<unknown> {
+  const data = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
+  const projectId = typeof data.projectId === 'string' ? data.projectId : ''
+  // 处理这条能力操作即动作起点：签发此刻打开的项目；实时面的项目闸与之后的写入只认它。
+  const loaded = withProjectAction((project) => project) ?? null
+  const activeId = loaded ? loaded.binding.projectId : null
+  // 画布读写**只能**作用于当前打开的项目（动 store → 必须是活动项目，否则串台）；目标≠活动 → 拒。
+  // 确认门（spend.confirm / plan.confirm）不在此限：AI 想在「非当前项目」生成/落方案时也弹全局卡，
+  // 卡里标明项目名，确认后走盘落地（不动非活动 store）。这正是治静默黑洞的关键放开。
+  //
+  // 项目身份按**面**分流（定义与理由住在 capabilityProjectBinding.ts）：
+  // · 可寻址面（asset.read / export.read）——底下按 projectId 直接寻址主进程 store，项目开不开着都能答，
+  //   所以完全豁免本闸，lease 的 projectId 一路往下传（这正是 MCP 宿主「改不了自己建的项目」的根因）。
+  // · 实时面（timeline.read / timeline.write）——真相在打开的那个项目的 store 里，
+  //   **没打开任何项目也算不匹配**（旧闸在这种情况放行，然后适配器抛没有下一步的 project_scope_required）。
+  // · 其余 op 维持原来的「目标≠活动 → 拒」，只是错误换成了会点名的那一句。
+  if (!MCP_PROJECT_ADDRESSABLE_CAPABILITY_OPS.has(op) && op !== 'spend.confirm' && op !== 'plan.confirm' && projectId) {
+    const mismatched = MCP_REALTIME_SURFACE_CAPABILITY_OPS.has(op)
+      ? projectId !== (activeId ?? '')
+      : Boolean(activeId) && projectId !== activeId
+    if (mismatched) throw capabilityProjectBindingError(projectId, activeId)
+  }
+  const plannerSnapshot =
+    op === 'production.plan-storyboard'
+      ? captureCanvasReadResult({
+          ...readCanvasReadSource(),
+          // Production planning is document-scoped. A transient UI selection
+          // must not make the prompt and the main-sealed read target disagree.
+          selectedNodeIds: [],
+        })
+      : null
+  const plannerFeatureKey = `nomi:production-planner:${projectId || 'local'}:${typeof data.runId === 'string' ? data.runId : 'unbound'}:${typeof data.operationId === 'string' ? data.operationId : op}`
+  let plannerCapturedCanvasReadSnapshot: CapturedCanvasReadSnapshotHandleWire | null = null
+  if (plannerSnapshot) {
+    const plannerBinding = captureCurrentProjectCanvasReadSurfaceBinding()
+    if (!plannerBinding) throw new SurfacePortWireError('surface_port_unavailable')
+    // This is production submission's first await. Main seals A's exact safe
+    // bytes before unrelated landing work can yield and the UI can switch to B.
+    plannerCapturedCanvasReadSnapshot = await sealCurrentProjectCanvasReadSnapshot(plannerBinding, plannerSnapshot)
+  }
+
+  // P4 S5 画布落地（materialize-shots：建占位 + 每一镜的运行状态 / 结果）——受上面的活动项目守卫约束（只动当前项目 store），
+  // 落点住在 multiShotCanvasLanding（保持本 handler 精简）。未处理返回 null → 继续走下方 switch。
+  const landed = await handleMultiShotCanvasLandingOp(op, data)
+  if (landed !== null) return landed
+  if (op === 'storyboard.present') return presentStoryboard(data)
+  if (op === 'director.preview-blocks') return directorPreviewBlocksOp(data)
+  if (op === 'storyboard.upsert-design') return upsertAgentStoryboardDesign(data)
+  if (op === 'storyboard.patch-design') return patchAgentStoryboardDesign(data)
+  if (op === 'storyboard.extend-design') return extendAgentStoryboardDesign(data)
+
+  // 外部 MCP 宿主触发的纯渲染层副作用（打开凭据页 / 宿主配置已修复提示），落点住在 mcpHostSurfaceOps。
+  const hostSurface = handleMcpHostSurfaceOp(op, data)
+  if (hostSurface !== null) return hostSurface
+
+  switch (op) {
+    case 'document.write': {
+      // 文稿端口由项目会话层 owner 提供（基线永远在，编辑器挂载时是增强版），这里不再探「有没有编辑器」。
+      const tools = getDocumentSessionPort()
+      const operation = data.operation === 'insert' || data.operation === 'replace' || data.operation === 'append'
+        ? data.operation
+        : null
+      const content = typeof data.content === 'string' ? data.content : ''
+      const documentId = useWorkbenchStore.getState().activeDocumentId
+      if (!operation || !content || !documentId) {
+        throw new SurfacePortWireError('surface_port_unavailable')
+      }
+      const current = tools.readState()
+      return tools.applyDocumentWrite({
+        operation,
+        content,
+        target: { kind: 'document', documentId, anchor: current.anchor },
+        preconditions: { document: { revision: current.revision, contentHash: current.contentHash } },
+      })
+    }
+    case 'canvas.write':
+      return executeCanonicalCanvasPlanPatch({
+        projectId,
+        input: data.input,
+        receiptProposalId: typeof data.receiptProposalId === 'string' ? data.receiptProposalId : 'mcp-canvas-plan:renderer',
+        approvalId: typeof data.approvalId === 'string' ? data.approvalId : 'mcp-canvas-plan:renderer',
+        ...(typeof data.actionHash === 'string' ? { actionHash: data.actionHash } : {}),
+        loaded,
+      })
+    case 'canvas.read-doc':
+      return useGenerationCanvasStore.getState().readDocumentSnapshot()
+    case 'canvas.apply': {
+      // 外部写入只改它自己改了的东西：画布写边界的统一提交口按它读到的那份（base）三方合并到此刻的画布，事实层以此刻的为准。
+      if (!isCanvasDocument(data.snapshot) || !isCanvasDocument(data.base)) throw new SurfacePortWireError('capability_input_invalid')
+      const restoredEdgeIds = Array.isArray(data.restoredEdgeIds) ? data.restoredEdgeIds.filter((id): id is string => typeof id === 'string') : undefined
+      useGenerationCanvasStore.getState().applyExternalGraph({ base: data.base, next: data.snapshot, ...(restoredEdgeIds ? { restoredEdgeIds } : {}) })
+      return { ok: true }
+    }
+    case 'spend.confirm':
+      return confirmSpendFromMainProcess(data as SpendConfirmPayload)
+    case 'generation.gate.confirm':
+      return confirmGenerationGateForAgent(data as GenerationGateConfirmPayload)
+    case 'plan.confirm':
+      return confirmPlanForAgent(data as PlanConfirmPayload)
+    case 'timeline.read': {
+      // 阶段 5a：`operation` **就是**语义动作名（`read_timeline` / `inspect_timeline_range`）。
+      // 这里原本有一条 `'range' → inspect_timeline_range` 的反向映射，它存在的唯一理由是
+      // 对外 MCP 曾经自带一套动作词表（`read` / `range`）。两个 profile 同源之后那套词表
+      // 没有了，反向映射也就没有了——少一处「外部说的名字在 Nomi 日志里搜不到」的地方。
+      return executeTimelineReadTarget(
+        data.operation === 'inspect_timeline_range'
+          ? {
+              operation: 'inspect_timeline_range',
+              startFrame: data.startFrame,
+              endFrame: data.endFrame,
+            } as Parameters<typeof executeTimelineReadTarget>[0]
+          : { operation: 'read_timeline' },
+      )
+    }
+    case 'timeline.write': {
+      if (data.operation === 'preview') {
+        const plan = data.plan && typeof data.plan === 'object' && !Array.isArray(data.plan) ? data.plan as Record<string, unknown> : {}
+        return executeTimelineReadTarget({ operation: 'propose_edit_plan', ...plan } as Parameters<typeof executeTimelineReadTarget>[0])
+      }
+      const signal = new AbortController().signal
+      const plan = data.plan && typeof data.plan === 'object' && !Array.isArray(data.plan) ? data.plan as Record<string, unknown> : {}
+      const input = data.operation === 'undo'
+        ? { operation: 'undo_timeline_edit', undoToken: data.undoToken, expectedRevision: data.expectedRevision, ...(typeof data.reason === 'string' ? { reason: data.reason } : {}) }
+        : { operation: 'apply_edit_plan', ...plan }
+      const revision = data.operation === 'undo' && typeof data.expectedRevision === 'string'
+        ? data.expectedRevision
+        : typeof plan.baseRevision === 'string' ? plan.baseRevision : ''
+      return executeTimelineWriteTarget({
+        projectId: projectId || activeId || '',
+        input: input as Parameters<typeof executeTimelineWriteTarget>[0]['input'],
+        target: { kind: 'timeline', clipIds: [] },
+        preconditions: { timeline: { revision } },
+        receiptProposalId: typeof data.receiptProposalId === 'string' ? data.receiptProposalId : 'mcp-edit:renderer',
+        approvalId: typeof data.approvalId === 'string' ? data.approvalId : 'mcp-host:renderer',
+        actionHash: typeof data.actionHash === 'string' ? data.actionHash : 'mcp-action:renderer',
+        signal,
+        assertCurrent: () => { if (!loaded || !isProjectExecutionContextCurrent(loaded)) throw new SurfacePortWireError('surface_port_stale') },
+      })
+    }
+    case 'layout.read': {
+      const layout = useWorkbenchStore.getState().editingPanelLayout
+      return { operation: 'read_layout', ok: true, layout }
+    }
+    case 'layout.write': {
+      const next = data.layout && typeof data.layout === 'object' && !Array.isArray(data.layout)
+        ? data.layout as Parameters<ReturnType<typeof useWorkbenchStore.getState>['setEditingPanelLayout']>[0]
+        : null
+      if (!next) throw new SurfacePortWireError('capability_input_invalid')
+      const store = useWorkbenchStore.getState()
+      const previous = store.editingPanelLayout
+      store.setEditingPanelLayout(next)
+      return { operation: 'write_layout', ok: true, layout: useWorkbenchStore.getState().editingPanelLayout, receipt: `布局已更新 · ⌘Z 可撤销`, undoToken: `layout:${Date.now()}:${previous.preset}` }
+    }
+    case 'asset.read': {
+      // 载荷是**传输形状**（leaseHandle / projectId / operation:'list'…），语义 schema 是 strict 的：
+      // 整包 spread 会把 operation 覆盖回 'list'、还带进 leaseHandle/projectId，两条都直接
+      // capability_input_invalid（真宿主旅程当场撞出来的）。所以按面逐字段搭语义输入。
+      // 阶段 5a：`operation` **就是**语义动作名。这里原本还有一条
+      // `list/get/inspect/source_range/waveform → search_media/…` 的反向映射链，
+      // 与 MCP 侧 `parseCall` 里那条三元表达式是同一张手写表的两半。两边同源之后两半一起没了。
+      const assetId = typeof data.assetId === 'string' ? data.assetId : ''
+      const input = data.operation === 'get_media' || data.operation === 'inspect_media'
+        ? { operation: data.operation, assetId }
+        : data.operation === 'inspect_source_range'
+          ? { operation: 'inspect_source_range', assetId, startFrame: data.startFrame, endFrame: data.endFrame }
+          : data.operation === 'read_waveform'
+            ? {
+                operation: 'read_waveform',
+                assetId,
+                ...(data.startSeconds === undefined ? {} : { startSeconds: data.startSeconds }),
+                ...(data.endSeconds === undefined ? {} : { endSeconds: data.endSeconds }),
+                ...(data.buckets === undefined ? {} : { buckets: data.buckets }),
+              }
+            : {
+                operation: 'search_media',
+                query: typeof data.query === 'string' ? data.query : '',
+                ...(Array.isArray(data.kinds) ? { kinds: data.kinds } : {}),
+                ...(data.limit === undefined ? {} : { limit: data.limit }),
+              }
+      return executeAssetReadTarget({
+        projectId: projectId || activeId || '',
+        input,
+        target: { kind: 'asset', assetIds: assetId ? [assetId] : [] },
+      })
+    }
+    case 'export.read': {
+      const operation = data.operation === 'verify' ? 'verify_render' : 'inspect_export_job'
+      return executeExportReadTarget({ projectId: projectId || activeId || '', input: { operation, jobId: data.jobId }, target: { kind: 'export', jobId: data.jobId } })
+    }
+    case 'production.plan-directions': {
+      // B1 方向门：driver 停在 awaiting_direction 时让渲染层拟 2-3 个「创意方向」候选（三选一）。
+      // 走无工具的一次性文本链路（runDirectionPlanner），语言跟随 brief。失败冒泡给 driver 走
+      // gate title/summary 兜底——不静默编造候选（诚实降级）。
+      const brief =
+        data.brief && typeof data.brief === 'object' && !Array.isArray(data.brief)
+          ? (data.brief as Record<string, unknown>)
+          : {}
+      const playbook =
+        data.playbook && typeof data.playbook === 'object' && !Array.isArray(data.playbook)
+          ? (data.playbook as Record<string, unknown>)
+          : null
+      return runDirectionPlanner({ brief, playbook, projectId })
+    }
+    case 'production.plan-script': {
+      const brief =
+        data.brief && typeof data.brief === 'object' && !Array.isArray(data.brief)
+          ? (data.brief as Record<string, unknown>)
+          : {}
+      const lines = [
+        typeof brief.goal === 'string' ? `目标：${brief.goal}` : '',
+        typeof brief.audience === 'string' ? `受众：${brief.audience}` : '',
+        typeof brief.channel === 'string' ? `渠道：${brief.channel}` : '',
+        typeof brief.tone === 'string' ? `调性：${brief.tone}` : '',
+        typeof brief.durationSeconds === 'number' ? `时长：约 ${brief.durationSeconds} 秒` : '',
+        Array.isArray(brief.sellingPoints)
+          ? `卖点：${brief.sellingPoints.filter((value): value is string => typeof value === 'string').join('、')}`
+          : '',
+      ].filter(Boolean)
+      return { text: await runProductionTextPlanner({ projectId, goal: lines.join('\n') }) }
+    }
+    case 'production.revise-script': {
+      return {
+        text: await runProductionTextPlanner({
+          projectId,
+          instruction: typeof data.instruction === 'string' ? data.instruction : '',
+          source: typeof data.sourceContent === 'string' ? data.sourceContent : '',
+        }),
+      }
+    }
+    case 'production.revise-storyboard': {
+      const revised = await runProductionTextPlanner({
+        projectId,
+        instruction: typeof data.instruction === 'string' ? data.instruction : '',
+        source: typeof data.sourceContent === 'string' ? data.sourceContent : '',
+        outputFormat: 'storyboard',
+      })
+      // The storyboard revision contract is deliberately stricter than script
+      // revision: prose is never silently accepted as a plan.  Accept only a
+      // raw JSON object (or a JSON fenced block for providers that add fences),
+      // then run the same runtime schema used by materialization.
+      const fenced = revised.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1]
+      const candidate = fenced || revised.trim()
+      const parsed = JSON.parse(candidate) as unknown
+      const plan =
+        parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'plan' in parsed
+          ? (parsed as Record<string, unknown>).plan
+          : parsed
+      return { plan: parseStoryboardPlan(plan) }
+    }
+    case 'production.plan-storyboard': {
+      const brief =
+        data.brief && typeof data.brief === 'object' && !Array.isArray(data.brief)
+          ? (data.brief as Record<string, unknown>)
+          : {}
+      const result = await runStoryboardPlanner({
+        target: 'production',
+        projectId,
+        featureKey: plannerFeatureKey,
+        snapshot: plannerSnapshot!,
+        capturedCanvasReadSnapshot: plannerCapturedCanvasReadSnapshot!,
+        canWrite: () => true,
+        storyText: typeof brief.goal === 'string' ? brief.goal : '',
+        skill: { key: 'brand.promo', name: '品牌宣传片' },
+      })
+      const plan = result.plan
+      if (!plan) throw new Error(i18n.t('runtime.capability.storyboardPlanMissing'))
+      return { text: result.text, plan }
+    }
+    case 'production.materialize-storyboard': {
+      // External MCP and the in-app StoryboardPlanEditor deliberately share
+      // this callable path: parse the approved IR, convert it to the canonical
+      // create_canvas_nodes payload, then let applyCanvasToolCall perform the
+      // real Zustand mutation/edge wiring/layout. The service performs all
+      // project/run/version/provenance checks before this operation is reached.
+      const plan = parseStoryboardPlan(data.plan)
+      const materializationOperationId =
+        typeof data.materializationOperationId === 'string' &&
+        /^[A-Za-z0-9._:-]{1,240}$/.test(data.materializationOperationId)
+          ? data.materializationOperationId
+          : undefined
+      const [imageDefault, videoDefault] = await Promise.all([
+        resolveStoryboardImageDefault(),
+        resolveStoryboardVideoDefault(),
+      ])
+      const args = storyboardPlanToCreateNodesArgs(plan, {
+        ...(imageDefault.modelKey ? { defaultImageModelKey: imageDefault.modelKey } : {}),
+        ...(imageDefault.modelVendor ? { defaultImageModelVendor: imageDefault.modelVendor } : {}),
+        ...(imageDefault.modeId ? { defaultImageModeId: imageDefault.modeId } : {}),
+        ...(imageDefault.refModeId ? { defaultImageRefModeId: imageDefault.refModeId } : {}),
+        ...(videoDefault.modelKey ? { defaultVideoModelKey: videoDefault.modelKey } : {}),
+        ...(videoDefault.modelVendor ? { defaultVideoModelVendor: videoDefault.modelVendor } : {}),
+        ...(videoDefault.modeId ? { defaultVideoModeId: videoDefault.modeId } : {}),
+        ...(materializationOperationId ? { materializationOperationId } : {}),
+      })
+      // 幂等归写边界所有（applyCanvasToolCall 的 create_canvas_nodes 认物化章）：进程在画布已提交、
+      // Production 合同还没挂上时挂掉，下一次重放会复用带章的旧节点而不是再建一份分镜。
+      // 这里**不再手写第二份去重**（P1）——边也一并由写边界解析，不需要另调 connect_nodes。
+      const applied = (await applyCanvasToolCall('create_canvas_nodes', args)) as {
+        createdNodeIds?: unknown
+        clientIdToNodeId?: unknown
+        connectedCount?: unknown
+      }
+      const rawClientIdToNodeId =
+        applied?.clientIdToNodeId &&
+        typeof applied.clientIdToNodeId === 'object' &&
+        !Array.isArray(applied.clientIdToNodeId)
+          ? (applied.clientIdToNodeId as Record<string, unknown>)
+          : {}
+      const clientIdToNodeId: Record<string, string> = Object.entries(rawClientIdToNodeId).reduce<
+        Record<string, string>
+      >((out, [clientId, nodeId]) => {
+        if (typeof nodeId === 'string' && nodeId.trim()) out[clientId] = nodeId
+        return out
+      }, {})
+      // 落地后按各镜当前模式投影「行上的提示词 + 参考图」进节点：与分镜表点生成同一个投影（对等测试 shotOutbound.parity）。
+      projectPlanShotsOntoCreatedNodes(plan, (id) => clientIdToNodeId[id] || resolveCanvasToolNodeId(id), useGenerationCanvasStore.getState())
+      const nodeById = new Map(useGenerationCanvasStore.getState().nodes.map((node) => [node.id, node]))
+      const bindings = args.nodes
+        .map((created) => {
+          const mapped = clientIdToNodeId[created.clientId]
+          const nodeId =
+            typeof mapped === 'string' && mapped.trim() ? mapped : resolveCanvasToolNodeId(created.clientId)
+          const node = nodeById.get(nodeId)
+          const meta = node?.meta as Record<string, unknown> | undefined
+          return {
+            nodeId,
+            stageId: 'generate',
+            provider:
+              typeof meta?.modelVendor === 'string'
+                ? meta.modelVendor
+                : typeof meta?.vendor === 'string'
+                  ? meta.vendor
+                  : '',
+            model: typeof meta?.modelKey === 'string' ? meta.modelKey : '',
+            ...(created.metadata ? { metadata: created.metadata } : {}),
+          }
+        })
+        .filter((binding) => binding.nodeId && binding.provider && binding.model)
+      return {
+        createdNodeIds: args.nodes
+          .map((created) => clientIdToNodeId[created.clientId])
+          .filter((value): value is string => typeof value === 'string' && Boolean(value.trim())),
+        connectedCount: typeof applied?.connectedCount === 'number' ? applied.connectedCount : 0,
+        bindings,
+      }
+    }
+    case 'production.arrange': {
+      const shotNodeIds = Array.isArray(data.shotNodeIds)
+        ? data.shotNodeIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+        : []
+      const result = await arrangeStoryboardToTimeline(shotNodeIds.length ? { nodeIds: shotNodeIds } : {})
+      if (result.scopeError) throw new Error(result.scopeError)
+      if (!result.ok && result.total === 0) throw new Error('没有可排片的镜头')
+      const timelineContract = draftFilmTimelineFromState(useWorkbenchStore.getState().timeline)
+      return {
+        arranged: result.sent.length,
+        total: result.total,
+        placed: result.sent.map((item) => ({ nodeId: item.nodeId, role: item.role, startFrame: item.startFrame })),
+        skipped: result.skipped,
+        timelineContract,
+      }
+    }
+    case 'production.verify-shots': {
+      // W1.5：qa 阶段审片（路径②）。driver 传本次已生成的镜头节点 id，渲染层复用现成审片闭环判分回传。
+      const shotNodeIds = Array.isArray(data.shotNodeIds)
+        ? data.shotNodeIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+        : []
+      return verifyShotsForProduction(shotNodeIds, loaded)
+    }
+    case 'production.export': {
+      const project = typeof data.projectId === 'string' ? data.projectId : ''
+      const state = useWorkbenchStore.getState()
+      // Production Run exports are the final quality gate: a rough cut without
+      // captions or a complete shot sequence must stop with an actionable
+      // message instead of being reported as a finished film. Manual exports
+      // without a runId retain the existing flexible editor behavior.
+      if (typeof data.runId === 'string' && data.runId.trim()) {
+        assertDraftFilmReady(draftFilmTimelineFromState(state.timeline))
+      }
+      const { manifest } = createTimelineExportManifest({
+        projectId: project || activeId || '',
+        timeline: state.timeline,
+        aspectRatio: state.previewAspectRatio,
+        generationNodes: useGenerationCanvasStore.getState().nodes,
+      })
+      return { manifest }
+    }
+    case 'production.capture-export': {
+      const project = typeof data.projectId === 'string' ? data.projectId : ''
+      const state = useWorkbenchStore.getState()
+      if (typeof data.runId === 'string' && data.runId.trim()) {
+        assertDraftFilmReady(draftFilmTimelineFromState(state.timeline))
+      }
+      const { timeline } = createTimelineExportManifest({
+        projectId: project || activeId || '',
+        timeline: state.timeline,
+        aspectRatio: state.previewAspectRatio,
+        generationNodes: useGenerationCanvasStore.getState().nodes,
+      })
+      const webm = await exportTimelineToWebm({
+        timeline,
+        aspectRatio: state.previewAspectRatio,
+        width: 1920,
+        autoDownload: false,
+      })
+      return { webmBytes: await webm.arrayBuffer() }
+    }
+    default:
+      throw new Error(i18n.t('runtime.capability.unknownOperation', { operation: op }))
+  }
+}
+
+let unregister: (() => void) | null = null
+
+/** 在 app 启动时注册一次（NomiStudioApp）。重复注册先反注册旧的。preload 无 onApply（老版本）则 no-op。 */
+export function registerCapabilityApplyHandler(): void {
+  unregister?.()
+  unregister = null
+  const onApply = getDesktopBridge()?.capability?.onApply
+  if (typeof onApply === 'function') {
+    unregister = onApply(handleCapabilityApply)
+  }
+}

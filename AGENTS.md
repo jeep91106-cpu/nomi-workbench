@@ -1,0 +1,41 @@
+<!-- 本文件由 scripts/gen-agents-md.mjs 从 CLAUDE.md 自动生成，请勿手改。 -->
+<!-- 改纪律请改 CLAUDE.md，再跑 pnpm run gen:agents；check:agents-sync 在 gates 链里拦漂移。 -->
+# Nomi — 工程纪律
+
+> 本文件常驻、每次 session 读完再动手；细节触发才查：`docs/engineering-rules.md`（规则详解）、`docs/engineering/`（命令全表、设计卡、交付与评审、编排手册）、`docs/lessons/INDEX.md`、`docs/ARCHITECTURE-NOW.md`、`docs/GLOSSARY.md`。每轮还会按用户消息关键词注入提示块（`scripts/claude-hooks/self-check.sh`）。
+> **维护纪律**：本文件是策展的，不是 append 的——只放「删掉它 Claude 就会犯错」的内容，加内容前先找能合并或删掉的，能减就减，实在减不了可以不减。新踩的坑进 `docs/lessons/` 或 hook 的 `violations.log`；规则当天进仓库，不只记长期记忆，见 `rules.json` P2。**禁止手改 `AGENTS.md`**：改纪律只改本文件，再跑 `pnpm run gen:agents`。
+
+## 项目概览
+
+Nomi：本地优先 AI 视频创作工作台。Electron + React 18 + Tailwind 3 + Zustand + React Flow (`@xyflow/react`) + Vercel AI SDK。主要模块：项目库 → 创作（文本）→ 生成画布（节点系统）→ 时间轴预览 → 导出 MP4。设计系统：`Design.md` + `src/design/`，token-only，光 / 暗双模式，密度优先。
+所有改动从最新 `origin/main` 创建独立任务分支 / worktree，通过 PR 交付；禁止直接推 `main`。操作文件用绝对路径。
+
+`pnpm run gates` 是本机完整自检（按风险档，和 CI 共用 `scripts/validation-policy.mjs`）；全量档 `pnpm run gates:full`；推送前 git 钩子自动跑快检，完整门岗以 CI 为准；其余命令见 `docs/engineering/commands.md`。开任务先 `pnpm run delivery:preflight`。
+
+## 核心原则
+
+**P0 只写我们独有的** — 领域本身（分镜、镜头与制作流程、画布、素材、按镜头的花钱语义，以 `docs/engineering/self-written.json` 的领域目录为准）才自己写；通用能力默认接入现成的框架 / 库 / 标准，自写必须登记、理由只认领域约束；能力按通用场景设计，不与具体供应商耦合。自问：「这段是我们独有的吗？不是 → 先找现成的。」
+
+**P1 加新必删旧** — 新实现同 commit 删旧实现，无并行版、无 fallback；CSS 只写组件 `className`，全局 CSS 只减不增。同一文件或同目录 14 天第 3 个 fix、出现 revert fix、修复因评测掉分被回滚、同线第 3 轮修补（同一 PR 验收第 2 次不过也算）、第三个特例分支，任一出现就停止派修补，先做类根因复盘（`docs/engineering/direction-check-template.md`）交用户拍板（RW；碰热点的 fix 提交须带 `Direction-Check:` trailer）；例外：只因概念 / 目录 / 自写登记口径命中、要改的文件本身没命中，且改法是换或删（同提交删旧、不新增分支或特例）时，由协调会话代批、事后报用户（用户 2026-10-22 拍板），要「再补一刀」的照旧交用户。
+
+**P2 修根因、改系统** — 沉淀规则是每个 agent 的使命。任何 bug、回归、CI / 平台失败，动代码前走 `.agents/skills/root-cause-remediation/SKILL.md`：分清症状 / 直接原因 / 类根因，`node scripts/door-map.mjs <符号或文件>` 数清全部入口，修在最早共享边界；再答「系统哪里没拦住」，把漏洞补上，强弱依次：删掉 > 结构上做不出来 > 门岗自动拦 > 写规则文字。修 bug 的 PR 必填「## 系统改进」。用户发现的问题进逃逸账本，结账必须挂结构性预防。自问：「同类问题还能从另一个调用者、供应商、版本、平台或旧数据回来吗？」答不出「不能」就没解决，这一类的入口 / 形状 / 边界全写成测试；只修这一处不算完成。
+
+**P3 全绿不等于完成** — 用户可见改动报完成前：和获批样张逐项对账，真截图自己亲眼 Read 过（zh/en 两轨）；功能交付要有真实任务闭环；没有真实资源记 `unverified`，不许 mock 绿灯顶替。真付费只跑一次：免费演练先过、产物含修复标记、专用工作树里跑（入口会拒跑）。
+
+**P5 想清楚再动手** — 动手前先写设计卡（`docs/engineering/design-card.md`）：所有改动都填 ★ 5 格（1、2、3、4、9；★9 的验收清单与反例动手前写全，实现线按它自验、验收线只核它；★1 每个指标点名量具，没有写「未验证：缺量具」），四类和新增功能先填 ★0 先查别人（≥3 条「出处 · 它怎么做 · 对哪个决定的影响」，先查再设计），碰花钱 / 长跑 / 可打断 / 新界面这四类 9 格全填；**新增功能再填 ★7 性能**（新增的操作、最坏规模、预算，登记进 `tests/perf/scenarios/` 并用 `pnpm run perf:scenarios` 跑出基线，PR 交 `perf-scenario` 数字，超预算不合并，`docs/engineering/perf-scenarios.md`）；写进任务书或 `docs/plan`，PR 正文 `## 设计卡` 放链接或全文；四类合并前还要另一条线独立验收，PR 正文 `## 独立验收` 带报告链接和验收线编号（不得与实现线相同）。新增或改动用户可见界面走 `docs/engineering/design-pipeline.md`：第 1 步探索图出在 **Claude Design 画布**（Artifact「Design」类型，按设计系统出高保真稿，协调会话逐张对过设计系统再交用户拍板；跳过这步直接拼组件的屏不进拍板；其它手写 HTML / widget 只准标 `exploration`），拍板即出清单（`docs/design/boards/`），第 2 步用生产组件搭建，清单是实现合同（`check:board-parity` 守）；Agent / 聊天界面：一个东西一个家、Agent 只指路——聊天只放指向元素、必要请示、本来属于聊天的东西，不放小编辑器和完整预览（`docs/design/nomi-design-system.md` §1.0）；改现有 UI 先看它真实样子；重要改动先一轮批量 grill（每题带默认答案，连带面单独成题），纯 bug 修复不问。
+
+## 规则
+
+规则正本是 `docs/engineering/rules.json`（视图 `rules.md`，旧 R# 编号见 aliases）。常驻只放 12 条：上面的 P0 P1 P2 P3 P5+ 下面的状态词、并行纪律、多会话 + 用户 2026-10-02 拍板常驻的两条判断原则（决策自治、替用户做决策；执行点 manual）。
+
+**状态词只有四档**：已实现未推送 / 已推送待合入 / 已合入待验证 / 已解决（「已解决」需 merge SHA 上的 `delivery:verify-merged` 收据）。
+
+**并行纪律**：独立 sibling worktree 的干净任务分支先 `delivery:preflight`，新 worktree 先 `pnpm install`；不在共享主仓里切分支 / 提交 / 解冲突；推送前整合最新 `origin/main`（merge，不 reset、不压缩提交），只推任务分支并开 PR；不 force-push；评审 / 打捞分支先算 merge-base。
+
+**多会话**：同一时段只有一个协调会话，用户只和它说话。其他会话动手前向它报要碰的概念，冲突排队；做完只开 PR 并把号发给它，不自己合并；新问题和要拍板的问题都发消息给它（带推荐项和各选项代价），不建任务卡、不直接问用户。合并只由协调会话做：CI 绿 + 合并前扫描（`scripts/merge-preflight.mjs`）干净就合，最多 3 个在等收据，任何一个收据红了立刻停、交人定修还是回滚。细节见编排手册 §19。
+
+## 决策自治
+
+默认自主推进到底，不留遗留：发现的问题就全部整完，有合理默认的按用户会选的那版做掉再报。只在关键决策才停：产品方向 / 不可逆取舍 / 架构岔路 / 需要用户独有资源（额度仅产品级、大额、不可逆才问）/ 样张里两条拍板自相矛盾（此时停下上报，不许自己挑一条实现），这时合成一轮、给对比表和推荐项。实现细节、命名、模块拆法、测试策略、评测 / 验证类的额度花费，自己定，事后报花了多少。
+
+**替用户做决策时**：①从创作者真实的摩擦和结构约束出发，不从实现和功能列出发——先问创作者那一刻卡在哪、累不累，让创作者多读、多配、多学的默认砍；再定位它在价值链 / 护城河的哪个位置、用户一个人扛不扛得动，约束就是战略，投机的大盘先砍或延后；②第一性追到底层「为什么」：论断要有据，不确定就实查；叫某东西是 bug 之前先搞懂现有设计为什么这么写；方案用大白话讲清为什么、会发生什么、体验是什么，并一句话点破用户要权衡的那个核心，用户复述不出「为什么」和「我在纠结什么」就重写；③狠的极简加诚实交付：砍一切不挣命的，缺口和限制明着标；④逻辑清楚就快决：用户要的是敢分析、敢反驳、敢下判断的伙伴，不是附和者；用户提的想法也只是看法，该反驳就反驳；「你怎么看」就是要你的判断。

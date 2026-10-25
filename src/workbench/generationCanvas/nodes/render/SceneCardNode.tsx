@@ -1,0 +1,87 @@
+/**
+ * SceneCardNode body — 场景分类节点（v0.8 极简版）。
+ *
+ * 信息条仍 absolute 浮在主图底部（保留场景"沉浸全图"的视觉），
+ * 但只在有名字 / mood / usage 且悬停或编辑标题时显现，常驻时不遮媒体。
+ * 场景名 inline 可编辑。
+ */
+import React, { type JSX } from 'react'
+import { useTranslation } from 'react-i18next'
+import { cn } from '../../../../utils/cn'
+import type { GenerationCanvasNode } from '../../model/generationCanvasTypes'
+import { readSceneMeta } from '../../model/nodeMetaFields'
+import { useNodeUsageCount, useNodeVariantCount } from '../../hooks/useNodeRelationships'
+import { EMPTY_SURFACE_CLASS, UsageDot, VariantChip, UploadFallback } from './CardCommon'
+import { useNodeImageUpload } from '../../adapters/useNodeImageUpload'
+import { EditableNodeTitle } from './EditableNodeTitle'
+import { useNodeMediaMeasurement } from '../useNodeMediaMeasurement'
+import { DeferredNodeImage } from '../DeferredNodeMedia'
+import { canvasImageSourceOf } from '../canvasImageSource'
+import { resolveNodeVisualSize } from '../nodeSizing'
+
+type Props = {
+  node: GenerationCanvasNode
+}
+
+function SceneCardNodeImpl({ node }: Props): JSX.Element {
+  const { t } = useTranslation()
+  const mediaMeasurement = useNodeMediaMeasurement(node)
+  const meta = readSceneMeta(node)
+  const usageCount = useNodeUsageCount(node.id, node.title)
+  const variantCount = useNodeVariantCount(node.id)
+  // 卡片图也只挂画布预览（原图只经被计数的缺失分支，见 canvasImageSource）。
+  const imageSource = canvasImageSourceOf(node.result)
+  const hasImage = Boolean(imageSource)
+  const handleUpload = useNodeImageUpload(node.id, 'scene-card-upload')
+
+  const hasMood = Boolean(meta.mood && meta.mood.length > 0)
+  const hasTitle = Boolean(node.title && node.title.trim().length > 0)
+  const hasInfoBar = hasImage && (hasTitle || hasMood || usageCount > 0 || variantCount > 0)
+
+  return (
+    <div className={cn('relative w-full h-full rounded-nomi overflow-hidden bg-nomi-paper')}>
+      <div className={cn('relative w-full h-full overflow-hidden', !hasImage && EMPTY_SURFACE_CLASS)}>
+        {hasImage ? (
+          <DeferredNodeImage
+            src={imageSource!}
+            onLoad={mediaMeasurement.onImageLoad}
+            alt={node.title || ''}
+            className="w-full h-full object-contain object-center select-none pointer-events-none"
+          />
+        ) : (
+          <UploadFallback accept="image/*" label={t('generationCommon.card.scene.image')} onUpload={handleUpload} kind="scene" height={resolveNodeVisualSize(node).height} />
+        )}
+      </div>
+
+      {hasInfoBar ? (
+        <div
+          data-node-scene-info="true"
+          className={cn(
+            'absolute bottom-2 left-2 right-2',
+            'px-3 py-2 rounded-nomi-sm',
+            'bg-nomi-ink/[0.78] backdrop-blur-md text-nomi-paper',
+            'flex flex-col gap-0.5 opacity-0 pointer-events-none group-hover/node:opacity-100 group-hover/node:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto',
+          )}
+        >
+          <div className="flex items-center justify-between gap-2">
+            <EditableNodeTitle
+              nodeId={node.id}
+              value={node.title || ''}
+              placeholder={t('generationCommon.card.scene.unnamed')}
+              className="text-nomi-paper"
+            />
+            <span className="flex items-center gap-1">
+              <UsageDot count={usageCount} />
+              <VariantChip count={variantCount} />
+            </span>
+          </div>
+          {hasMood ? <span className="text-micro text-nomi-paper/80">{meta.mood!.join(' · ')}</span> : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+const SceneCardNode = React.memo(SceneCardNodeImpl, (prev, next) => prev.node === next.node)
+SceneCardNode.displayName = 'SceneCardNode'
+export default SceneCardNode

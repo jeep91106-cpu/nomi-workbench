@@ -1,0 +1,26 @@
+import { readFileSync } from 'node:fs'
+import { describe, expect, it } from 'vitest'
+
+import { MODEL_FACING_TOOL_SPECS, mcpProfileTools } from '../../../../electron/shared/agentCapabilities/modelFacingToolRegistry'
+import { applyCanvasToolCall } from './applyCanvasToolCall'
+
+describe('retired renderer generation writer', () => {
+  it('is not advertised on the model-facing surface', () => {
+    // 2026-09-11: the only owner of the model-facing surface is the verb registry
+    // (internal profile + derived MCP profile), so assert there.
+    const modelFacingToolNames: string[] = [
+      ...MODEL_FACING_TOOL_SPECS.map(({ name }) => name),
+      ...mcpProfileTools().map(({ name }) => name),
+    ]
+    expect(modelFacingToolNames).not.toContain('run_generation_batch')
+  })
+
+  it('cannot mint a spend grant or dispatch a local generation queue', async () => {
+    await expect(applyCanvasToolCall('run_generation_batch', { nodeIds: ['node-1'] }))
+      .rejects.toThrow('unknown tool run_generation_batch')
+    const source = readFileSync(new URL('./applyCanvasToolCall.ts', import.meta.url), 'utf8')
+    expect(source).not.toContain('mintSpendGrant')
+    expect(source).not.toContain('runPlanWithToasts')
+    expect(source).not.toContain("toolName === 'run_generation_batch'")
+  })
+})

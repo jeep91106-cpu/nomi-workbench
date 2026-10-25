@@ -1,0 +1,399 @@
+// 能力核 · MCP 工具契约目录（单一职责：把 Nomi 能力核暴露成哪些 MCP 工具、各自的 name/title/description/
+// inputSchema(JSON Schema)/method(能力核方法或内部路由键)/build(args→params)）。
+//
+// 面收敛（2026-09-02，surface-16-collapse）：42 个「一动词一工具」的 API 镜像塌成 15 个「按对象归并」的贴任务
+// 工具。收敛只发生在 catalog 层——每个新工具的 build 按 target/action/phase 枚举分派到**原 method 字面量 +
+// 原 params 形状**；能力核 handler、付费 seam（MAC/fail-closed/收据落账）一行不碰（见 mcpGenerationTools.ts /
+// dispatcher.ts / generationDispatcher.ts）。多态工具带 resolveMethod(args)→内部路由键；消费方（mcpProtocol）
+// 用 tool.resolveMethod?.(args) ?? tool.method 派发。读侧全收进一个整体 readOnlyHint 的 nomi_read（形状约束1：
+// 读写分名）；付费两相靠 phase(T7)/action(T14) 保相位（形状约束2/3）。
+//
+// title 字段：MCP tools spec 2025-06-18 支持，宿主 UI 优先显示。readOnlyHint 收进本目录 annotations（真相单一，
+// 不再靠 mcpProtocol.ts 的 name 集合旁挂）。
+//
+import { productionRunToolDescriptors } from '../shared/agentCapabilities/productionRunDescriptors'
+import { toPublishedJsonSchema, type JsonSchemaObject } from '../shared/agentCapabilities/modelVisibleJsonSchema'
+import { listProductionPlaybookNames } from '../productionRun/productionPlaybooks'
+import { CANVAS_READ_CAPABILITY } from '../shared/agentCapabilities/canvasRead'
+import { MCP_CAPABILITY_RESOLVER, immutableSchemaSnapshot } from './mcpCapabilityProjection'
+import { MCP_GENERATION_TOOL_CATALOG } from './mcpGenerationToolCatalog'
+import { MCP_PROJECT_SESSION_TOOL } from './mcpProjectSessionTool'
+import { MCP_READ_TOOL_NAME } from '../shared/agentCapabilities/mcpTransportNames'
+
+const str = (value: unknown): string => (typeof value === 'string' ? value : '')
+
+// Same descriptor schemas used by laneToolCatalog; only the external addressing,
+// object aggregation and approval envelope are owned by this transport.
+function productionFields(name: keyof typeof productionRunToolDescriptors): Record<string, JsonSchemaObject> {
+  return toPublishedJsonSchema(productionRunToolDescriptors[name].parameters).properties as Record<string, JsonSchemaObject>
+}
+const RUN_CREATE_FIELDS = productionFields('start_production_run')
+const RUN_EVENT_FIELDS = productionFields('subscribe_production_run')
+const ARTIFACT_FIELDS = productionFields('read_production_artifact')
+const { playbook: _playbook, playbookVersion: _playbookVersion, ...RUN_BRIEF_FIELDS } = RUN_CREATE_FIELDS
+const { decision: _reviewDecision, ...REVIEW_FIELDS } = productionFields('review_production_artifact')
+
+
+// 画布只读投影（canvas.read capability adapter；别名由能力契约声明，M2 语义面把它改叫 nomi_canvas_read）——
+// 收进 nomi_read target=canvas 时借它的 method/canonical 投影（读侧统一，形状约束1：不另留第二个画布读名）。
+const CANVAS_READ_ALIAS = CANVAS_READ_CAPABILITY.aliases.mcp
+const CANVAS_READ_ADAPTER_TOOL = MCP_CAPABILITY_RESOLVER.list().find((tool) => tool.name === CANVAS_READ_ALIAS)
+if (!CANVAS_READ_ADAPTER_TOOL) throw new Error('canvas.read MCP adapter is not registered')
+/** target=canvas 的内部路由键（= CANVAS_READ_CAPABILITY.id）；nomi_read 借它走 canvas.read 传输适配器。 */
+export const CANVAS_READ_METHOD = CANVAS_READ_ADAPTER_TOOL.method
+
+// ── T3 · nomi_canvas_edit：画布写=语义租约面（M2 canvas/document 根因契约） ─────────────────────
+// 并线裁定（2026-09-02）：42→15 收敛期的 action→canvas.addNodes/... 薄路由与 M2 语义面同名相撞。语义面
+//（leaseHandle 必填、operation 枚举、canvas.write 能力路由、fail-closed 图校验）是根因修复
+//（docs/fixes/2026-09-02-m2-canvas-document-semantic-surface.root-cause.json），薄路由正是它要杀的
+//「目录直投遗留画布操作、裸 projectId 可写」——同 commit 删净（P1），画布写只此一面；删除/撤销走
+// nomi_canvas_maintenance（destructiveHint + confirmation + undoToken）。
+// title 回归修复（slice-3）：T3 把旧薄路由替换成 M2 语义面时 title 随旧对象一起丢了；
+// 此处包装补回，措辞按新语义面（lease-scoped / semantic operation 枚举），不照抄旧分支枚举说明。
+const _CANVAS_EDIT_ADAPTER = MCP_CAPABILITY_RESOLVER.resolve('nomi_canvas_edit')
+if (!_CANVAS_EDIT_ADAPTER) throw new Error('canvas.write MCP adapter is not registered')
+const CANVAS_EDIT_TOOL = {
+  ..._CANVAS_EDIT_ADAPTER,
+  title: '画布编辑提案',
+}
+
+// M2 语义编辑工具（timeline_read/edit · export_job · media_query + M2 canvas/document 语义面）——
+// 独立能力投影，非本次 42→15 收敛的一员，此处**原样保留**其已发布形态（读工具带 annotations.readOnlyHint），
+// 不替它们发明 nomi_read target/collapse 归并——那是未经设计稿裁定的新面设计，留给编排者续裁。
+// canvas.read 已进 nomi_read（target=canvas）、canvas 写已是 T3 本体，这两个从透传里排除以免撞名/并行版。
+const SEMANTIC_EDITING_TOOLS = MCP_CAPABILITY_RESOLVER.list().filter((tool) => tool.name !== CANVAS_READ_ALIAS && tool.name !== CANVAS_EDIT_TOOL.name)
+if (SEMANTIC_EDITING_TOOLS.length === 0) throw new Error('M2 semantic editing MCP adapters are not registered')
+const SEMANTIC_EDITING_TOOL_TITLES = {
+  nomi_canvas_maintenance: { 'zh-CN': '删除或撤销画布节点', en: 'Delete or undo Canvas nodes' },
+  nomi_document_read: { 'zh-CN': '读取文稿或选区', en: 'Read document or selection' },
+  nomi_document_edit: { 'zh-CN': '编辑文稿', en: 'Edit document' },
+  nomi_timeline_read: { 'zh-CN': '读取时间轴', en: 'Read timeline' },
+  nomi_timeline_edit: { 'zh-CN': '预览、应用或撤销时间轴修改', en: 'Preview, apply or undo timeline edits' },
+  nomi_export_job: { 'zh-CN': '查看与核验导出', en: 'Inspect or verify export' },
+  nomi_media_query: { 'zh-CN': '查询媒体与波形', en: 'Query media and waveforms' },
+  nomi_layout_read: { 'zh-CN': '读取工作区布局', en: 'Read workspace layout' },
+  nomi_layout_write: { 'zh-CN': '调整工作区布局', en: 'Change workspace layout' },
+  nomi_model_setup: { 'zh-CN': '接入或调整模型', en: 'Set up or adjust a model connection' },
+  nomi_try_model: { 'zh-CN': '试跑一次（会花钱）', en: 'Try this model once (spends credit)' },
+  nomi_remove_provider: { 'zh-CN': '永久删除连接或模型', en: 'Permanently delete a connection or model' },
+} as const
+/** M2 语义编辑工具名单（真相源），供测试派生完整目录范围而非手抄排除规则。 */
+export const SEMANTIC_EDITING_TOOL_NAMES = Object.freeze(SEMANTIC_EDITING_TOOLS.map((t) => t.name))
+const SEMANTIC_EDITING_TOOLS_WITH_TITLES = SEMANTIC_EDITING_TOOLS.map((tool) => {
+  const titles = SEMANTIC_EDITING_TOOL_TITLES[tool.name as keyof typeof SEMANTIC_EDITING_TOOL_TITLES]
+  if (!titles) throw new Error(`Missing localized MCP title for ${tool.name}`)
+  return { ...tool, title: titles['zh-CN'], titleByLocale: Object.freeze(titles) }
+})
+
+// ── T2 · nomi_read：读侧统一入口（多态只读，整体 readOnlyHint） ───────────────────────────────
+// 每个旧读工具 = 一个 target 值；get/read 双读（get_artifact vs read_artifact）= artifact vs artifact_content
+// 两个 target（投影深浅不同）；subscribe 长轮询 = run_events + waitMs/afterCursor。必填由 handler 按 target 断言
+// （schema 层不上 oneOf/if-then，与 validateToolArguments 单边界家法一致；坏组合诊断码由 C3 测试钉住）。
+const READ_METHOD_BY_TARGET: Record<string, string> = {
+  canvas: CANVAS_READ_METHOD,
+  projects: 'project.list',
+  models: 'models.list',
+  // 分级披露第二档：选定之后再查那一个的说明书（模式/参数/取值/参考槽/变体）。
+  // 走 target 扩展而不是新增工具——`tools/list` 的总字节有只减不增的棘轮。
+  model: 'models.read',
+  generation_context: 'nomi_get_generation_context',
+  operation: 'nomi_operation_read',
+  run: 'production.get',
+  run_events: 'production.events',
+  artifact: 'production.artifact',
+  artifact_content: 'production.artifact.read',
+  // 「接到哪一步了」。旧名 `integration` 与旧工具 `nomi_integration` 一起退役（#754）：
+  // 那条路上模型要同时学「integration 是名词还是动词」，而它其实只是一次**接入**的状态。
+  setup: 'integration.get',
+  // 「写一份配置需要的东西」。**无任何前置**：schema、撰写规范、两份实测过的样例卡，
+  // 三样都是进程常量、零用户数据、零凭据。2026-09-21 之前它们挂在会话的 `compileRequest` 上，
+  // 而那要等 `credentialStatus=ready` —— AI 在人贴 key 之前一件事都做不了，实测四个模型
+  // 一个都没走到「声明」那一步。让它们等 key 从来没换来任何安全。
+  onboarding_kit: 'model.onboarding.kit',
+  // 按任务号查一个已提交异步任务的现状（nomi_try_model 返回 still_processing 之后）。只读，不重提交。
+  task: 'task.read',
+}
+/** nomi_read 的 target 集合（供 mcpProtocol 判 widget/canonical 投影时复用，真相单一）。 */
+export const READ_TARGETS = Object.freeze(Object.keys(READ_METHOD_BY_TARGET))
+/** target∈{run,run_events,artifact} → 挂 nomiRunData/widget 投影（形状约束：投影不许丢）。 */
+export const READ_RUN_DATA_TARGETS = Object.freeze(['run', 'run_events', 'artifact'])
+
+const READ_TOOL = {
+  // 名字的 owner 在 shared/agentCapabilities/mcpTransportNames.ts：只投对外 profile 的动词
+  // 要在说明书里点名它，装配期得认得出来（见那份文件的文件头）。
+  name: MCP_READ_TOOL_NAME,
+  title: '读取项目与制作状态',
+  description: '按 target 读取只读投影；不改状态、不花钱。\n'
+    + 'For target=canvas only (canvas reads use this tool with target=canvas):\n'
+    + CANVAS_READ_ADAPTER_TOOL.description,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      // 对外 payload 有只减不增的棘轮（check:mcp-payload）。两条 lane 各写了一版这段散文，2026-09-22 总合并
+      // 把两版的**事实**合起来、话压到最短：合法值本来就在 `enum` 里，散文里再抄一遍是纯重复。
+      target: { type: 'string', enum: READ_TARGETS, description: '模型分两档：models 薄名单；model + modelId 取那一个的说明书（参数/取值/参考槽/变体），别为拿参数拉整份名单。projects 每行带 projectSelectionHandle，喂给 nomi_session_open 续接。' },
+      modelId: { type: 'string', description: 'target=model 必填：薄名单里的 modelId。' },
+      vendor: { type: 'string', description: 'target=model 可选：同名模型多家时指定哪家。' },
+      projectId: { type: 'string' },
+      leaseHandle: { type: 'string', description: 'target=canvas/generation_context/operation 必填。' },
+      runId: RUN_EVENT_FIELDS.runId,
+      operationId: { type: 'string', description: 'target=operation 必填。' },
+      artifactId: ARTIFACT_FIELDS.artifactId,
+      setupId: { type: 'string', description: 'target=setup：不填=列出你的接入会话。' },
+      taskId: { type: 'string', description: 'target=task 必填：still_processing 给的任务号；只查一次，不重提交。' },
+      afterCursor: { ...RUN_EVENT_FIELDS.afterCursor, default: 0 },
+      waitMs: { ...RUN_EVENT_FIELDS.waitMs, default: 0 },
+      page: { type: 'integer', minimum: 0 },
+    },
+    required: ['target'],
+    additionalProperties: false,
+  },
+  annotations: { readOnlyHint: true as const },
+  method: 'production.get',
+  resolveMethod: (a: Record<string, unknown>): string => READ_METHOD_BY_TARGET[str(a.target)] ?? 'production.get',
+  build: (a: Record<string, unknown>): Record<string, unknown> => {
+    const target = str(a.target)
+    switch (target) {
+      case 'canvas':
+        // 与旧 nomi_read_canvas 的 canvasReadTransportInputSchema 同形：leaseHandle（必填）+ 可选 projectId。
+        return { ...(typeof a.leaseHandle === 'string' ? { leaseHandle: a.leaseHandle } : {}), ...(typeof a.projectId === 'string' ? { projectId: a.projectId } : {}) }
+      case 'generation_context':
+        return { projectId: a.projectId, leaseHandle: a.leaseHandle }
+      case 'operation':
+        return { projectId: a.projectId, leaseHandle: a.leaseHandle, operationId: a.operationId }
+      case 'projects':
+      case 'models':
+      case 'onboarding_kit':
+        return {}
+      case 'task':
+        return { taskId: a.taskId }
+      case 'model':
+        return { modelId: a.modelId, ...(typeof a.vendor === 'string' ? { vendor: a.vendor } : {}) }
+      case 'run':
+        return { projectId: a.projectId, runId: a.runId }
+      case 'run_events':
+        return { projectId: a.projectId, runId: a.runId, afterCursor: a.afterCursor ?? 0, waitMs: a.waitMs ?? 0 }
+      case 'artifact':
+      case 'artifact_content':
+        return { projectId: a.projectId, runId: a.runId, artifactId: a.artifactId }
+      case 'setup':
+        // 「查一眼 vs 等到好」用同一个长轮询习语（与 target=run_events 逐字相同），模型不用学第二种等法。
+        return { ...(typeof a.setupId === 'string' ? { setupId: a.setupId } : {}), waitMs: a.waitMs ?? 0 }
+      default:
+        return {}
+    }
+  },
+} as const
+
+// ── T4 · nomi_asset_import：本机文件→项目素材 ────────────────────────────────────────────
+const ASSET_IMPORT_TOOL = {
+  name: 'nomi_asset_import',
+  title: '导入本机素材',
+  description: '导入本机图片/视频素材；支持 png/jpg/webp/gif/bmp/tiff/heic/mp4/mov/webm/m4v，单文件≤64MB，须绝对路径；拒绝 ~/.ssh、~/.nomi。',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      projectId: { type: 'string' },
+      path: { type: 'string', description: '本机文件绝对路径。' },
+      title: { type: 'string', description: '可选素材名；自动补扩展名。' },
+    },
+    required: ['projectId', 'path'],
+    additionalProperties: false,
+  },
+  method: 'asset.import',
+  build: (a: Record<string, unknown>): Record<string, unknown> => ({ projectId: a.projectId, path: a.path, ...(a.title ? { title: a.title } : {}) }),
+} as const
+
+// ── T12 · nomi_artifact_review：版本化剧本/分镜的审阅+定点修订（簇 B 镜像消除：script/storyboard 双工具→kind） ──
+const ARTIFACT_REVIEW_TOOL = {
+  name: 'nomi_artifact_review',
+  title: '审阅与修订剧本或分镜',
+  description: '按 action 审阅/修订当前剧本或分镜版本；仅接受刚读到的版本（乐观锁）。',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      projectId: { type: 'string' },
+      ...productionFields('revise_production_artifact'),
+      ...REVIEW_FIELDS,
+      action: { type: 'string', enum: ['approve', 'request_changes', 'reject', 'revise'] },
+    },
+    required: ['projectId', 'runId', 'artifactId', 'expectedVersion', 'action'],
+    additionalProperties: false,
+  },
+  method: 'production.artifact.review',
+  resolveMethod: (a: Record<string, unknown>): string =>
+    str(a.action) === 'revise' ? 'production.artifact.revise' : 'production.artifact.review',
+  build: (a: Record<string, unknown>): Record<string, unknown> => {
+    const base = { projectId: a.projectId, runId: a.runId, artifactId: a.artifactId, expectedVersion: a.expectedVersion }
+    if (str(a.action) === 'revise') return { ...base, instruction: a.instruction, kind: a.kind }
+    // approve/request_changes/reject → production.artifact.review 的 decision 枚举。
+    const decision = str(a.action) === 'approve' ? 'approved' : str(a.action) === 'request_changes' ? 'changes_requested' : 'rejected'
+    return { ...base, decision }
+  },
+} as const
+
+// ── T13 · nomi_run_gate：Run 侧付费/创意门（含物化落地） ──────────────────────────────────
+const RUN_GATE_TOOL = {
+  name: 'nomi_run_gate',
+  title: '制作确认门',
+  description: '按 action 处理 Run 授权：decide 表态可逆创意门；materialize 将已批分镜落画布并登记 jobs/预算；不批剧本/预算、不直接调用付费模型。',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      projectId: { type: 'string' },
+      ...productionFields('decide_production_gate'),
+      ...productionFields('materialize_production_storyboard'),
+      action: { type: 'string', enum: ['decide', 'materialize'] },
+    },
+    required: ['projectId', 'runId', 'action'],
+    additionalProperties: false,
+  },
+  method: 'production.decide-gate',
+  resolveMethod: (a: Record<string, unknown>): string =>
+    str(a.action) === 'materialize' ? 'production.storyboard.materialize' : 'production.decide-gate',
+  build: (a: Record<string, unknown>): Record<string, unknown> => {
+    if (str(a.action) === 'materialize') return { projectId: a.projectId, runId: a.runId, artifactId: a.artifactId, expectedVersion: a.expectedVersion }
+    return { projectId: a.projectId, runId: a.runId, gateId: a.gateId, decision: a.decision, choiceKey: a.choiceKey }
+  },
+} as const
+
+// ── T10 · nomi_run_start：耐久制作草稿入口（只记 brief+playbook，不批预算、不调付费模型） ────────
+const RUN_START_TOOL = {
+  name: 'nomi_run_start',
+  title: '新建制作草稿',
+  description: '创建制作草稿；只记 brief/playbook，不批预算、不调用付费模型。',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      projectId: { type: 'string' },
+      playbook: {
+        type: 'string',
+        enum: listProductionPlaybookNames(),
+        description: `可用 playbook：${listProductionPlaybookNames().join('、')}；其他值拒绝。`,
+      },
+      playbookVersion: RUN_CREATE_FIELDS.playbookVersion,
+      brief: {
+        type: 'object',
+        properties: {
+          ...RUN_BRIEF_FIELDS,
+          referenceArtifactIds: { type: 'array', maxItems: 20, items: { type: 'string' } },
+        },
+        required: ['goal'],
+        additionalProperties: false,
+      },
+      trustLevel: {
+        type: 'string',
+        enum: ['key_confirm', 'budget_only', 'confirm_all'],
+        // 2026-09-21：原话是「要求直接出时用 budget_only」——而 `nomi_run_start` 从那天起**不再收**
+        // 更松的档位（调用方自报的值不是用户的决定）。照旧话做的助手会撞 403，然后以为是自己填错了。
+        description: '信任档位：key_confirm 默认（停方向/样片门）；budget_only 跳过创意/样片门、只管钱；confirm_all 每镜确认。这里只收默认或更严的档；budget_only 要用户授权：先建 Run，再 nomi_run_control action=set_trust（会在 Nomi 里弹一次确认）。',
+      },
+    },
+    required: ['projectId', 'playbook', 'brief'],
+    additionalProperties: false,
+  },
+  method: 'production.start',
+  build: (a: Record<string, unknown>): Record<string, unknown> => ({
+    projectId: a.projectId,
+    playbook: a.playbook,
+    playbookVersion: a.playbookVersion,
+    brief: a.brief,
+    ...(a.trustLevel ? { trustLevel: a.trustLevel } : {}),
+  }),
+} as const
+
+// ── T11 · nomi_run_control：持久制作 Run 控制（pause/resume/cancel/set_trust） ─────────────────
+const RUN_CONTROL_TOOL = {
+  name: 'nomi_run_control',
+  title: '控制制作任务',
+  description: 'pause 保留已花预算/已完成镜头；resume 不重做/不重付；cancel 未提交不计费；set_trust 改档（需 trustLevel）。',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      projectId: { type: 'string' },
+      ...productionFields('control_production_run'),
+    },
+    required: ['projectId', 'runId', 'action'],
+    additionalProperties: false,
+  },
+  method: 'production.control',
+  build: (a: Record<string, unknown>): Record<string, unknown> => ({ projectId: a.projectId, runId: a.runId, action: a.action, ...(a.trustLevel ? { trustLevel: a.trustLevel } : {}) }),
+} as const
+
+// ── T15 · nomi_project_create：建新项目（产出 projectId 的独立小对象写） ────────────────────────
+const PROJECT_CREATE_TOOL = {
+  name: 'nomi_project_create',
+  title: '新建项目',
+  description: '新建空白 Nomi 项目并返回 projectId。',
+  inputSchema: { type: 'object', properties: { name: { type: 'string' } }, additionalProperties: false },
+  method: 'project.create',
+  build: (a: Record<string, unknown>): Record<string, unknown> => (a.name ? { name: a.name } : {}),
+} as const
+
+// 工具定义：name → { title?, description, inputSchema(JSON Schema), method(能力核方法/内部路由键),
+//   resolveMethod?(args→路由键), build(args→params), annotations? }。
+export const MCP_TOOL_CATALOG = [
+  MCP_PROJECT_SESSION_TOOL, // T1
+  READ_TOOL, // T2（吸收 10 读）
+  CANVAS_EDIT_TOOL, // T3（画布写=M2 语义租约面，吸收 4 画布写；删除/撤销在 nomi_canvas_maintenance）
+  ASSET_IMPORT_TOOL, // T4
+  ...MCP_GENERATION_TOOL_CATALOG, // T5/T6/T7/T8/T9（operation 族）
+  RUN_START_TOOL, // T10
+  RUN_CONTROL_TOOL, // T11
+  ARTIFACT_REVIEW_TOOL, // T12（吸收 review + script/storyboard revision）
+  RUN_GATE_TOOL, // T13（吸收 decide_gate + materialize）
+  PROJECT_CREATE_TOOL, // T15
+  ...SEMANTIC_EDITING_TOOLS_WITH_TITLES, // M2 语义编辑（含中英文人话标题）
+] as const
+
+export type McpToolDefinition = (typeof MCP_TOOL_CATALOG)[number] & {
+  title?: string
+  titleByLocale?: { readonly 'zh-CN': string; readonly en: string }
+  resolveMethod?: (args: Record<string, unknown>) => string
+  /** 共享描述符声明的容忍钩子（`mcpCapabilityProjection.ts` 派生）。协议层在校验之前调用。 */
+  prepareArguments?: (args: unknown) => Record<string, unknown>
+  annotations?: { readonly readOnlyHint: true }
+  presentResult?: (result: unknown) => unknown
+}
+
+export function assertMcpToolTitles(tools: readonly McpToolDefinition[]): void {
+  for (const tool of tools) {
+    if (typeof tool.title !== 'string' || tool.title.trim().length === 0) {
+      throw new Error(`Missing MCP tool title for ${tool.name}`)
+    }
+    const localized = tool.titleByLocale
+    if (localized && (!localized['zh-CN'].trim() || !localized.en.trim())) {
+      throw new Error(`Missing localized MCP tool title for ${tool.name}`)
+    }
+  }
+}
+
+// 再导出整族路由映射，供测试逐条 assert 「旧 name 的 method+params ≡ 新 name 某枚举分支的 build 输出」。
+export { READ_METHOD_BY_TARGET }
+
+const MCP_TOOL_SNAPSHOT = Object.freeze(MCP_TOOL_CATALOG.map((tool) => {
+  const annotations = 'annotations' in tool && tool.annotations
+    ? Object.freeze({ ...tool.annotations })
+    : undefined
+  return Object.freeze({
+    ...tool,
+    inputSchema: immutableSchemaSnapshot(tool.inputSchema),
+    ...(annotations ? { annotations } : {}),
+  })
+})) as readonly McpToolDefinition[]
+
+assertMcpToolTitles(MCP_TOOL_SNAPSHOT)
+
+const MCP_TOOL_BY_NAME = new Map<string, McpToolDefinition>(
+  MCP_TOOL_SNAPSHOT.map((tool) => [tool.name, tool]),
+)
+
+if (MCP_TOOL_BY_NAME.size !== MCP_TOOL_SNAPSHOT.length) {
+  throw new Error('Duplicate MCP tool name in the explicit catalog')
+}
+
+/** tools/list and tools/call must share this exact post-filter resolver. */
+export const MCP_TOOL_RESOLVER = Object.freeze({
+  list: (): readonly McpToolDefinition[] => MCP_TOOL_SNAPSHOT,
+  resolve: (name: string): McpToolDefinition | undefined => MCP_TOOL_BY_NAME.get(name),
+})

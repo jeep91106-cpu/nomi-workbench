@@ -1,0 +1,468 @@
+import React from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { confirmDialog } from '../../design'
+import { notify } from '../../ui/notificationPolicy'
+import { useGenerationCanvasStore } from '../generationCanvas/store/generationCanvasStore'
+import { useSpendConfirmStore } from '../generationCanvas/spend/spendConfirm'
+import { buildProductionContractView } from '../generationCanvas/spend/productionContractView'
+import { buildAnchorCheckpointCard } from '../generationCanvas/spend/anchorCheckpointView'
+import { useWorkbenchStore } from '../workbenchStore'
+import { productionRunApi } from './productionRunApi'
+import { nodeIdOfJob, releaseUnknownSubmission } from './releaseUnknownSubmission'
+import { executeProductionRunCommand, isNothingToResume } from './productionRunCommands'
+import { buildProductionPolicySettingsTarget, isProductionPolicyError } from './productionPolicyRecovery'
+import { useProductionRunStore } from './productionRunStore'
+import { buildProductionRunView, gateKindOf, type ProductionRunPrimaryAction } from './productionRunView'
+import { useActiveProductionRun } from './useActiveProductionRun'
+
+function localizedGateCopy(
+  run: NonNullable<ReturnType<typeof useActiveProductionRun>['run']>,
+  gate: NonNullable<ReturnType<typeof useActiveProductionRun>['run']>['gates'][number],
+  translate: (key: string, params?: Record<string, unknown>) => string,
+): { title: string; message: string } {
+  if (gate.scope === 'export') {
+    return {
+      title: translate('generationCommon.production.gate.exportTitle'),
+      message: translate('generationCommon.production.gate.exportSummary'),
+    }
+  }
+  if (gate.scope === 'budget_envelope') {
+    return {
+      title: translate('generationCommon.production.gate.contractTitle'),
+      message: translate('generationCommon.production.gate.contractSummary'),
+    }
+  }
+  if (gate.scope === 'stage' && gate.gateId.startsWith('gate-direction-')) {
+    // B1：有候选 → 用「选方向」文案（配单选行）；没候选（LLM 关着的兜底）→ 保持原「确认创作方向」。
+    const hasCandidates = (gate.directionCandidates?.length ?? 0) > 0
+    return {
+      title: translate(hasCandidates ? 'generationCommon.production.gate.directionPickTitle' : 'generationCommon.production.gate.directionTitle'),
+      message: translate(hasCandidates ? 'generationCommon.production.gate.directionPickSummary' : 'generationCommon.production.gate.directionSummary'),
+    }
+  }
+  if (gate.scope === 'stage' && gate.gateId.startsWith('gate-sample-')) {
+    // B2：样片门——先看首镜再批量。批准=满意继续；取消=换风格重来（会暂停）。
+    return {
+      title: translate('generationCommon.production.gate.sampleTitle'),
+      message: translate('generationCommon.production.gate.sampleSummary'),
+    }
+  }
+  if (gate.scope === 'job_set' && gate.gateId.startsWith('gate-shot-')) {
+    const job = run.jobs.find((candidate) => candidate.jobId === gate.jobIds[0])
+    const index = job ? run.jobs.findIndex((candidate) => candidate.jobId === job.jobId) + 1 : 0
+    const params = {
+      index,
+      node: job?.nodeId || job?.jobId || gate.jobIds[0] || '-',
+      provider: job?.provider || '-',
+      model: job?.model || '-',
+    }
+    return {
+      title: translate('generationCommon.production.gate.shotTitle', params),
+      message: translate('generationCommon.production.gate.shotSummary', params),
+    }
+  }
+  return { title: gate.title, message: gate.summary }
+}
+
+export function useProductionStatus(options: { enabled?: boolean } = {}) {
+  const { t } = useTranslation()
+  const production = useActiveProductionRun(undefined, options)
+  const actionInFlightRef = React.useRef(false)
+  const [failure, setFailure] = React.useState<{ identity: string; message: string } | null>(null)
+  const identity = production.run ? `production-run:${production.run.projectId}:${production.run.runId}` : ''
+  const reportFailure = React.useCallback((error: unknown, reason: string) => {
+    notify({
+      identity, reason, level: 'inline', type: 'error',
+      message: `${t(reason)}: ${error instanceof Error ? error.message : String(error)}`,
+      present: (message) => setFailure({ identity, message }),
+    })
+  }, [identity, t])
+  const view = React.useMemo(() => (production.run ? buildProductionRunView(production.run) : null), [production.run])
+  const executeCommand = React.useCallback(
+    (projectId: string, runId: string, command: Parameters<typeof productionRunApi.command>[2]) =>
+      executeProductionRunCommand(projectId, runId, command, {
+        read: productionRunApi.read,
+        execute: productionRunApi.command,
+      }),
+    [],
+  )
+
+  const onPrimaryAction = React.useCallback(
+    async (action: Exclude<ProductionRunPrimaryAction, null>) => {
+      if (actionInFlightRef.current) return
+      actionInFlightRef.current = true
+      setFailure(null)
+      try {
+        const run = production.run
+        if (!run) return
+        const targetJob =
+          run.jobs.find((job) => job.jobId === view?.targetId) ??
+          [...run.jobs].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]
+
+        if (action === 'review-script' || action === 'review-storyboard') {
+          useWorkbenchStore.getState().setWorkspaceMode('creation')
+          return
+        }
+        if (action === 'open-stage') {
+          if (targetJob?.nodeId) useGenerationCanvasStore.getState().selectNode(targetJob.nodeId)
+          useWorkbenchStore.getState().setWorkspaceMode('generation')
+          useWorkbenchStore.getState().requestCanvasFit()
+          return
+        }
+        if (action === 'review-rough-cut') {
+          useWorkbenchStore.getState().setWorkspaceMode('preview')
+          const accepted = await confirmDialog({
+            title: t('generationCommon.production.roughCut.title'),
+            message: t('generationCommon.production.roughCut.message'),
+            confirmLabel: t('generationCommon.production.roughCut.accept'),
+            cancelLabel: t('generationCommon.production.roughCut.keepReviewing'),
+          })
+          if (!accepted) return
+          try {
+            await executeCommand(run.projectId, run.runId, {
+              commandId: globalThis.crypto.randomUUID(),
+              expectedRevision: run.revision,
+              type: 'run.status',
+              payload: { status: 'awaiting_export' },
+              issuedAt: new Date().toISOString(),
+            })
+            await useProductionRunStore.getState().loadRun(run.projectId, run.runId)
+          } catch (error) {
+            reportFailure(error, 'generationCommon.production.gate.failed')
+          }
+          return
+        }
+        if (action === 'open-export') {
+          useWorkbenchStore.getState().setWorkspaceMode('preview')
+          return
+        }
+        if (action === 'resume-run') {
+          // A4：从断点继续（run.control 与 MCP 侧同一命令收口）。
+          try {
+            await executeCommand(run.projectId, run.runId, {
+              commandId: globalThis.crypto.randomUUID(),
+              expectedRevision: run.revision,
+              type: 'run.control',
+              payload: { action: 'resume' },
+              issuedAt: new Date().toISOString(),
+            })
+            await useProductionRunStore.getState().loadRun(run.projectId, run.runId)
+          } catch (error) {
+            // 继续了也一镜都不会派（主进程唯一判定 resumeOutlook，#1139 V-1139c）：说真话，不报「操作失败」、不贴原文。
+            if (isNothingToResume(error)) {
+              const reason = 'generationCommon.production.canvasLanding.actionFailure.nothingToResume'
+              notify({ identity, reason, level: 'inline', type: 'error', message: t(reason), present: (message) => setFailure({ identity, message }) })
+            } else reportFailure(error, 'generationCommon.production.control.failed')
+          }
+          return
+        }
+        if (action === 'retry-retrieval') {
+          // 已生成、取回失败 → 重新取回（#975 A2）：主进程把这一镜放回轮询、再查一次再取一次。不重新生成，所以不弹付费卡。
+          if (!targetJob) return
+          try {
+            await executeCommand(run.projectId, run.runId, {
+              commandId: globalThis.crypto.randomUUID(),
+              expectedRevision: run.revision,
+              type: 'job.retry_retrieval',
+              payload: { jobId: targetJob.jobId },
+              issuedAt: new Date().toISOString(),
+            })
+            await useProductionRunStore.getState().loadRun(run.projectId, run.runId)
+          } catch (error) {
+            reportFailure(error, 'generationCommon.production.control.failed')
+          }
+          return
+        }
+        if (action === 'release-unknown') {
+          // 结果未知且没有任务号：Nomi 没法核对，只能请用户去服务商后台看。用户确认「没有」后放行这一镜，
+          // 再走这一镜正常的付费确认卡（confirmAndRunNode）——放行本身不开拍。
+          if (!targetJob) return
+          const confirmed = await confirmDialog({
+            title: t('generationCommon.production.reconcile.releaseTitle'),
+            message: t('generationCommon.production.reconcile.releaseMessage'),
+            confirmLabel: t('generationCommon.production.reconcile.releaseContinue'),
+            cancelLabel: t('common.cancel'),
+            danger: true,
+          })
+          if (!confirmed) return
+          try {
+            await releaseUnknownSubmission(run.projectId, run.runId, targetJob.jobId, productionRunApi)
+            await useProductionRunStore.getState().loadRun(run.projectId, run.runId)
+          } catch (error) {
+            reportFailure(error, 'generationCommon.production.reconcile.failed')
+            return
+          }
+          const nodeId = nodeIdOfJob(run, targetJob)
+          if (nodeId) {
+            useGenerationCanvasStore.getState().selectNode(nodeId)
+            useWorkbenchStore.getState().setWorkspaceMode('generation')
+            // 动态加载：生成控制器是重模块，只有走到「放行后重新生成」这一步才需要它。
+            void import('../generationCanvas/runner/generationRunController').then(({ confirmAndRunNode }) => confirmAndRunNode(nodeId, { initiator: 'user' }))
+          }
+          return
+        }
+        if (action === 'reconcile') {
+          if (targetJob?.nodeId) useGenerationCanvasStore.getState().selectNode(targetJob.nodeId)
+          const found = await confirmDialog({
+            title: t('generationCommon.production.reconcile.questionTitle'),
+            message: t('generationCommon.production.reconcile.message', {
+              provider: targetJob?.provider || t('generationCommon.production.reconcile.unknownProvider'),
+              taskId: targetJob?.providerTaskId || t('generationCommon.production.reconcile.noTaskId'),
+            }),
+            confirmLabel: t('generationCommon.production.reconcile.found'),
+            cancelLabel: t('generationCommon.production.reconcile.notFound'),
+          })
+          let outcome: 'found' | 'not_found' = 'found'
+          if (!found) {
+            const confirmMissing = await confirmDialog({
+              title: t('generationCommon.production.reconcile.notFoundTitle'),
+              message: t('generationCommon.production.reconcile.notFoundMessage'),
+              confirmLabel: t('generationCommon.production.reconcile.confirmNotFound'),
+              cancelLabel: t('common.cancel'),
+              danger: true,
+            })
+            if (!confirmMissing) return
+            outcome = 'not_found'
+          }
+          try {
+            await executeCommand(run.projectId, run.runId, {
+              commandId: globalThis.crypto.randomUUID(),
+              expectedRevision: run.revision,
+              type: 'job.reconcile',
+              payload: { jobId: targetJob?.jobId, outcome },
+              issuedAt: new Date().toISOString(),
+            })
+            await useProductionRunStore.getState().loadRun(run.projectId, run.runId)
+          } catch (error) {
+            reportFailure(error, 'generationCommon.production.reconcile.failed')
+          }
+          return
+        }
+
+        let activeRun = run
+        let gate =
+          activeRun.gates.find((item) => item.gateId === view?.targetId && item.status === 'waiting') ??
+          run.gates.find((item) => item.status === 'waiting')
+        if (!gate) return
+
+        // P4 §3.2 形象确认卡（anchor_checkpoint 免费质量门）：与花钱确认卡同一条对话框轨道，但决议语义不同——
+        //   开拍 = decide approved → service 钩子自动续踢镜批（不用手动踢）；
+        //   先不拍 = 不 decide、门保持 waiting（任务中心卡持续显示「查看」可重开）；
+        //   重拍选中 = decide rejected + 对选中 shotId 走 S6 返工链（reworkShot），新 attempt 完成后门重新武装、卡再弹。
+        if (gateKindOf(gate) === 'checkpoint') {
+          const model = buildAnchorCheckpointCard(activeRun, gate)
+          if (!model) return
+          const reworkShotIds: string[] = []
+          const approved = await useSpendConfirmStore.getState().requestConfirm({
+            title: t('generationCommon.production.checkpoint.title'),
+            message: '', // 形象卡自带副标题 + 承诺行，不用通用 message
+            kind: 'anchorCheckpoint',
+            anchorCheckpoint: model,
+            source: activeRun.origin.host === 'nomi' ? 'user' : 'agent',
+            onRework: (shotIds) => { reworkShotIds.push(...shotIds) },
+          })
+          // 重拍：decide rejected（停批、不扣费）+ 逐个 reworkShot（S6 返工链，新 attempt 完成后门重新武装）。
+          if (reworkShotIds.length > 0) {
+            try {
+              await executeCommand(activeRun.projectId, activeRun.runId, {
+                commandId: globalThis.crypto.randomUUID(),
+                expectedRevision: activeRun.revision,
+                type: 'gate.decide',
+                payload: { gateId: gate.gateId, status: 'rejected' },
+                issuedAt: new Date().toISOString(),
+              })
+              for (const shotId of reworkShotIds) {
+                await productionRunApi.rework(activeRun.projectId, activeRun.runId, shotId)
+              }
+              await useProductionRunStore.getState().loadRun(activeRun.projectId, activeRun.runId)
+            } catch (error) {
+              reportFailure(error, 'generationCommon.production.gate.failed')
+            }
+            return
+          }
+          // 先不拍：不 decide，门保持 waiting（重开路径 = 任务中心 run 卡的「查看」主动作）。
+          if (!approved) return
+          // 开拍：decide approved → 钩子自动续踢镜批。
+          try {
+            await executeCommand(activeRun.projectId, activeRun.runId, {
+              commandId: globalThis.crypto.randomUUID(),
+              expectedRevision: activeRun.revision,
+              type: 'gate.decide',
+              payload: { gateId: gate.gateId, status: 'approved' },
+              issuedAt: new Date().toISOString(),
+            })
+            await useProductionRunStore.getState().loadRun(activeRun.projectId, activeRun.runId)
+          } catch (error) {
+            reportFailure(error, 'generationCommon.production.gate.failed')
+          }
+          return
+        }
+
+        if (gate.scope === 'budget_envelope') {
+          try {
+            const refreshed = await executeCommand(activeRun.projectId, activeRun.runId, {
+              commandId: globalThis.crypto.randomUUID(),
+              expectedRevision: activeRun.revision,
+              type: 'policy.refresh',
+              payload: {},
+              issuedAt: new Date().toISOString(),
+            })
+            activeRun = refreshed.run
+            gate = activeRun.gates.find((item) => item.gateId === gate?.gateId && item.status === 'waiting')
+            if (!gate) return
+          } catch (error) {
+            reportFailure(error, 'generationCommon.production.gate.failed')
+            return
+          }
+        }
+        const gateCopy = localizedGateCopy(activeRun, gate, (key, params) => t(key, params))
+        const contract = ['budget_envelope', 'export', 'publish'].includes(gate.scope)
+          ? buildProductionContractView(activeRun, gate)
+          : undefined
+        // B1：方向门候选（driver 拟好后挂在 gate 上）。有候选 → 弹单选，捕获选中 key 带进决议留痕。
+        const isDirectionGate = gate.scope === 'stage' && gate.gateId.startsWith('gate-direction-')
+        const isSampleGateApproval = gate.scope === 'stage' && gate.gateId.startsWith('gate-sample-')
+        const isShotGate = gate.scope === 'job_set' && gate.gateId.startsWith('gate-shot-')
+        const shotJob = isShotGate ? activeRun.jobs.find((candidate) => candidate.jobId === gate?.jobIds[0]) : undefined
+        const shotIndex = shotJob ? activeRun.jobs.findIndex((candidate) => candidate.jobId === shotJob.jobId) + 1 : 0
+        const directionCandidates = isDirectionGate ? (gate.directionCandidates ?? []) : []
+        let directionChoiceKey: string | null = directionCandidates[0]?.key ?? null
+        let openingPolicySettings = false
+        const approved = await useSpendConfirmStore.getState().requestConfirm({
+          title: gateCopy.title,
+          message: gateCopy.message,
+          // B2：样片门批准=「满意，批量生成」；其余门=「批准并继续」。
+          confirmLabel: t(isSampleGateApproval
+            ? 'generationCommon.production.gate.sampleApprove'
+            : isShotGate
+              ? 'generationCommon.production.gate.shotApprove'
+              : 'generationCommon.production.gate.approve'),
+          ...(isSampleGateApproval || isShotGate ? {
+            cancelLabel: t(isShotGate ? 'generationCommon.production.gate.shotReject' : 'generationCommon.production.gate.sampleReject'),
+          } : {}),
+          source: activeRun.origin.host === 'nomi' ? 'user' : 'agent',
+          kind: gate.scope === 'stage' ? 'plan' : isShotGate ? 'generation' : 'contract',
+          ...(contract ? { contract } : {}),
+          ...(isShotGate && shotJob ? {
+            details: [
+              { label: t('generationCommon.production.gate.shotLabel'), value: `${shotIndex} · ${shotJob.nodeId || shotJob.jobId}` },
+              { label: t('generationCommon.production.gate.providerModelLabel'), value: `${shotJob.provider} · ${shotJob.model}` },
+            ],
+          } : {}),
+          ...(directionCandidates.length ? {
+            directionCandidates: directionCandidates.map((candidate) => ({ key: candidate.key, title: candidate.title, oneLiner: candidate.oneLiner })),
+            onDirectionDecision: (key: string | null) => { directionChoiceKey = key },
+          } : {}),
+          ...(gate.scope === 'budget_envelope' && contract && !contract.policy.ready ? {
+            onOpenPolicySettings: () => {
+              openingPolicySettings = true
+              window.dispatchEvent(new CustomEvent('nomi-open-settings', {
+                detail: buildProductionPolicySettingsTarget(),
+              }))
+            },
+          } : {}),
+        })
+        const isSampleGate = gate.scope === 'stage' && gate.gateId.startsWith('gate-sample-')
+        if (!approved) {
+          if (openingPolicySettings) return
+          // 预算门否决=撤销制作；样片门否决=换风格重来（service 会把它变成暂停）。其余门（方向/plan）取消=不表态。
+          if (gate.scope !== 'budget_envelope' && !isSampleGate && !isShotGate) return
+          try {
+            await executeCommand(activeRun.projectId, activeRun.runId, {
+              commandId: globalThis.crypto.randomUUID(),
+              expectedRevision: activeRun.revision,
+              type: 'gate.decide',
+              payload: { gateId: gate.gateId, status: 'rejected' },
+              issuedAt: new Date().toISOString(),
+            })
+            await useProductionRunStore.getState().loadRun(activeRun.projectId, activeRun.runId)
+          } catch (error) {
+            reportFailure(error, 'generationCommon.production.gate.failed')
+          }
+          return
+        }
+        try {
+          await executeCommand(activeRun.projectId, activeRun.runId, {
+            commandId: globalThis.crypto.randomUUID(),
+            expectedRevision: activeRun.revision,
+            type: 'gate.decide',
+            payload: { gateId: gate.gateId, status: 'approved', ...(directionChoiceKey ? { choiceKey: directionChoiceKey } : {}) },
+            issuedAt: new Date().toISOString(),
+          })
+          await useProductionRunStore.getState().loadRun(activeRun.projectId, activeRun.runId)
+        } catch (error) {
+          const incompletePolicy = isProductionPolicyError(error)
+          const openSettings = await confirmDialog({
+            title: incompletePolicy
+              ? t('generationCommon.production.gate.missingPolicyFallbackTitle')
+              : t('generationCommon.production.gate.failed'),
+            message: incompletePolicy
+              ? t('generationCommon.production.gate.missingPolicyMessage')
+              : error instanceof Error ? error.message : String(error),
+            confirmLabel: incompletePolicy
+              ? t('generationCommon.production.gate.openProductionPolicy')
+              : t('generationCommon.production.gate.openSettings'),
+            cancelLabel: t('common.cancel'),
+          })
+          if (openSettings)
+            window.dispatchEvent(
+              new CustomEvent('nomi-open-settings', {
+                detail: incompletePolicy
+                  ? buildProductionPolicySettingsTarget()
+                  : { tab: 'automation', section: 'automation' },
+              }),
+            )
+        }
+      } finally {
+        actionInFlightRef.current = false
+      }
+    },
+    [executeCommand, identity, production.run, reportFailure, t, view?.targetId],
+  )
+
+  // A4 情境控制：暂停直接执行；取消是破坏性动作先 confirmDialog（§3.5）。两者与 MCP 同走 run.control。
+  const onControl = React.useCallback(
+    async (action: 'pause' | 'cancel') => {
+      const run = production.run
+      if (!run || actionInFlightRef.current) return
+      actionInFlightRef.current = true
+      setFailure(null)
+      try {
+        if (action === 'cancel') {
+          const confirmed = await confirmDialog({
+            title: t('generationCommon.production.control.cancelTitle'),
+            message: t('generationCommon.production.control.cancelMessage'),
+            confirmLabel: t('generationCommon.production.control.cancelConfirm'),
+            cancelLabel: t('common.cancel'),
+            danger: true,
+          })
+          if (!confirmed) return
+        }
+        await executeCommand(run.projectId, run.runId, {
+          commandId: globalThis.crypto.randomUUID(),
+          expectedRevision: run.revision,
+          type: 'run.control',
+          payload: { action },
+          issuedAt: new Date().toISOString(),
+        })
+        await useProductionRunStore.getState().loadRun(run.projectId, run.runId)
+      } catch (error) {
+        reportFailure(error, 'generationCommon.production.control.failed')
+      } finally {
+        actionInFlightRef.current = false
+      }
+    },
+    [executeCommand, production.run, reportFailure, t],
+  )
+
+  const navigationTarget = production.navigationTarget
+  const focusedArtifactId =
+    navigationTarget &&
+    navigationTarget.projectId === production.run?.projectId &&
+    navigationTarget.runId === production.run?.runId
+      ? (navigationTarget.artifactId ?? null)
+      : null
+
+  return { production, view, focusedArtifactId, actionError: failure?.identity === identity ? failure.message : null, onPrimaryAction, onControl }
+}

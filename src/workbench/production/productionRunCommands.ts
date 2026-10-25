@@ -1,0 +1,55 @@
+import type { ProductionRun, RunCommand } from '../../../electron/productionRun/productionRunTypes'
+
+/**
+ * 主进程的唯一判定（resumeOutlook）说「继续了也一镜都不会派」时，run.control 写口抛 NothingToResumeError（码 `nothing_to_resume`）。
+ * 跨 IPC 只剩错误原文，这里按码认它（与 isRevisionConflict 同一种认法）。
+ */
+export function isNothingToResume(error: unknown): boolean {
+  return /\bnothing_to_resume\b/.test(error instanceof Error ? error.message : String(error))
+}
+
+type ProductionCommandResult = {
+  run: ProductionRun
+  events: unknown[]
+}
+
+type ProductionRunCommandDeps = {
+  read: (projectId: string, runId: string) => Promise<ProductionRun | null>
+  execute: (projectId: string, runId: string, command: RunCommand) => Promise<ProductionCommandResult>
+}
+
+function isRevisionConflict(error: unknown): boolean {
+  return /productionrunrevisionconflict|production run revision conflict|revision[\s_-]*conflict/i.test(
+    error instanceof Error ? error.message : String(error),
+  )
+}
+
+/** Recover renderer commands from a concurrent durable Run update. */
+export async function executeProductionRunCommand(
+  projectId: string,
+  runId: string,
+  command: RunCommand,
+  deps: ProductionRunCommandDeps,
+): Promise<ProductionCommandResult> {
+  try {
+    return await deps.execute(projectId, runId, command)
+  } catch (error) {
+    if (!isRevisionConflict(error)) throw error
+
+    const latest = await deps.read(projectId, runId)
+    if (!latest) throw error
+
+    if (command.type === 'gate.decide') {
+      const gateId = typeof command.payload.gateId === 'string' ? command.payload.gateId : ''
+      const gate = latest.gates.find((candidate) => candidate.gateId === gateId)
+      // Another click/client may have completed the same gate while this
+      // request was in flight. Treat that as success and refresh the panel.
+      if (gate && gate.status !== 'waiting') return { run: latest, events: [] }
+    }
+
+    return deps.execute(projectId, runId, {
+      ...command,
+      expectedRevision: latest.revision,
+    })
+  }
+}

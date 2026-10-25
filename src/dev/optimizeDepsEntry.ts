@@ -1,0 +1,44 @@
+import 'react';
+import 'react/jsx-runtime';
+import 'react/jsx-dev-runtime';
+import 'react-dom';
+import 'react-dom/client';
+import 'react-router-dom';
+import 'diff';
+import '@floating-ui/dom';
+import '@mantine/core';
+import '@mantine/modals';
+import '@mantine/notifications';
+import '@react-three/drei';
+import '@react-three/fiber';
+import '@tanstack/react-virtual';
+import '@tiptap/core';
+import '@tiptap/extension-placeholder';
+import '@tiptap/extension-highlight';
+import '@tiptap/extension-list';
+import '@tiptap/extension-table';
+import '@tiptap/react';
+import '@tiptap/starter-kit';
+import '@tiptap/suggestion';
+// 富文本内核直接从这些 @tiptap/pm 子路径引 ProseMirror。必须与 @tiptap/starter-kit 进同一次预打包，
+// 让 prosemirror-* 去重成单实例——漏掉会让该子路径走未优化独立 ESM、与预打包实例分裂，
+// 触发创作区 Decoration 崩溃（vite.config.ts optimizeDeps.include 有同款条目与详释）。
+import '@tiptap/pm/view';
+import '@tiptap/pm/state';
+import '@tiptap/pm/model';
+import 'clsx';
+import 'framer-motion';
+import 'i18next';
+import 'react-i18next';
+import 'react-rnd';
+import 'react-reverse-portal';
+import 'streamdown';
+import '@photo-sphere-viewer/core';
+import 'tailwind-merge';
+import 'swr';
+import 'three';
+import 'zod';
+import 'zustand';
+import 'zustand/middleware';
+import 'zustand/middleware/immer';
+import 'zustand/traditional';

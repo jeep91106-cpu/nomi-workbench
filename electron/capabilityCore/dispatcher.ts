@@ -1,0 +1,798 @@
+// 能力核 · 方法路由（单一真相源）。
+// RPC 传输（rpcServer）与 headless host（host）共用这一份 method→core 映射，杜绝两份路由漂移（P1）。
+import crypto from 'node:crypto'
+import {
+  addProjectNodes,
+  connectProjectNodes,
+  createNamedProject,
+  deleteProjectNodes,
+  importProjectAsset,
+  listAllProjects,
+  setProjectNodePrompt,
+  type FetchTaskResultFn,
+  type RunTaskFn,
+} from './core'
+import { CANVAS_WRITE_HEADLESS_OPERATIONS, CANVAS_WRITE_LIVE_RENDERER_OPERATIONS, CANVAS_WRITE_OPERATIONS, canvasWriteSemanticInputSchema, type CanvasWriteOperation } from '../shared/agentCapabilities/canvasWrite'
+import { canvasDeleteSemanticInputSchema } from '../shared/agentCapabilities/canvasDelete'
+import { documentWriteSemanticInputSchema } from '../shared/agentCapabilities/documentWrite'
+import { readProjectDocument, writeProjectDocument } from './documentSurface'
+import { CanvasGraphError, type CanvasSnapshot } from './canvasGraph'
+import { listSkillSummariesForMcp, readSkillContentForMcp, readSkillRecords, type SkillMcpAccess } from '../skills/skillStore'
+import type { ProductionRunService } from '../productionRun/productionRunService'
+import type { ProductionBrief } from '../productionRun/productionRunTypes'
+import { isAnchorCheckpointGate } from '../productionRun/anchorCheckpoint'
+import { withPreApprovedPlan, type ProjectGateway } from './gateway'
+import { INTAKE_MAX_QUESTIONS, buildIntakeMessage, buildIntakeQuestions } from './mcpBriefIntake'
+import { isBuiltinMcpClient } from './security'
+import type { CapabilityOriginHost } from './security'
+import { classifyMcpGenerationRoute } from './mcpGenerationPolicy'
+import { dispatchSemanticGeneration, guardLegacyGenerationRoute, isSemanticGenerationRoute } from './generationDispatcher'
+import { RpcError, type RpcPublicErrorCode } from './rpcError'
+import { assertOnlyFields, optionalText, requiredIdentifier } from './dispatcherParams'
+import { issueTrustGrantChallenge } from './productionTrustGrantChallenge'
+export { RpcError } from './rpcError'
+export type { RpcPolicyErrorCode, RpcPolicyErrorDetails } from './rpcError'
+import type { ProjectLeaseV2 } from './projectLease'
+import type { GenerationInvocationContext } from '../shared/agentCapabilities/generationInvocationContext'
+import type { ApprovalReceiptAuthority, HumanApprovalReceiptV1 } from './approvalReceipt'
+import type { McpConnectionContext } from './mcpConnectionContext'
+import type { ProjectSessionAuthority } from './projectSessionAuthority'
+import {
+  getIntegrationSessionService,
+  type IntegrationSessionService,
+} from '../integrationCertification/integrationSession'
+import { withCredentialElicitationTicket } from '../integrationCertification/credentialElicitation'
+import { currentCatalogFingerprint, dispatchModelOnboarding } from './modelOnboarding/dispatch'
+import { buildOnboardingKit } from './modelOnboarding/kit'
+import { readTask } from './readTask'
+import { dispatchModelSpec } from './modelSpecRead'
+import { makeChangeId } from '../shared/agentCapabilities/changeId'
+import { NothingToResumeError } from '../productionRun/resumeOutlook'
+
+/** 带 id = 读那一个；不带 = 列出这个客户端自己的会话。 */
+const readIntegrationSession = (sessions: IntegrationSessionService, sessionId: unknown, owner: CapabilityOriginHost) =>
+  (typeof sessionId === 'string' && sessionId.trim() ? sessions.get(sessionId, owner) : sessions.list(owner))
+/**
+ * makeGateway：按 projectId 解析该用哪个网关——A 模式（app 开着且该项目正打开）→ 渲染层网关（实时）；
+ * 否则 → 磁盘网关（直写盘）。rpcServer 据 isProjectOpen + 渲染层可达性提供；headless host 恒磁盘网关。
+ */
+export type DispatchContext = {
+  runTask: RunTaskFn
+  fetchTaskResult?: FetchTaskResultFn
+  makeGateway: (projectId: string) => ProjectGateway
+  productionRuns: Pick<ProductionRunService, 'createDraft' | 'readProjection' | 'readEvents' | 'readArtifactProjection' | 'readFull' | 'command'> & Partial<{
+    /** Task 4 versioned artifact MCP seam. Optional keeps low-level test doubles/source-compatible. */
+    readArtifactContent: (projectId: string, runId: string, artifactId: string) => unknown
+    requestArtifactRevision: (input: { projectId: string; runId: string; artifactId: string; expectedVersion: number; instruction: string; kind: 'script' | 'storyboard' }) => unknown
+    reviewArtifact: (input: { projectId: string; runId: string; artifactId: string; expectedVersion: number; decision: 'approved' | 'changes_requested' | 'rejected' }) => unknown
+    materializeStoryboard: (input: { projectId: string; runId: string; artifactId: string; expectedVersion: number }) => unknown
+  }>
+  /** Transport-owned authority. Request bodies may provide only an audit label, never trust. */
+  origin?: { host: CapabilityOriginHost; actorId?: string }
+  /** The frozen server-side generation policy. Omit in legacy callers to build the default snapshot. */
+  /** One cohesive, transport-owned project-session authority for every leased MCP capability. */
+  projectSession?: Readonly<{
+    authority: ProjectSessionAuthority
+    connection: McpConnectionContext
+  }>
+  /** Optional read-only context seam. No semantic route may fall through to a legacy service. */
+  generationContext?: (params: Record<string, unknown>) => unknown | Promise<unknown>
+  /** Shared semantic planning/editing seam. MCP and GUI must provide the same handler; no provider call here. */
+  generationPlanning?: (input: { capability: string; params: Record<string, unknown>; lease?: ProjectLeaseV2; origin?: { host: CapabilityOriginHost; actorId?: string; sourceDocument?: { documentId: string; revision: number; contentHash: string } }; storyboardTarget?: GenerationInvocationContext['storyboardTarget']; modelNames?: GenerationInvocationContext['modelNames'] }) => unknown | Promise<unknown>
+  /** Main-process approval-receipt authority. Gate routes verify receipts here; the Run owner consumes them. */
+  approvalReceiptAuthority?: ApprovalReceiptAuthority
+  /** Run-owned challenge projection. It must recompute model/cost/contract from main-process state. */
+  requestGenerationGate?: (input: { params: Record<string, unknown>; lease: ProjectLeaseV2 }) => unknown | Promise<unknown>
+  /** Main-process GUI fallback for the exact challenge; it may return the receipt minted from the gesture. */
+  confirmGenerationInNomi?: (input: { challengeToken: string }) => Promise<unknown>
+  /**
+   * Run-owned generation authorization seam. It receives already verified
+   * lease/receipt bindings; the dispatcher never persists a second gate or
+   * mints a spend grant itself.
+   */
+  authorizeGeneration?: (input: {
+    params: Record<string, unknown>
+    lease: ProjectLeaseV2
+    receipt: HumanApprovalReceiptV1
+  }) => unknown | Promise<unknown>
+  /** Project-owner revision lookup. Receipt bindings never trust a revision supplied by the caller. */
+  projectRevisionResolver?: (projectId: string) => number | undefined
+  /**
+   * 方案已由协议层 elicitation-first 拿到真人 accept（画布确认，见 mcpProtocol.ts）→ `canvas.write`
+   * 的 create_canvas_nodes 预批准方案门、不再弹渲染层卡（免双问）。只作用于建节点那一步的 confirmPlan，
+   * 钱路不经这里（付费生成只走语义生成 → ProductionRun）。
+   */
+  planConfirmed?: boolean
+  /** Conversational model-integration session authority. External MCP clients drive begin→…→start here. */
+  integrationSessions?: IntegrationSessionService
+  /** GUI-owned credential handoff effect. Called after the durable handoff is queued. */
+  openCredentialsInNomi?: (input: { sessionId: string; vendorName: string }) => { opened: boolean } | void | Promise<{ opened: boolean } | void>
+  /**
+   * 用户此刻选的审批档位（宿主持有的那一份快照）。**它只被读，不被这一层解释**——
+   * 「该不该弹卡」带 Run 的入口只有 `directGenerationBrakes.ts#spendDecisionByPolicy` 回答（档位那一半是 `spendDecidedByPolicy`）。
+   * 不传 = 不猜档位 = 照旧弹卡，与 `generationTransportAdapters.decideByPolicyAfterDraft` 同一条纪律。
+   */
+  approvalPolicy?: () => import('../shared/agentCapabilities/capabilityApprovalPolicy').ProjectAgentApprovalPolicy | undefined
+}
+
+const PROJECT_SESSION_RETRY = 'Open a new project session and retry'
+
+function mcpSkillAccess(origin: DispatchContext['origin']): SkillMcpAccess {
+  // `origin.host` is populated only after the MCP client proof has been
+  // verified by the transport.  Treat every other caller as public; never
+  // trust an audience field supplied in tool params.
+  return isBuiltinMcpClient(origin?.host) ? 'local-authenticated' : 'public'
+}
+
+function errorCodeOf(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '') || undefined
+    : undefined
+}
+function leaseFailureCode(error: unknown): Extract<
+  RpcPublicErrorCode,
+  'lease_invalid' | 'project_scope_changed' | 'project_binding_stale' | 'lease_expired' | 'lease_revoked'
+> {
+  const code = errorCodeOf(error)
+  const message = error instanceof Error ? error.message : ''
+  if (code === 'project_binding_stale') return code
+  if (code === 'project_scope_changed'
+    && (/does not match (?:the )?current scope|scope is insufficient/i.test(message))) return code
+  if (code === 'lease_expired' || code === 'lease_revoked') return code
+  return 'lease_invalid'
+}
+
+function leasePublicError(error: unknown): RpcError {
+  const code = leaseFailureCode(error)
+  const message = code === 'lease_expired'
+    ? 'Project session lease has expired'
+    : code === 'lease_revoked'
+      ? 'Project session lease has been revoked'
+      : code === 'project_scope_changed'
+        ? 'Project session lease does not authorize this project or capability'
+        : code === 'project_binding_stale'
+          ? 'Project binding is stale'
+        : 'Project session lease is invalid'
+  return new RpcError(message, 403, {
+    code,
+    nextAction: PROJECT_SESSION_RETRY,
+    capability: 'project.session',
+  })
+}
+
+function projectSessionOpenPublicError(error: unknown): RpcError {
+  const code = errorCodeOf(error)
+  if (code === 'lease_expired' || code === 'lease_revoked' || code === 'project_scope_changed'
+    || code === 'project_binding_stale') {
+    return leasePublicError(error)
+  }
+  if (code === 'lease_required') {
+    return new RpcError('Project session request is invalid', 400, {
+      code: 'lease_required',
+      nextAction: 'Choose a project and open a new project session',
+      capability: 'project.session',
+    })
+  }
+  if (code === 'project_selection_denied') {
+    return new RpcError('Project selection is not authorized', 403, {
+      code,
+      nextAction: 'Choose an authorized project in Nomi',
+      capability: 'project.session',
+    })
+  }
+  if (code === 'project_identity_unavailable') {
+    return new RpcError('Project identity is unavailable', 503, {
+      code,
+      nextAction: 'Retry after the project identity is available',
+      capability: 'project.session',
+    })
+  }
+  return new RpcError('Project session is unavailable', 500, {
+    code: 'project_session_unavailable',
+    nextAction: 'Retry opening the project session',
+    capability: 'project.session',
+  })
+}
+
+async function leasedProject(
+  ctx: DispatchContext,
+  params: Record<string, unknown>,
+  scope: string,
+): Promise<ProjectLeaseV2> {
+  const session = ctx.projectSession
+  const leaseHandle = typeof params.leaseHandle === 'string' ? params.leaseHandle.trim() : ''
+  if (!session || !leaseHandle) {
+    throw new RpcError('A verified project-session lease is required', 403, {
+      code: 'lease_required', nextAction: PROJECT_SESSION_RETRY, capability: 'project.session',
+    })
+  }
+  try {
+    return await session.authority.verifyLease(leaseHandle, {
+      connection: session.connection,
+      ...(typeof params.projectId === 'string' && params.projectId.trim() ? { projectHint: params.projectId.trim() } : {}),
+      scope,
+    })
+  } catch (error) {
+    throw leasePublicError(error)
+  }
+}
+
+function proposalId(): string { return `proposal-${crypto.randomUUID()}` }
+
+function canvasRecovery(deviationCount = 0) {
+  return { ok: deviationCount === 0, deviationCount }
+}
+
+const canvasDeleteUndoJournal = new Map<string, Readonly<{ projectId: string; snapshot: CanvasSnapshot; deletedNodeIds: readonly string[] }>>()
+
+const PRODUCTION_START_FIELDS = new Set([
+  'projectId', 'playbook', 'playbookVersion', 'host', 'actorId', 'brief', 'trustLevel',
+])
+
+function stringList(value: unknown, label: string, maxItems = 20): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.length > maxItems) throw new RpcError(`Invalid ${label}`, 400)
+  return value.map((item, index) => optionalText(item, `${label}[${index}]`) as string)
+}
+
+function artifactVersion(value: unknown): number {
+  const version = Number(value)
+  if (!Number.isInteger(version) || version < 1) throw new RpcError('Invalid artifact version', 400)
+  return version
+}
+
+function revisionInstruction(value: unknown): string {
+  const instruction = typeof value === 'string' ? value.trim() : ''
+  if (!instruction || instruction.length > 4_000) throw new RpcError('Invalid revision instruction', 400)
+  return instruction
+}
+
+function artifactReadService(ctx: DispatchContext) {
+  if (typeof ctx.productionRuns.readArtifactContent !== 'function') throw new RpcError('Versioned artifact reads are unavailable', 501)
+  return ctx.productionRuns.readArtifactContent
+}
+
+function artifactRevisionService(ctx: DispatchContext) {
+  if (typeof ctx.productionRuns.requestArtifactRevision !== 'function') throw new RpcError('Artifact revisions are unavailable', 501)
+  return ctx.productionRuns.requestArtifactRevision
+}
+
+function artifactReviewService(ctx: DispatchContext) {
+  if (typeof ctx.productionRuns.reviewArtifact !== 'function') throw new RpcError('Artifact review is unavailable', 501)
+  return ctx.productionRuns.reviewArtifact
+}
+
+function storyboardMaterializeService(ctx: DispatchContext) {
+  if (typeof ctx.productionRuns.materializeStoryboard !== 'function') throw new RpcError('Storyboard materialization is unavailable', 501)
+  return ctx.productionRuns.materializeStoryboard
+}
+
+function productionBrief(value: unknown): ProductionBrief {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new RpcError('Invalid production brief', 400)
+  const raw = value as Record<string, unknown>
+  const allowed = new Set(['goal', 'audience', 'channel', 'tone', 'durationSeconds', 'sellingPoints', 'referenceArtifactIds'])
+  const unexpected = Object.keys(raw).find((key) => !allowed.has(key))
+  if (unexpected) throw new RpcError(`Production brief field is not allowed: ${unexpected}`, 400)
+  const goal = optionalText(raw.goal, 'brief goal', 2_000)
+  if (!goal) throw new RpcError('Production brief goal is required', 400)
+  const duration = raw.durationSeconds === undefined ? undefined : Number(raw.durationSeconds)
+  if (duration !== undefined && (!Number.isFinite(duration) || duration < 1 || duration > 3_600)) {
+    throw new RpcError('Invalid brief durationSeconds', 400)
+  }
+  return {
+    goal,
+    ...(optionalText(raw.audience, 'brief audience') ? { audience: optionalText(raw.audience, 'brief audience') } : {}),
+    ...(optionalText(raw.channel, 'brief channel') ? { channel: optionalText(raw.channel, 'brief channel') } : {}),
+    ...(optionalText(raw.tone, 'brief tone') ? { tone: optionalText(raw.tone, 'brief tone') } : {}),
+    ...(duration !== undefined ? { durationSeconds: duration } : {}),
+    ...(raw.sellingPoints !== undefined ? { sellingPoints: stringList(raw.sellingPoints, 'brief sellingPoints') } : {}),
+    ...(raw.referenceArtifactIds !== undefined
+      ? { referenceArtifactIds: stringList(raw.referenceArtifactIds, 'brief referenceArtifactIds') }
+      : {}),
+  }
+}
+
+function productionStartInput(params: Record<string, unknown>, authority: DispatchContext['origin']) {
+  const forbidden = Object.keys(params).find((key) => !PRODUCTION_START_FIELDS.has(key))
+  if (forbidden) throw new RpcError(`Production start field is not allowed: ${forbidden}`, 400)
+  const actorId = authority?.actorId ?? optionalText(params.actorId, 'origin actor', 160)
+  // B3：可选信任档位随草稿一起声明（不传 = 服务侧默认 key_confirm）。非法值早拒，不静默兜底。
+  let trustLevel: string | undefined
+  if (params.trustLevel !== undefined) {
+    trustLevel = String(params.trustLevel)
+    if (!['key_confirm', 'budget_only', 'confirm_all'].includes(trustLevel)) throw new RpcError('Invalid trust level', 400)
+  }
+  return {
+    projectId: requiredIdentifier(params.projectId, 'project'),
+    playbook: {
+      name: requiredIdentifier(params.playbook, 'playbook'),
+      version: optionalText(params.playbookVersion, 'playbook version', 120) ?? '1.0.0',
+    },
+    origin: {
+      host: authority?.host ?? 'external',
+      ...(actorId ? { actorId } : {}),
+    },
+    brief: productionBrief(params.brief),
+    ...(trustLevel ? { policy: { trustLevel: trustLevel as import('../productionRun/productionRunTypes').TrustLevel } } : {}),
+  }
+}
+
+/**
+ * 主进程（无头 stdio / 磁盘网关）自己就能落账的画布操作。
+ * 补集（分镜/站位/运镜/时间轴落地/整理布局）的耐久 owner 在渲染层创作区，主进程只能诚实地说「需要 GUI」，
+ * 不再假装那是一次生成计划。
+ */
+const HEADLESS_CANVAS_OPERATIONS: ReadonlySet<CanvasWriteOperation> = new Set<CanvasWriteOperation>(CANVAS_WRITE_HEADLESS_OPERATIONS)
+
+export async function dispatch(method: string, params: Record<string, unknown>, ctx: DispatchContext): Promise<unknown> {
+  if (method === 'nomi_session_open') {
+    if (!ctx.projectSession) throw projectSessionOpenPublicError(undefined)
+    try {
+      return await ctx.projectSession.authority.open(params, ctx.projectSession.connection)
+    } catch (error) {
+      throw projectSessionOpenPublicError(error)
+    }
+  }
+  const classifiedRoute = classifyMcpGenerationRoute(method)
+  const legacyRoute = classifiedRoute.kind === 'legacy'
+    ? classifiedRoute.route
+    : method.startsWith('production.')
+      ? method
+      : null
+  // production.decide-gate 是**免费可逆质量门表态**（方向/样片/冻结/锚定妆照检查点），不是单次付费生成。
+  // 它经 assertOnlyFields 只收 {projectId,runId,gateId,decision,choiceKey}——结构上就带不了任何真实生成绑定
+  //（leaseHandle/receiptId/contractHash…全被拒），其授权边界是本 case 自己的 scope 校验（只放行可逆门、
+  // 付费门仍 403 回 Nomi）。generationBindingGuard 把通用字段 `gateId` 也列作 marker（防生成路夹带），于是
+  // 这条只带 gateId 的门表态被 legacy 防火墙误伤（legacy_path_forbidden）。故此路显式豁免：marker 集不动
+  //（生成路仍拦），仅把「决门」这条正当可逆路径放行到它自己的 case 守卫。
+  if (legacyRoute && legacyRoute !== 'production.decide-gate') guardLegacyGenerationRoute(legacyRoute, params)
+  if (isSemanticGenerationRoute(method)) return dispatchSemanticGeneration(method, params, ctx)
+
+  switch (method) {
+    case 'ping':
+      return { ok: true }
+    case 'project.list': {
+      const projects = await listAllProjects()
+      // 每一行都带上可直接喂给 nomi_session_open 的 projectSelectionHandle。
+      // 修复前只有 project.create 会签发 handle（同一个 issueProjectSelection，此处不复制第二份签发逻辑），
+      // 于是没开 GUI 的外部宿主只能在「本次连接里刚建的项目」里干活：重启即失忆，用户已有的项目一个也接不上。
+      // 单个项目的身份校验失败（工程目录被移走/权限没了）只让**那一行**没有 handle，不连累整份列表 ——
+      // 列表本身是只读投影，宿主至少还能看见项目在。
+      if (!ctx.projectSession) return { projects }
+      const projectSession = ctx.projectSession
+      const withHandles = await Promise.all(projects.map(async (project) => {
+        try {
+          const selection = await projectSession.authority.issueProjectSelection('listed_project', project.id, projectSession.connection)
+          return { ...project, projectSelectionHandle: selection.handle.handleId }
+        } catch {
+          return project
+        }
+      }))
+      return { projects: withHandles }
+    }
+    case 'project.create': {
+      const created = createNamedProject(typeof params.name === 'string' ? params.name : undefined)
+      if (!ctx.projectSession) return created
+      const selection = await ctx.projectSession.authority.issueProjectSelection(
+        'created_project',
+        created.id,
+        ctx.projectSession.connection,
+      )
+      return { ...created, projectSelectionHandle: selection.handle.handleId }
+    }
+    case 'models.list':
+    case 'models.read':
+      // 模型目录的两档分级披露（薄名单 / 单模型详情），两档都住 modelSpecRead。
+      return dispatchModelSpec(method, params)
+    case 'skills.list':
+      // 导演/编剧技能库元数据（渐进披露，不含正文）。供 MCP 脊柱 resources/prompts 列表。
+      return { skills: listSkillSummariesForMcp(mcpSkillAccess(ctx.origin), await readSkillRecords()) }
+    case 'skills.read': {
+      // 按 name/directoryName 读一个技能正文。找不到 ⇒ null（协议层转 error）。
+      const packageVersion = typeof params.packageVersion === 'string' ? params.packageVersion : ''
+      const contentHash = typeof params.contentHash === 'string' ? params.contentHash : ''
+      return readSkillContentForMcp(
+        String(params.name || params.directoryName || ''),
+        mcpSkillAccess(ctx.origin),
+        await readSkillRecords(),
+        packageVersion && contentHash ? { packageVersion, contentHash } : undefined,
+        typeof params.filePath === 'string' ? params.filePath : undefined,
+      )
+    }
+    case 'production.start':
+      return ctx.productionRuns.createDraft(productionStartInput(params, ctx.origin))
+    case 'production.get':
+      assertOnlyFields(params, new Set(['projectId', 'runId']))
+      return ctx.productionRuns.readProjection(
+        requiredIdentifier(params.projectId, 'project'),
+        requiredIdentifier(params.runId, 'run'),
+      )
+    case 'production.events': {
+      assertOnlyFields(params, new Set(['projectId', 'runId', 'afterCursor', 'waitMs']))
+      const afterCursor = params.afterCursor === undefined ? 0 : Number(params.afterCursor)
+      const waitMs = params.waitMs === undefined ? 0 : Number(params.waitMs)
+      if (!Number.isInteger(afterCursor) || afterCursor < 0) throw new RpcError('Invalid production event cursor', 400)
+      if (!Number.isFinite(waitMs) || waitMs < 0 || waitMs > 25_000) throw new RpcError('Invalid production event waitMs', 400)
+      return ctx.productionRuns.readEvents(
+        requiredIdentifier(params.projectId, 'project'),
+        requiredIdentifier(params.runId, 'run'),
+        afterCursor,
+        Math.floor(waitMs),
+      )
+    }
+    case 'production.artifact':
+      assertOnlyFields(params, new Set(['projectId', 'runId', 'artifactId']))
+      return ctx.productionRuns.readArtifactProjection(
+        requiredIdentifier(params.projectId, 'project'),
+        requiredIdentifier(params.runId, 'run'),
+        requiredIdentifier(params.artifactId, 'artifact'),
+      )
+    case 'production.artifact.read': {
+      assertOnlyFields(params, new Set(['projectId', 'runId', 'artifactId']))
+      return artifactReadService(ctx)(
+        requiredIdentifier(params.projectId, 'project'),
+        requiredIdentifier(params.runId, 'run'),
+        requiredIdentifier(params.artifactId, 'artifact'),
+      )
+    }
+    case 'production.artifact.revise': {
+      assertOnlyFields(params, new Set(['projectId', 'runId', 'artifactId', 'expectedVersion', 'instruction', 'kind']))
+      const kind = params.kind === 'script' || params.kind === 'storyboard' ? params.kind : ''
+      if (!kind) throw new RpcError('Artifact revision kind must be script or storyboard', 400)
+      return artifactRevisionService(ctx)({
+        projectId: requiredIdentifier(params.projectId, 'project'),
+        runId: requiredIdentifier(params.runId, 'run'),
+        artifactId: requiredIdentifier(params.artifactId, 'artifact'),
+        expectedVersion: artifactVersion(params.expectedVersion),
+        instruction: revisionInstruction(params.instruction),
+        kind,
+      })
+    }
+    case 'production.artifact.review': {
+      assertOnlyFields(params, new Set(['projectId', 'runId', 'artifactId', 'expectedVersion', 'decision']))
+      const decision = params.decision === 'approved' || params.decision === 'changes_requested' || params.decision === 'rejected'
+        ? params.decision
+        : ''
+      if (!decision) throw new RpcError('Invalid artifact review decision', 400)
+      return artifactReviewService(ctx)({
+        projectId: requiredIdentifier(params.projectId, 'project'),
+        runId: requiredIdentifier(params.runId, 'run'),
+        artifactId: requiredIdentifier(params.artifactId, 'artifact'),
+        expectedVersion: artifactVersion(params.expectedVersion),
+        decision,
+      })
+    }
+    case 'production.storyboard.materialize': {
+      assertOnlyFields(params, new Set(['projectId', 'runId', 'artifactId', 'expectedVersion']))
+      return storyboardMaterializeService(ctx)({
+        projectId: requiredIdentifier(params.projectId, 'project'),
+        runId: requiredIdentifier(params.runId, 'run'),
+        artifactId: requiredIdentifier(params.artifactId, 'artifact'),
+        expectedVersion: artifactVersion(params.expectedVersion),
+      })
+    }
+    case 'production.trust-challenge': {
+      // 2026-09-10：降到 budget_only 前，先在**调用方客户端**里把逐镜价目与上限摊开问一次真人。
+      return issueTrustGrantChallenge(ctx, params)
+    }
+    case 'production.control': {
+      // A4：pause/resume/cancel。B3：set_trust（配 trustLevel）改信任档位。
+      // commandId 按 (action[/trustLevel], revision) 确定 → 同一状态下重复触发天然幂等。
+      assertOnlyFields(params, new Set(['projectId', 'runId', 'action', 'trustLevel', 'receiptId', 'receiptToken']))
+      const action = String(params.action || '')
+      if (!['pause', 'resume', 'cancel', 'set_trust'].includes(action)) throw new RpcError('Invalid production control action', 400)
+      const projectId = requiredIdentifier(params.projectId, 'project')
+      const runId = requiredIdentifier(params.runId, 'run')
+      const full = ctx.productionRuns.readFull(projectId, runId)
+      if (!full) throw new RpcError(`Production run not found: ${runId}`, 404)
+      if (action === 'set_trust') {
+        const trustLevel = String(params.trustLevel || '')
+        if (!['key_confirm', 'budget_only', 'confirm_all'].includes(trustLevel)) throw new RpcError('Invalid trust level', 400)
+        if (trustLevel !== 'confirm_all' && full.gates.some((gate) => gate.status === 'waiting'
+          && gate.scope === 'job_set' && gate.gateId.startsWith('gate-shot-'))) {
+          throw new RpcError('Decide the waiting shot in Nomi before changing its trust level', 403)
+        }
+        // 降档到 budget_only = 一次付费放行 → 带上客户端确认拿到的收据（Run 命令边界验+一次性消费）。
+        const receiptId = optionalText(params.receiptId, 'approval receipt id', 200)
+        const receiptToken = optionalText(params.receiptToken, 'approval receipt token', 8192)
+        await ctx.productionRuns.command(projectId, runId, {
+          commandId: `mcp-control-set_trust-${trustLevel}-${full.revision}`,
+          expectedRevision: full.revision,
+          type: 'run.control',
+          payload: {
+            action,
+            trustLevel,
+            ...(receiptId ? { receiptId } : {}),
+            ...(receiptToken ? { receiptToken } : {}),
+          },
+          issuedAt: new Date().toISOString(),
+        })
+        return ctx.productionRuns.readProjection(projectId, runId)
+      }
+      try {
+        await ctx.productionRuns.command(projectId, runId, { commandId: `mcp-control-${action}-${full.revision}`, expectedRevision: full.revision, type: 'run.control', payload: { action }, issuedAt: new Date().toISOString() })
+      } catch (error) {
+        // 「继续」了也一镜都不会派（唯一判定 resumeOutlook，写口拒绝）：不是出错，回结构化原因，Agent 照它说真话（#1139 V-1139c）。
+        if (!(error instanceof NothingToResumeError)) throw error
+        return { ...ctx.productionRuns.readProjection(projectId, runId), resume: { outcome: 'nothing_to_resume', removed: error.outlook.removed, canvas: error.outlook.canvas, failed: error.outlook.failed } }
+      }
+      return ctx.productionRuns.readProjection(projectId, runId)
+    }
+    case 'production.decide-gate': {
+      // B1：agent 已用 elicitation 问过真人，拿到 accept 才调这里表态一道门（方向门可带 choiceKey）。
+      assertOnlyFields(params, new Set(['projectId', 'runId', 'gateId', 'decision', 'choiceKey']))
+      const decision = String(params.decision || '')
+      if (decision !== 'approved' && decision !== 'rejected') throw new RpcError('Invalid production gate decision', 400)
+      const projectId = requiredIdentifier(params.projectId, 'project')
+      const runId = requiredIdentifier(params.runId, 'run')
+      const gateId = requiredIdentifier(params.gateId, 'gate')
+      const rawChoice = typeof params.choiceKey === 'string' ? params.choiceKey.trim() : ''
+      const choiceKey = /^[A-Za-z0-9._-]{1,40}$/.test(rawChoice) ? rawChoice : undefined
+      const full = ctx.productionRuns.readFull(projectId, runId)
+      if (!full) throw new RpcError(`Production run not found: ${runId}`, 404)
+      const gate = full.gates.find((item) => item.gateId === gateId)
+      if (!gate) throw new RpcError(`Production gate not found: ${gateId}`, 404)
+      const creativeGate = gate.scope === 'stage'
+        && (gate.gateId.startsWith('gate-direction-') || gate.gateId.startsWith('gate-sample-') || gate.gateId.startsWith('gate-freeze-'))
+      // P4 §3.2：锚定妆照检查点也是免费质量门（不授权任何预算，见 anchorCheckpoint.ts）→ 与创意门同权
+      // 可经真人 elicitation 确认后在此表态；决议落库后 service 钩子重踢批次。预算/导出/逐镜付费门仍必须回 Nomi。
+      if (!creativeGate && !isAnchorCheckpointGate(gate)) throw new RpcError('This production gate must be decided in Nomi', 403)
+      await ctx.productionRuns.command(projectId, runId, {
+        commandId: `mcp-decide-${gateId}-${decision}-${full.revision}`,
+        expectedRevision: full.revision,
+        type: 'gate.decide',
+        payload: { gateId, status: decision, ...(choiceKey ? { choiceKey } : {}) },
+        issuedAt: new Date().toISOString(),
+      })
+      return ctx.productionRuns.readProjection(projectId, runId)
+    }
+    case 'canvas.write': {
+      const lease = await leasedProject(ctx, params, 'canvas:write')
+      const raw = { ...params }
+      delete raw.leaseHandle
+      delete raw.projectId
+      // 未知 operation 必须当场说清「合法的有哪些」：Zod 的 discriminator 错误只会说
+      // "Invalid discriminator value"，模型据此没法自纠（MCP spec 要求输入错误可恢复）。
+      if (!CANVAS_WRITE_OPERATIONS.includes(raw.operation as CanvasWriteOperation)) {
+        throw new RpcError(`未知的画布操作：${JSON.stringify(raw.operation ?? null)}`, 400, {
+          code: 'capability_input_invalid',
+          nextAction: `Use one of: ${CANVAS_WRITE_OPERATIONS.join(', ')}`,
+          capability: 'canvas.write' as never,
+        })
+      }
+      const input = canvasWriteSemanticInputSchema.parse(raw)
+      const base = ctx.makeGateway(lease.projectId)
+      if (input.operation === 'set_node_prompt') {
+        const result = await setProjectNodePrompt(base, input.nodeId, input.prompt)
+        if (!result.changed) throw new CanvasGraphError('node_not_found', `Canvas node not found: ${input.nodeId}`)
+        const proposal = proposalId()
+        return { applied: true, proposalId: proposal, changeId: makeChangeId('canvas', proposal), operation: input.operation, affectedNodeIds: [input.nodeId], reconciliation: canvasRecovery() }
+      }
+      if (input.operation === 'create_canvas_nodes') {
+        // 这条 headless 路把 planned node **逐字段重建**成 `NodeSpec`（`canvasGraph.ts`，七个字段），
+        // 而 `artifact`（模型手写的 SVG/HTML/Markdown 正文）不在其中。渲染层那条路会把它交给
+        // `deliverAgentArtifact` 落盘再挂进 `meta.artifact`；这条路没有那一步，于是正文在重建的那一行
+        // **无声蒸发**：外部宿主收到 `applied: true` 和一个真节点 id，画布上是一个空壳，正文再也找不回来。
+        // 2026-09-18 扫描抓出（与镜头 `title` 死在五处手抄里是同一形态）。
+        //
+        // 在能拦住的最早一层**拒收**，而不是建一个空节点再说成功：这条路今天送不到，就别收下它。
+        // 补齐传输（headless 也走一次真落盘）是另一件事，那才是让它重新可用的办法。
+        const artifactNodes = input.nodes.filter((node) => node.artifact !== undefined).map((node) => node.clientId)
+        if (artifactNodes.length > 0) {
+          throw new RpcError(`这个宿主还不能保存手写产物的正文（${artifactNodes.join(', ')}）`, 400, {
+            code: 'capability_unsupported',
+            nextAction: 'Create the node without artifact content, or author the artifact inside the Nomi app.',
+            capability: 'canvas.write' as never,
+          })
+        }
+        const created = await addProjectNodes(
+          ctx.planConfirmed ? withPreApprovedPlan(base) : base,
+          input.nodes.map((node) => ({
+            kind: node.kind, title: node.title, prompt: node.prompt,
+            ...(node.position ? { x: node.position.x, y: node.position.y } : {}),
+            ...(node.vendor || node.modelVendor ? { vendor: node.vendor || node.modelVendor } : {}),
+            ...(node.modelKey ? { modelKey: node.modelKey } : {}),
+          })),
+          lease.projectId,
+        )
+        if (created.cancelled) return { applied: false, proposalId: proposalId(), operation: input.operation, cancelled: true, affectedNodeIds: [], affectedEdgeIds: [], clientIdToNodeId: {}, connectedCount: 0, skippedEdges: [], reconciliation: canvasRecovery() }
+        const clientIdToNodeId = Object.fromEntries(input.nodes.map((node, index) => [node.clientId, created.ids[index]]))
+        const edges = (input.edges ?? []).map((edge) => ({
+          source: clientIdToNodeId[edge.sourceClientId] ?? edge.sourceClientId,
+          target: clientIdToNodeId[edge.targetClientId] ?? edge.targetClientId,
+          ...(edge.mode ? { mode: edge.mode } : {}),
+        }))
+        const connected = edges.length
+          ? await connectProjectNodes(ctx.makeGateway(lease.projectId), edges)
+          : { edgeIds: [], skipped: [] }
+        const skippedEdges = connected.skipped.map((item) => ({ source: item.connection.source, target: item.connection.target, reason: item.reason }))
+        const proposal = proposalId()
+        return { applied: true, proposalId: proposal, changeId: makeChangeId('canvas', proposal), operation: input.operation, affectedNodeIds: created.ids, affectedEdgeIds: connected.edgeIds, clientIdToNodeId, connectedCount: connected.edgeIds.length, skippedEdges, reconciliation: canvasRecovery(skippedEdges.length) }
+      }
+      if (input.operation === 'connect_canvas_edges') {
+        const connected = await connectProjectNodes(ctx.makeGateway(lease.projectId), input.edges.map((edge) => ({
+          source: edge.sourceClientId, target: edge.targetClientId, ...(edge.mode ? { mode: edge.mode } : {}),
+        })))
+        const skippedEdges = connected.skipped.map((item) => ({ source: item.connection.source, target: item.connection.target, reason: item.reason }))
+        const proposal = proposalId()
+        return { applied: true, proposalId: proposal, changeId: makeChangeId('canvas', proposal), operation: input.operation, affectedNodeIds: [], affectedEdgeIds: connected.edgeIds, connectedCount: connected.edgeIds.length, skippedEdges, reconciliation: canvasRecovery(skippedEdges.length) }
+      }
+      // ── 剩下的 6 个 operation 是**渲染层拥有**的（分镜/站位/运镜/时间轴落地/整理布局）：
+      // 它们的耐久 owner 是创作区 store，主进程这条路没有实现。
+      //
+      // 曾经这里的兜底是 `ctx.generationPlanning({ capability: input.operation, ... })` —— 把画布动作
+      // 当成一次**生成计划**递进去。generationPlanning 只认 create/preview/gate_request/start… 这套
+      // 生成词表，收到 `tidy_canvas` 会先铸一个 `op-<uuid>` 再去查一个根本不存在的 production run，
+      // 于是宿主看到的是 `Production run not found: op-…` —— 一句像内部崩溃的话，而不是「这条路需要 GUI」。
+      // 更糟的是它**吞掉了未知 operation**：任何将来新增却没接上的动作都会变成同一句假崩溃。
+      //
+      // 现在按 MCP 规范办：结构性不可用 = isError 的工具错误 + **列全部合法 operation**，让模型能自纠。
+      throw new RpcError(
+        `画布操作 ${input.operation} 需要 Nomi 创作区正在运行（它的耐久 owner 是创作区，不是主进程）`,
+        501,
+        {
+          code: 'capability_unsupported',
+          nextAction: `Open the Nomi creation surface and retry. Operations available on this transport right now: ${[...HEADLESS_CANVAS_OPERATIONS].join(', ')}; with a project-session lease while Nomi is open also: ${CANVAS_WRITE_LIVE_RENDERER_OPERATIONS.join(', ')}`,
+          capability: 'canvas.write' as never,
+        },
+      )
+    }
+    case 'canvas.delete': {
+      const lease = await leasedProject(ctx, params, 'canvas:write')
+      const gateway = ctx.makeGateway(lease.projectId)
+      if (params.operation === 'undo_canvas_delete') {
+        const undoToken = typeof params.undoToken === 'string' ? params.undoToken.trim() : ''
+        const entry = canvasDeleteUndoJournal.get(undoToken)
+        if (!entry || entry.projectId !== lease.projectId) {
+          throw new RpcError('Canvas undo token is invalid or expired', 409, {
+            code: 'capability_input_invalid',
+            nextAction: 'Use the latest deletion receipt or refresh the Canvas and retry',
+            capability: 'canvas.delete',
+          })
+        }
+        const current = await gateway.readDoc()
+        const currentIds = new Set(current.nodes.map((node) => node.id))
+        const restoredNodes = entry.snapshot.nodes.filter((node) => entry.deletedNodeIds.includes(node.id) && !currentIds.has(node.id))
+        const restoredIds = restoredNodes.map((node) => node.id)
+        if (!restoredNodes.length) {
+          throw new RpcError('Canvas deletion has already been undone or superseded', 409, {
+            code: 'capability_input_invalid',
+            nextAction: 'Refresh the Canvas and continue from its current state',
+            capability: 'canvas.delete',
+          })
+        }
+        const restoredIdSet = new Set([...currentIds, ...restoredIds])
+        const currentEdgeIds = new Set(current.edges.map((edge) => edge.id))
+        const restoredEdges = entry.snapshot.edges.filter((edge) =>
+          !currentEdgeIds.has(edge.id) && restoredIdSet.has(edge.source) && restoredIdSet.has(edge.target))
+        await gateway.apply({ ...current, nodes: [...current.nodes, ...restoredNodes], edges: [...current.edges, ...restoredEdges] }, current, { restoredEdgeIds: restoredEdges.map((edge) => edge.id) })
+        canvasDeleteUndoJournal.delete(undoToken)
+        return {
+          applied: true,
+          proposalId: proposalId(),
+          operation: 'undo_canvas_delete',
+          restoredNodeIds: restoredIds,
+          recoveryActions: ['undo_applied'],
+          reconciliation: canvasRecovery(),
+        }
+      }
+      if (params.operation !== 'delete_canvas_nodes' || params.confirmation !== true) {
+        throw new RpcError('Human confirmation is required before deleting Canvas nodes', 403, { code: 'human_approval_required', nextAction: 'Confirm the destructive Canvas maintenance request and retry', capability: 'canvas.write' as never })
+      }
+      const input = canvasDeleteSemanticInputSchema.parse({ operation: 'delete_canvas_nodes', nodeIds: params.nodeIds, ...(typeof params.reason === 'string' ? { reason: params.reason } : {}) })
+      const before = await gateway.readDoc()
+      const deleted = await deleteProjectNodes(gateway, input.nodeIds)
+      if (!deleted.deleted.length) throw new CanvasGraphError('node_not_found', 'One or more canvas nodes were not found')
+      const undoToken = `undo-${crypto.randomUUID()}`
+      canvasDeleteUndoJournal.set(undoToken, { projectId: lease.projectId, snapshot: before, deletedNodeIds: deleted.deleted })
+      return {
+        applied: true,
+        proposalId: proposalId(),
+        operation: input.operation,
+        deletedNodeIds: deleted.deleted,
+        undoToken,
+        recoveryActions: ['Call nomi_canvas_maintenance with this undoToken before making another canvas edit.'],
+        reconciliation: canvasRecovery(),
+      }
+    }
+    case 'document.read': {
+      const lease = await leasedProject(ctx, params, 'document:read')
+      const scope = params.scope === 'selection' ? 'selection' : params.scope === 'full' ? 'full' : null
+      if (!scope) throw new RpcError('Document scope is required', 400, { code: 'capability_input_invalid', nextAction: 'Retry with scope full or selection', capability: 'document.read' as never })
+      return readProjectDocument(lease.projectId, typeof params.documentId === 'string' ? params.documentId : undefined, scope)
+    }
+    case 'document.write': {
+      const lease = await leasedProject(ctx, params, 'document:write')
+      const input = documentWriteSemanticInputSchema.parse({ operation: params.operation, content: params.content })
+      return writeProjectDocument(lease.projectId, typeof params.documentId === 'string' ? params.documentId : undefined, input.operation, input.content)
+    }
+    case 'brief.intake': {
+      // W3 幕 0：只组题/给默认，**不落任何状态**——真正的「问」由协议层弹 elicitation（enum 候选），
+      // 客户端不支持表单时协议层退化成把题面交给模型在对话里一次问全。
+      assertOnlyFields(params, new Set(['projectId', 'kind']))
+      const questions = buildIntakeQuestions({ kind: typeof params.kind === 'string' ? params.kind : '' })
+      return { questions, message: buildIntakeMessage(questions), maxQuestions: INTAKE_MAX_QUESTIONS }
+    }
+    case 'asset.import':
+      // M2：本机文件 → 项目素材 → nomi-local:// URL。安全判据在 importAssetGuard（纯函数，逐条单测）。
+      assertOnlyFields(params, new Set(['projectId', 'path', 'title']))
+      return importProjectAsset({
+        projectId: requiredIdentifier(params.projectId, 'project'),
+        path: String(params.path || ''),
+        ...(typeof params.title === 'string' && params.title.trim() ? { title: params.title.trim() } : {}),
+      })
+    case 'integration.begin': {
+      const optional = ['sessionId', 'baseUrl', 'docs', 'providerKind', 'authType', 'authHeader', 'authQueryParam', 'clientRequestId'] as const
+      return (ctx.integrationSessions || getIntegrationSessionService()).begin(
+        {
+          kind: params.kind as 'http-api-provider' | 'comfyui-workflow',
+          name: params.name as string,
+          ...Object.fromEntries(optional.filter((key) => typeof params[key] === 'string').map((key) => [key, params[key]])),
+        },
+        ctx.origin?.host || 'external',
+      )
+    }
+    case 'integration.open_credentials': {
+      const opened = (ctx.integrationSessions || getIntegrationSessionService()).openCredentials(
+        params.sessionId,
+        params.expectedRevision,
+        ctx.origin?.host || 'external',
+      )
+      // 窗口可能在「落盘排队」与「叫渲染层」之间消失：不让 MCP 契约因此不可用，排队的交接单会在
+      // Nomi 下次打开时重放。一次性凭据页（URL 模式 elicitation）铸在这一层 = 铸在持有会话的那个进程里。
+      const ui = await Promise.resolve(ctx.openCredentialsInNomi?.({ sessionId: opened.id, vendorName: opened.config.name })).catch(() => undefined)
+      return withCredentialElicitationTicket({ ...opened, credentialUiOpened: ui?.opened === true })
+    }
+    case 'integration.propose':
+      return (ctx.integrationSessions || getIntegrationSessionService()).propose(
+        params.sessionId,
+        params.expectedRevision,
+        ctx.origin?.host || 'external',
+        params.proposal,
+      )
+    case 'integration.start':
+      return (ctx.integrationSessions || getIntegrationSessionService()).start(
+        params.sessionId,
+        params.expectedRevision,
+        ctx.origin?.host || 'external',
+        params.idempotencyKey as string,
+      )
+    // 不带 sessionId = 「我把 id 弄丢了」。修复前这里直接报 Invalid sessionId，而 MCP 面上没有第二条路。
+    case 'integration.get':
+      return readIntegrationSession(ctx.integrationSessions || getIntegrationSessionService(), params.setupId ?? params.sessionId, ctx.origin?.host || 'external')
+    case 'integration.cancel':
+      return (ctx.integrationSessions || getIntegrationSessionService()).cancel(
+        params.sessionId,
+        params.expectedRevision,
+        ctx.origin?.host || 'external',
+      )
+    // 接入套件：**无前置的只读常量**（schema + 撰写规范 + 两份样例卡）。它不读任何用户数据，
+    // 所以也不要求签名身份——要求它等于把「读一份公开 schema」也挡在门外，而那正是
+    // 2026-09-21 实测里 AI 什么都做不了的那道墙。
+    case 'model.onboarding.kit':
+      return buildOnboardingKit()
+    // 按任务号查一个已提交异步任务的现状（nomi_try_model 的 still_processing 之后用）。只读：只走 fetchTaskResult，不碰 runTask。
+    case 'task.read': {
+      if (typeof params.taskId !== 'string' || !params.taskId.trim()) throw new RpcError('taskId is required for target=task', 400)
+      return readTask({ ...(ctx.fetchTaskResult ? { fetchTaskResult: ctx.fetchTaskResult } : {}) }, params)
+    }
+    // 接模型：三个 App 级能力（§4.1）。方法名 = 契约 id，与 tools/list 上那几个名字同源。
+    case 'model.onboarding.setup':
+    case 'model.onboarding.try':
+    case 'model.onboarding.remove': {
+      if (ctx.origin?.host === 'external' || !ctx.origin?.host) throw new RpcError('Signed client identity is required', 403)
+      return dispatchModelOnboarding(method, params, {
+        owner: ctx.origin.host,
+        ...(ctx.integrationSessions ? { sessions: ctx.integrationSessions } : {}),
+        ...(ctx.openCredentialsInNomi ? { openCredentialsInNomi: ctx.openCredentialsInNomi } : {}),
+        // 试跑走的就是画布那条执行器；这里只是把同一个 runTask 递过去，不另起一条。
+        runTask: ctx.runTask, ...(ctx.fetchTaskResult ? { fetchTaskResult: ctx.fetchTaskResult } : {}),
+        // 「该不该问人」由用户的档位决定，不由入口决定：档位原样往下递，判据只有
+        // `spendDecidedByPolicy` 一处。宿主没给 = 不猜 = 照旧问人。
+        ...(ctx.approvalPolicy ? { approvalPolicy: ctx.approvalPolicy } : {}),
+      })
+    }
+    default:
+      throw new RpcError(`未知方法: ${method}`, 404)
+  }
+}

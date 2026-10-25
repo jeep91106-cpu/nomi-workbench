@@ -1,0 +1,134 @@
+import React, { type JSX } from 'react'
+import { cn } from '../../utils/cn'
+import { usePointerSession } from '../timeline/timelineGesture'
+import {
+  clampCenter,
+  clampScale,
+  pixelToCenter,
+  snapCenterToGuides,
+  type Vec2,
+} from '../timeline/overlayTransform'
+
+type TransformPatch = { position?: Vec2; scale?: number }
+
+type OverlaySelectionBoxProps = {
+  /** 元素中心（归一化 0~1）*/
+  centerNorm: Vec2
+  /** 当前缩放（用于四角把手按比例换算）*/
+  scale: number
+  /** 舞台像素尺寸（归一化↔像素换算）*/
+  stageWidth: number
+  stageHeight: number
+  /** 拖动/缩放回调；commit=false 为拖动中（不落盘），true 为松手。*/
+  onTransform: (patch: TransformPatch, commit: boolean) => void
+  /** 吸附引导线变化（归一化坐标，null=无）。*/
+  onSnapGuides: (guides: { x: number | null; y: number | null }) => void
+  children: React.ReactNode
+  /**
+   * 双击（改字）挂在框本身：拖动开始时框对指针 setPointerCapture，之后的 click / dblclick 都派发给框、不再落到里层内容，
+   * 里层的 onDoubleClick 永远收不到（#1136 复核实测：选中态双击字幕进不了编辑）。
+   */
+  onDoubleClick?: () => void
+}
+
+const HANDLE_KEYS = ['nw', 'ne', 'se', 'sw'] as const
+const HANDLE_POS: Record<(typeof HANDLE_KEYS)[number], string> = {
+  nw: '-top-[5px] -left-[5px] cursor-nwse-resize',
+  ne: '-top-[5px] -right-[5px] cursor-nesw-resize',
+  se: '-bottom-[5px] -right-[5px] cursor-nwse-resize',
+  sw: '-bottom-[5px] -left-[5px] cursor-nesw-resize',
+}
+
+/**
+ * 通用叠加层选择框（content-agnostic）：拖动改 position、四角改 scale、中线吸附。
+ * 只认「中心 transform + 任意 children」——文字/图片/贴纸将来都能复用；不绑「文字」。
+ */
+export default function OverlaySelectionBox({
+  centerNorm,
+  scale,
+  stageWidth,
+  stageHeight,
+  onTransform,
+  onSnapGuides,
+  onDoubleClick,
+  children,
+}: OverlaySelectionBoxProps): JSX.Element {
+  const startSession = usePointerSession()
+
+  const beginBodyDrag = React.useCallback((event: React.PointerEvent<HTMLElement>) => {
+    if ((event.target as HTMLElement).closest('[data-handle]')) return
+    event.preventDefault()
+    event.stopPropagation()
+    const startX = event.clientX
+    const startY = event.clientY
+    const startCenterPx = { x: centerNorm.x * stageWidth, y: centerNorm.y * stageHeight }
+    const startCenter = { x: centerNorm.x, y: centerNorm.y }
+
+    const apply = (clientX: number, clientY: number, commit: boolean) => {
+      const px = { x: startCenterPx.x + (clientX - startX), y: startCenterPx.y + (clientY - startY) }
+      const snapped = snapCenterToGuides(clampCenter(pixelToCenter(px, stageWidth, stageHeight)))
+      onSnapGuides({ x: snapped.guideX, y: snapped.guideY })
+      onTransform({ position: snapped.center }, commit)
+    }
+    startSession({
+      event,
+      onMove: (move) => apply(move.clientX, move.clientY, false),
+      onCommit: (up) => apply(up.clientX, up.clientY, true),
+      // 被打断：位置回到拖之前（并落盘一次，把拖动中的临时值盖掉）。
+      onCancel: () => onTransform({ position: startCenter }, true),
+      onEnd: () => onSnapGuides({ x: null, y: null }),
+    })
+  }, [centerNorm.x, centerNorm.y, onSnapGuides, onTransform, startSession, stageHeight, stageWidth])
+
+  const beginHandleScale = React.useCallback((event: React.PointerEvent<HTMLElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const centerPx = { x: centerNorm.x * stageWidth, y: centerNorm.y * stageHeight }
+    const startDist = Math.hypot(event.clientX - centerPx.x, event.clientY - centerPx.y) || 1
+    const startScale = scale
+
+    const apply = (clientX: number, clientY: number, commit: boolean) => {
+      const dist = Math.hypot(clientX - centerPx.x, clientY - centerPx.y)
+      onTransform({ scale: clampScale(startScale * (dist / startDist)) }, commit)
+    }
+    startSession({
+      event,
+      onMove: (move) => apply(move.clientX, move.clientY, false),
+      onCommit: (up) => apply(up.clientX, up.clientY, true),
+      onCancel: () => onTransform({ scale: startScale }, true),
+    })
+  }, [centerNorm.x, centerNorm.y, onTransform, scale, startSession, stageHeight, stageWidth])
+
+  return (
+    <div
+      className={cn(
+        'workbench-overlay-selection',
+        'absolute pointer-events-auto cursor-move touch-none',
+        'outline outline-2 outline-[var(--nomi-ink)]',
+      )}
+      style={{
+        left: `${centerNorm.x * stageWidth}px`,
+        top: `${centerNorm.y * stageHeight}px`,
+        transform: 'translate(-50%, -50%)',
+      }}
+      onPointerDown={beginBodyDrag}
+      onDoubleClick={onDoubleClick ? (event) => { event.stopPropagation(); onDoubleClick() } : undefined}
+    >
+      {children}
+      {HANDLE_KEYS.map((key) => (
+        <span
+          key={key}
+          data-handle={key}
+          className={cn(
+            'workbench-overlay-selection__handle',
+            'absolute w-[10px] h-[10px] rounded-nomi-sm touch-none',
+            'border-[1.5px] border-[var(--nomi-ink)] bg-[var(--nomi-paper)]',
+            'shadow-nomi-sm',
+            HANDLE_POS[key],
+          )}
+          onPointerDown={beginHandleScale}
+        />
+      ))}
+    </div>
+  )
+}

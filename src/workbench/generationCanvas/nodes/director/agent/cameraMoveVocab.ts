@@ -1,0 +1,61 @@
+/**
+ * [INPUT]: 依赖 ./stagingVocab 的 SHOT_FRAMING / StagingShot（景别复用站位词表，单一真相源）、electron/shared/director/vocab 的 CAMERA_MOVES / CameraMove
+ * [OUTPUT]: 对外提供 CameraMove / ZOOM_MOVES、CameraSpeed / CAMERA_SPEED_DURATION、CAMERA_MOVE_LABEL / CAMERA_MOVE_LABEL_EN、CAMERA_MOVE_FRAMING、CAMERA_MOVE_DESC，
+ *           再导出 CAMERA_MOVES / SHOT_FRAMING / StagingShot
+ * [POS]: director/agent 的运镜词汇表（原 V1 cameraMoveVocab，切换门入籍）：13 个电影运镜（10 个机位运动 + 3 个变焦族），
+ *        Agent 工具 create_camera_move 的受理回执与工具摘要、运镜小片搭建（./cameraMoveBuilder）、挂接的提示词地板、镜头条的运镜名都从这里取
+ *        （视频节点上的手动「运镜」控件 2026-09-12 已删，c1b1c9e02）。
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+import { SHOT_FRAMING, type StagingShot } from './stagingVocab'
+import { CAMERA_MOVES, type CameraMove } from '../../../../../../electron/shared/director/vocab'
+
+export { CAMERA_MOVES }
+
+export { SHOT_FRAMING }
+export type { StagingShot }
+
+
+// 变焦族（FOV 随段进度渐变）
+export const ZOOM_MOVES = new Set<CameraMove>(['zoom_in', 'zoom_out', 'dolly_zoom'])
+
+// 运镜速度 → 时长（秒），落在 Seedance 3-8s 甜区内
+export type CameraSpeed = 'slow' | 'medium' | 'fast'
+export const CAMERA_SPEED_DURATION: Record<CameraSpeed, number> = { slow: 8, medium: 5, fast: 3 }
+
+export const CAMERA_MOVE_LABEL: Record<string, string> = {
+  static: '固定', follow: '跟随', pan: '横摇', tilt: '俯仰', whip: '甩镜', rack_focus: '移焦',
+  orbit_left: '左环绕', orbit_right: '右环绕', push_in: '推近', pull_out: '拉远', crane_up: '升镜', crane_down: '降镜',
+  track_left: '左横移跟拍', track_right: '右横移跟拍', arc_left: '左弧线', arc_right: '右弧线',
+  zoom_in: '变焦推', zoom_out: '变焦拉', dolly_zoom: '希区柯克变焦',
+}
+
+export const CAMERA_MOVE_LABEL_EN: Record<string, string> = {
+  static: 'Static', follow: 'Follow', pan: 'Pan', tilt: 'Tilt', whip: 'Whip pan', rack_focus: 'Rack focus',
+  orbit_left: 'Orbit left', orbit_right: 'Orbit right', push_in: 'Push in', pull_out: 'Pull out', crane_up: 'Crane up', crane_down: 'Crane down',
+  track_left: 'Track left', track_right: 'Track right', arc_left: 'Arc left', arc_right: 'Arc right',
+  zoom_in: 'Zoom in', zoom_out: 'Zoom out', dolly_zoom: 'Dolly zoom',
+}
+
+// 运镜专属景别（distance/fov）：让整个 2.5 高的主体始终在框内且留余量（可见竖向 = 2·distance·tan(fov/2) ≥ 3.0）
+export const CAMERA_MOVE_FRAMING: Record<StagingShot, { distance: number; fov: number }> = {
+  wide: { distance: 7, fov: 40 },
+  medium: { distance: 4.8, fov: 40 },
+  close: { distance: 3.6, fov: 46 },
+}
+
+export const CAMERA_MOVE_DESC: Record<CameraMove, string> = {
+  orbit_left: '相机绕主体逆时针大角度环绕（约 300°），展示主体四周空间。',
+  orbit_right: '相机绕主体顺时针大角度环绕（约 300°），展示主体四周空间。',
+  push_in: '相机正面推近主体，逐渐放大主体、强化压迫感或聚焦。',
+  pull_out: '相机从主体拉远，逐渐揭示环境、收尾或退场感。',
+  crane_up: '相机在主体前方升高（升降臂上摇），从平视升到俯视。',
+  crane_down: '相机在主体前方降低，从俯视降到平视或仰视。',
+  track_left: '相机在主体前方向左横移跟拍（平移），保持距离不变。',
+  track_right: '相机在主体前方向右横移跟拍（平移），保持距离不变。',
+  arc_left: '相机绕主体逆时针小角度弧线（约 90°），轻微换视角。',
+  arc_right: '相机绕主体顺时针小角度弧线（约 90°），轻微换视角。',
+  zoom_in: '机位不动，镜头变焦推近（FOV 收窄），画面放大、空间压缩感。',
+  zoom_out: '机位不动，镜头变焦拉远（FOV 放宽），画面变广、揭示环境。',
+  dolly_zoom: '希区柯克变焦：机位后拉同时变焦推近，主体大小不变、背景被抽离拉伸（眩晕感）。',
+}

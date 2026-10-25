@@ -1,0 +1,468 @@
+import { describe, expect, it } from "vitest";
+
+import { deriveBatchPlan, type BatchDerivationInput } from "./batchScheduleDerivation";
+import type {
+  ProductionGate,
+  ProductionGenerationPlan,
+  ProductionGenerationShot,
+  ProductionJob,
+  ProductionRun,
+} from "./productionRunTypes";
+import type { ExecutionContractV1, PlanCandidate } from "../capabilityCore/executionContract";
+
+// P4 S4 — pure batch derivation. TDD: these lock the "no second source of truth" contract. Every
+// tick recomputes the next dispatch set from (plan.shots + jobs[] + anchor gate) alone;
+// a crash-restart re-runs the SAME function over the durable Run and gets the SAME answer.
+
+const NOW = "2026-08-25T00:00:00.000Z";
+
+function candidate(id: string): PlanCandidate {
+  return {
+    candidateId: id,
+    revision: 1,
+    moduleId: "generation.single-shot",
+    providerId: "apimart",
+    modelId: "video-model",
+    mode: "image-to-video",
+    prompt: `shot ${id}`,
+    parameters: {},
+    references: [],
+  };
+}
+
+function contractFor(id: string, hash: string): ExecutionContractV1 {
+  return {
+    schemaVersion: 1,
+    candidateId: id,
+    candidateRevision: 1,
+    moduleId: "generation.single-shot",
+    moduleVersion: "1.0.0",
+    providerId: "apimart",
+    modelId: "video-model",
+    mode: "image-to-video",
+    prompt: `shot ${id}`,
+    parameters: {},
+    references: [],
+    contractHash: hash,
+    warnings: [],
+  };
+}
+
+function shot(shotId: string, hash: string, extra: Partial<ProductionGenerationShot> = {}): ProductionGenerationShot {
+  return {
+    shotId,
+    candidate: { ...candidate(shotId), sealedContractHash: hash },
+    contract: contractFor(shotId, hash),
+    approvedReceiptId: "receipt-plan",
+    updatedAt: NOW,
+    ...extra,
+  };
+}
+
+/** A sealed+approved multi-shot plan with the given shots. */
+function sealedPlan(shots: ProductionGenerationShot[]): ProductionGenerationPlan {
+  return {
+    operationId: "op-batch",
+    state: "submitted",
+    candidate: shots[0].candidate,
+    contract: shots[0].contract,
+    shots,
+    updatedAt: NOW,
+  };
+}
+
+/** A durable job for a given shot/attempt at a given status — mirrors what the submission facade writes. */
+function jobFor(shotId: string, hash: string, status: ProductionJob["status"], attempt = 1): ProductionJob {
+  const shotSegment = shotId ? `-${shotId}` : "";
+  const jobId = `generation-op-batch${shotSegment}-${hash.slice(0, 16)}${attempt > 1 ? `-attempt-${attempt}` : ""}`;
+  return {
+    jobId,
+    stageId: "generate",
+    status,
+    attempt,
+    provider: "apimart",
+    model: "video-model",
+    idempotencyKey: `generation:op-batch:${shotId}:${hash}:attempt-${attempt}`,
+    ...(shotId ? { metadata: { shotId } } : {}),
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+}
+
+function authorizedJobsFor(shots: ProductionGenerationShot[]): ProductionJob[] {
+  return shots
+    .filter((entry) => entry.included !== false && entry.contract)
+    .map((entry) => jobFor(entry.shotId, entry.contract!.contractHash, "authorized", entry.attemptCount ?? 1));
+}
+
+const ANCHOR_HASH = "n".repeat(64);
+
+/** An anchor entry in the plan: a role:"anchor" shot with an image sub-contract. */
+function anchorShot(shotId: string, extra: Partial<ProductionGenerationShot> = {}): ProductionGenerationShot {
+  return { ...shot(shotId, ANCHOR_HASH, extra), role: "anchor" };
+}
+
+/** A ready durable job for an anchor shot (jobId follows jobIdFor, same machinery as video shots). */
+function anchorJobReady(shotId: string, attempt = 1): ProductionJob {
+  return { ...jobFor(shotId, ANCHOR_HASH, "ready", attempt), model: "image-model" };
+}
+
+/** The anchor checkpoint gate; its jobIds reference the anchor's derived jobId. */
+function anchorCheckpointGate(status: ProductionGate["status"], createdAt = NOW): ProductionGate {
+  return {
+    gateId: "gate-anchor-checkpoint-op-batch",
+    scope: "anchor_checkpoint",
+    status,
+    planHash: "plan-hash-batch",
+    jobIds: [jobFor("anchor-1", ANCHOR_HASH, "ready").jobId],
+    title: "锚亮相检查点",
+    summary: "过目主角形象再开拍",
+    createdAt,
+    expiresAt: "2026-08-26T00:00:00.000Z",
+  };
+}
+
+/** Base input: two included shots, no anchor requirement, running. */
+function baseInput(overrides: Partial<BatchDerivationInput> & { budget?: ProductionRun["budget"] } = {}): BatchDerivationInput {
+  const shots = [shot("shot-a", "a".repeat(64)), shot("shot-b", "b".repeat(64))];
+  const base = {
+    runId: "op-batch",
+    runStatus: "running",
+    plan: sealedPlan(shots),
+    jobs: authorizedJobsFor(shots),
+    budget: { currency: "CNY", authorized: 100, reserved: 0, actual: 0, unsettled: 0, unknownInFlight: 0 },
+    anchorGate: undefined,
+    now: NOW,
+    ...overrides,
+  } as Omit<BatchDerivationInput, "run"> & { budget: ProductionRun["budget"] };
+  const { budget: _budget, ...input } = base;
+  return {
+    ...input,
+    run: {
+      runId: base.runId,
+      projectId: "project",
+      revision: 1,
+      status: base.runStatus,
+      stageId: "generate" as ProductionRun["stageId"],
+      playbook: { name: "production", version: "test" },
+      origin: { host: "test" },
+      budget: base.budget,
+      jobs: base.jobs,
+      generationPlan: base.plan,
+      createdAt: NOW,
+      updatedAt: NOW,
+    } as ProductionRun,
+  };
+}
+
+describe("P4 S4 deriveBatchPlan — shot dispatch", () => {
+  it("dispatches every included shot with a gate-authorized job (no anchor requirement)", () => {
+    const result = deriveBatchPlan(baseInput());
+    expect(result.shotDispatch.map((s) => s.shotId)).toEqual(["shot-a", "shot-b"]);
+    expect(result.anchorDispatch).toEqual([]);
+  });
+
+  it("excludes shots marked included:false", () => {
+    const shots = [shot("shot-a", "a".repeat(64)), shot("shot-b", "b".repeat(64), { included: false })];
+    const result = deriveBatchPlan(baseInput({ plan: sealedPlan(shots) }));
+    expect(result.shotDispatch.map((s) => s.shotId)).toEqual(["shot-a"]);
+  });
+
+  it("does not re-dispatch a shot that already has a durable job (crash-recovery re-run)", () => {
+    // A restart re-runs derivation over the durable Run: shot-a already submitted, shot-b not.
+    const jobs = [
+      jobFor("shot-a", "a".repeat(64), "provider_accepted"),
+      jobFor("shot-b", "b".repeat(64), "authorized"),
+    ];
+    const result = deriveBatchPlan(baseInput({ jobs }));
+    expect(result.shotDispatch.map((s) => s.shotId)).toEqual(["shot-b"]);
+  });
+
+  it("treats a terminal (ready) shot job as done — never re-dispatches it", () => {
+    const jobs = [
+      jobFor("shot-a", "a".repeat(64), "ready"),
+      jobFor("shot-b", "b".repeat(64), "adopted"),
+    ];
+    const result = deriveBatchPlan(baseInput({ jobs }));
+    expect(result.shotDispatch).toEqual([]);
+  });
+
+  it("re-dispatches only the current attempt when a shot has a fresh (higher) attemptCount but no job for it yet", () => {
+    // A fresh reauthorization bumped shot-a to attempt 2 and atomically created its authorized job.
+    const shots = [
+      shot("shot-a", "a".repeat(64), { attemptCount: 2 }),
+      shot("shot-b", "b".repeat(64)),
+    ];
+    const jobs = [
+      jobFor("shot-a", "a".repeat(64), "needs_attention", 1),
+      jobFor("shot-a", "a".repeat(64), "authorized", 2),
+      jobFor("shot-b", "b".repeat(64), "authorized"),
+    ];
+    const result = deriveBatchPlan(baseInput({ plan: sealedPlan(shots), jobs }));
+    const shotA = result.shotDispatch.find((s) => s.shotId === "shot-a");
+    expect(shotA?.attempt).toBe(2);
+  });
+});
+
+/** A plan with one anchor-role shot + two video shots (the雨夜便利店 shape). */
+function planWithAnchor(anchorExtra: Partial<ProductionGenerationShot> = {}): ProductionGenerationPlan {
+  return sealedPlan([
+    anchorShot("anchor-1", anchorExtra),
+    shot("shot-a", "a".repeat(64)),
+    shot("shot-b", "b".repeat(64)),
+  ]);
+}
+
+describe("P4 S4 deriveBatchPlan — anchor + checkpoint", () => {
+  it("dispatches anchors first and blocks shots until anchors have jobs", () => {
+    const plan = planWithAnchor();
+    const result = deriveBatchPlan(baseInput({ plan, jobs: authorizedJobsFor(plan.shots ?? []) }));
+    expect(result.anchorDispatch.map((a) => a.shotId)).toEqual(["anchor-1"]);
+    // No checkpoint approval yet and anchors not even generated → shots blocked.
+    expect(result.shotDispatch).toEqual([]);
+    expect(result.checkpoint.status).toBe("pending_anchors");
+  });
+
+  it("does not release shots while the anchor checkpoint gate is waiting", () => {
+    // Anchor job is ready but the checkpoint gate is still waiting for the user to approve the look.
+    const result = deriveBatchPlan(baseInput({
+      plan: planWithAnchor(),
+      jobs: [anchorJobReady("anchor-1"), ...authorizedJobsFor(planWithAnchor().shots!.slice(1))],
+      anchorGate: anchorCheckpointGate("waiting"),
+    }));
+    expect(result.anchorDispatch).toEqual([]); // anchor already has a job
+    expect(result.shotDispatch).toEqual([]); // gate waiting → shots blocked
+    expect(result.checkpoint.status).toBe("waiting");
+  });
+
+  it("releases shots once the anchor checkpoint gate is approved", () => {
+    const result = deriveBatchPlan(baseInput({
+      plan: planWithAnchor(),
+      jobs: [anchorJobReady("anchor-1"), ...authorizedJobsFor(planWithAnchor().shots!.slice(1))],
+      anchorGate: anchorCheckpointGate("approved"),
+    }));
+    expect(result.shotDispatch.map((s) => s.shotId)).toEqual(["shot-a", "shot-b"]);
+    expect(result.checkpoint.status).toBe("approved");
+  });
+
+  it("signals that the checkpoint gate should be OPENED once all anchors are ready and no gate exists yet", () => {
+    const result = deriveBatchPlan(baseInput({
+      plan: planWithAnchor(),
+      jobs: [anchorJobReady("anchor-1"), ...authorizedJobsFor(planWithAnchor().shots!.slice(1))],
+      anchorGate: undefined,
+    }));
+    expect(result.checkpoint.status).toBe("should_open");
+    expect(result.checkpoint.readyAnchorJobIds).toEqual([anchorJobReady("anchor-1").jobId]);
+    expect(result.shotDispatch).toEqual([]); // not released until the gate is opened + approved
+  });
+
+  // 2026-09-11 ruling: an approval gate NEVER decides itself. There is no timeout input any more, so
+  // "how long has it been waiting" is not an input to the derivation at all. This is the regression
+  // guard: no matter how much wall time passed, `waiting` stays `waiting` and no shot is dispatched.
+  it("never releases a waiting checkpoint on its own, however long it has been open", () => {
+    for (const later of ["2026-08-25T00:10:00.000Z", "2026-08-26T00:00:00.000Z", "2027-01-01T00:00:00.000Z"]) {
+      const result = deriveBatchPlan(baseInput({
+        plan: planWithAnchor(),
+        jobs: [anchorJobReady("anchor-1"), ...authorizedJobsFor(planWithAnchor().shots!.slice(1))],
+        anchorGate: anchorCheckpointGate("waiting", NOW),
+        now: later,
+      }));
+      expect(result.checkpoint.status).toBe("waiting");
+      expect(result.shotDispatch).toEqual([]);
+    }
+  });
+
+  it("re-dispatches ONLY the anchor (not shots) when the checkpoint was rejected", () => {
+    // Rejected checkpoint → a fresh authority created the anchor's attempt-2 job. The stale attempt-1
+    // anchor job stays; derivation offers only the authorized replacement and keeps shots blocked.
+    const result = deriveBatchPlan(baseInput({
+      plan: planWithAnchor({ attemptCount: 2 }),
+      jobs: [
+        anchorJobReady("anchor-1", 1),
+        jobFor("anchor-1", ANCHOR_HASH, "authorized", 2),
+        ...authorizedJobsFor(planWithAnchor().shots!.slice(1)),
+      ],
+      anchorGate: anchorCheckpointGate("rejected"),
+    }));
+    expect(result.anchorDispatch.map((a) => a.shotId)).toEqual(["anchor-1"]);
+    expect(result.anchorDispatch[0]?.attempt).toBe(2);
+    expect(result.shotDispatch).toEqual([]);
+  });
+});
+
+// ── 2026-10-01 付费卡① 删掉了 Run 级的预算停批 ──
+//
+// 授权按镜批之后，一镜派不派只看批它的那一份（它的 job 是不是 authorized）。以前这里还拿 Run 的总额度逐镜累加、
+// 超了就 halt——它能停下的只有用户亲手批过的镜，停下之后画布说「预算已用完 · 提额续拍」，而今天根本没有价格。
+describe("approved shots are never held back for money (no Run-level spend halt)", () => {
+  it("dispatches every approved shot in checkbox order, whatever the ledger says; a shot still waiting for its own approval waits", () => {
+    const shots = [shot("shot-a", "a".repeat(64)), shot("shot-b", "b".repeat(64)), shot("shot-c", "c".repeat(64))];
+    const result = deriveBatchPlan(baseInput({
+      plan: sealedPlan(shots),
+      jobs: [
+        jobFor("shot-a", "a".repeat(64), "authorized"),
+        jobFor("shot-b", "b".repeat(64), "authorization_required"),
+        jobFor("shot-c", "c".repeat(64), "authorized"),
+      ],
+      // 账上的数字与派不派无关：额度是 0、负债已经超过它，批过的镜照样派（派发时的硬墙在账本的 reserve，不在这里）。
+      budget: { currency: "CNY", authorized: 0, reserved: 6, actual: 6, unsettled: 0, unknownInFlight: 0 },
+    }));
+    expect(result.shotDispatch.map((task) => task.shotId)).toEqual(["shot-a", "shot-c"]);
+    expect(result).not.toHaveProperty("halt");
+  });
+});
+
+describe("shot claim dispatch boundary", () => {
+  it("does not dispatch a current attempt claimed by canvas", () => {
+    const shots = [shot("shot-a", "a".repeat(64), { claim: { by: "canvas", attempt: 1, claimedAt: NOW } })];
+    const result = deriveBatchPlan(baseInput({ plan: sealedPlan(shots), jobs: [jobFor("shot-a", "a".repeat(64), "authorized")] }));
+    expect(result.shotDispatch).toEqual([]);
+  });
+});
+
+describe("P4 S4 deriveBatchPlan — stop semantics", () => {
+  for (const status of ["pausing", "paused", "cancelled"] as const) {
+    it(`dispatches nothing new when the run is ${status}`, () => {
+      const result = deriveBatchPlan(baseInput({ runStatus: status }));
+      expect(result.anchorDispatch).toEqual([]);
+      expect(result.shotDispatch).toEqual([]);
+    });
+  }
+
+  it("a shot nobody has approved (no job at all) is not part of the batch: not pending, not dispatched, does not block completion", () => {
+    const shots = [shot("shot-a", "a".repeat(64)), shot("shot-b", "b".repeat(64))];
+    const result = deriveBatchPlan(baseInput({ plan: sealedPlan(shots), jobs: [jobFor("shot-a", "a".repeat(64), "ready")] }));
+    expect(result.progress).toMatchObject({ total: 1, completed: 1, inFlight: 0, pending: 0 });
+    expect(result.shotDispatch).toEqual([]);
+  });
+
+  it("reports structured stop counts (stopped/completed/pending) from durable jobs", () => {
+    const shots = [shot("shot-a", "a".repeat(64)), shot("shot-b", "b".repeat(64)), shot("shot-c", "c".repeat(64))];
+    const jobs = [
+      jobFor("shot-a", "a".repeat(64), "ready"), // completed
+      jobFor("shot-b", "b".repeat(64), "provider_accepted"), // in-flight
+      jobFor("shot-c", "c".repeat(64), "authorized"), // approved, never dispatched (a shot with no job at all was never approved and is not part of the batch)
+    ];
+    const result = deriveBatchPlan(baseInput({ plan: sealedPlan(shots), jobs, runStatus: "paused" }));
+    expect(result.progress.completed).toBe(1);
+    expect(result.progress.inFlight).toBe(1);
+    expect(result.progress.pending).toBe(1); // shot-c never started
+    expect(result.progress.total).toBe(3);
+  });
+});
+
+// P4 慢供应商修复（2026-08-25）— the `observe` output: in-flight units the orchestrator must keep
+// polling. Without this list, a re-kick after the scheduler rested (or an app restart) re-derived
+// "nothing to do" and slow-provider jobs sat at `processing` forever (the S6.5 paid-acceptance freeze).
+describe("P4 slow-provider observe — in-flight units the orchestrator keeps polling", () => {
+  it("lists provider_accepted/polling jobs (with a providerTaskId); settled/pre-submission/attention excluded", () => {
+    const shots = [shot("shot-a", "a".repeat(64)), shot("shot-b", "b".repeat(64)), shot("shot-c", "c".repeat(64)), shot("shot-d", "d".repeat(64))];
+    const result = deriveBatchPlan(baseInput({
+      plan: sealedPlan(shots),
+      jobs: [
+        { ...jobFor("shot-a", "a".repeat(64), "polling"), providerTaskId: "task-a" },
+        { ...jobFor("shot-b", "b".repeat(64), "ready"), providerTaskId: "task-b" }, // done → not observed
+        jobFor("shot-c", "c".repeat(64), "authorized"), // pre-submission → needsDispatch, not observe
+        { ...jobFor("shot-d", "d".repeat(64), "needs_attention"), providerTaskId: "task-d" }, // own recovery flow
+      ],
+    }));
+    expect(result.observe.map((t) => t.shotId)).toEqual(["shot-a"]);
+    expect(result.shotDispatch.map((t) => t.shotId)).toEqual(["shot-c"]);
+  });
+
+  it("excludes an in-flight job that has no providerTaskId yet (nothing to poll)", () => {
+    const result = deriveBatchPlan(baseInput({
+      jobs: [jobFor("shot-a", "a".repeat(64), "polling")],
+    }));
+    expect(result.observe).toEqual([]);
+  });
+
+  it("keeps observing on a stopped run: paid in-flight work still settles, nothing NEW dispatches", () => {
+    const result = deriveBatchPlan(baseInput({
+      runStatus: "paused",
+      jobs: [{ ...jobFor("shot-a", "a".repeat(64), "polling"), providerTaskId: "task-a" }],
+    }));
+    expect(result.observe.map((t) => t.shotId)).toEqual(["shot-a"]);
+    expect(result.shotDispatch).toEqual([]);
+    expect(result.anchorDispatch).toEqual([]);
+  });
+
+  it("orders anchors before video shots and survives the anchors-not-released early return", () => {
+    const plan = sealedPlan([shot("shot-a", "a".repeat(64)), anchorShot("anchor-1")]);
+    const result = deriveBatchPlan(baseInput({
+      plan,
+      jobs: [
+        { ...jobFor("shot-a", "a".repeat(64), "polling"), providerTaskId: "task-s" },
+        { ...jobFor("anchor-1", ANCHOR_HASH, "polling"), model: "image-model", providerTaskId: "task-anchor" },
+      ],
+    }));
+    // Anchors in flight → checkpoint pending, shots blocked — but BOTH stay observable (anchor first).
+    expect(result.checkpoint.status).toBe("pending_anchors");
+    expect(result.observe.map((t) => t.shotId)).toEqual(["anchor-1", "shot-a"]);
+  });
+});
+
+it("reports actual progress for a pure anchor batch and ignores an earlier batch approval", () => {
+  const anchor = shot("anchor", "a".repeat(64), { role: "anchor" });
+  const plan = sealedPlan([anchor]);
+  const pending = deriveBatchPlan(baseInput({ plan, jobs: authorizedJobsFor([anchor]) }));
+  expect(pending.progress).toMatchObject({ total: 1, completed: 0, pending: 1 });
+  const done = deriveBatchPlan(baseInput({ plan, jobs: [jobFor("anchor", "a".repeat(64), "ready")],
+    anchorGate: { ...anchorCheckpointGate("approved"), planHash: "earlier-batch" } }));
+  expect(done.progress).toMatchObject({ total: 1, completed: 1, pending: 0 });
+  expect(done.checkpoint.status).toBe("should_open");
+});
+
+
+// ── 2026-09-22 · 只有参考卡的批次 ────────────────────────────────────────────
+//
+// `draft_shots` 从今天起允许「只建几张参考卡、镜头下一轮再补」（用户 2026-09-21 亲自点名过
+// 那条拒绝）。这一组钉住的是：**调度器本来就支持这一支**，本次放行校验没有把它弄坏。
+// （原话在 `deriveBatchPlan`："Mixed batches retain their video progress; an anchor-only request
+// tracks its actual paid units"。）
+describe("anchor-only batch（校验放行之后仍然照旧工作）", () => {
+  it("锚照常派发，进度按锚算", () => {
+    const anchors = [anchorShot("anchor-1"), anchorShot("anchor-2")];
+    const result = deriveBatchPlan(baseInput({ plan: sealedPlan(anchors), jobs: authorizedJobsFor(anchors) }));
+    expect(result.anchorDispatch.map((task) => task.shotId)).toEqual(["anchor-1", "anchor-2"]);
+    expect(result.progress).toMatchObject({ total: 2, completed: 0, pending: 2 });
+    expect(result.shotDispatch, "这一批没有镜头可派").toEqual([]);
+  });
+
+  it("阳性对照：同一批里只要还有一个镜头，检查点照旧要开、镜头照旧被挡在它后面", () => {
+    const mixed = [anchorShot("anchor-1"), shot("shot-a", "a".repeat(64))];
+    const result = deriveBatchPlan(baseInput({ plan: sealedPlan(mixed), jobs: [anchorJobReady("anchor-1")] }));
+    expect(result.checkpoint.status).toBe("should_open");
+    expect(result.shotDispatch, "检查点没放行之前，镜头一个都不许派").toEqual([]);
+  });
+});
+
+// 批次歇下来时「有没有单元确定没成」只看**当前那次尝试**（2026-09-29）：重做成功之后，上一次失败的那个 job
+// 还躺在 jobs 里，不许再让整批被判「有镜头没成」而停下；当前尝试失败（失败 / 撤单 / 提交结果未知）才算，参考卡也算。
+describe("failedUnits — only the current attempt counts", () => {
+  it("a redone shot whose new attempt finished is not a failed unit; the superseded failure is ignored", () => {
+    const shots = [shot("shot-a", "a".repeat(64), { attemptCount: 2 }), shot("shot-b", "b".repeat(64))];
+    const jobs = [
+      jobFor("shot-a", "a".repeat(64), "needs_attention", 1),
+      jobFor("shot-a", "a".repeat(64), "ready", 2),
+      jobFor("shot-b", "b".repeat(64), "ready"),
+    ];
+    expect(deriveBatchPlan(baseInput({ plan: sealedPlan(shots), jobs })).failedUnits).toEqual([]);
+  });
+
+  it("the current attempt failing (failed, submission unknown) makes it a failed unit — anchors included", () => {
+    const plan = planWithAnchor();
+    const jobs = [
+      { ...jobFor("anchor-1", ANCHOR_HASH, "needs_attention"), model: "image-model" },
+      jobFor("shot-a", "a".repeat(64), "submission_unknown"),
+      jobFor("shot-b", "b".repeat(64), "authorized"),
+    ];
+    expect(deriveBatchPlan(baseInput({ plan, jobs })).failedUnits).toEqual(["anchor-1", "shot-a"]);
+  });
+
+  it("is reported even while the run is stopped (the rest verdict and the canvas read the same derivation)", () => {
+    const shots = [shot("shot-a", "a".repeat(64)), shot("shot-b", "b".repeat(64))];
+    const jobs = [jobFor("shot-a", "a".repeat(64), "needs_attention"), jobFor("shot-b", "b".repeat(64), "authorized")];
+    expect(deriveBatchPlan(baseInput({ runStatus: "needs_attention", plan: sealedPlan(shots), jobs })).failedUnits).toEqual(["shot-a"]);
+  });
+});

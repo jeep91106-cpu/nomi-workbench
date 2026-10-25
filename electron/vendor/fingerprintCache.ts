@@ -1,0 +1,96 @@
+// 指纹缓存(harness S8,总方案 §7.5):hash(NormalizedRecipe) → 终态成功 TaskResult。
+// 语义:参数没动 → 命中秒回零 vendor 调用零花费;真要重抽走「强制重跑」(extras.forceRerun,
+// 路由字段不进指纹)。缓存与复现自动对齐——承诺"一模一样"的那条路只能是缓存命中
+// (同配方+seed 不保证 vendor bit 级复现)。
+// 键含 projectId:资产已本地化到项目目录,跨项目命中会引用别人项目的文件路径。
+// 纯内存(会话内),关闭即回(§8.1b 回滚阀);外挂模块,runtime.ts 巨壳每处只挂一行。
+import crypto from "node:crypto";
+import { traceVendorCached } from "../events/vendorCallTrace";
+import type { NormalizedRecipe } from "./provenance";
+
+/** 结构兼容 runtime.TaskResult(该类型 runtime 私有,这里按形状对齐)。 */
+type TaskResultLike = {
+  id: string;
+  kind: string;
+  status: string;
+  assets: unknown[];
+  raw?: unknown;
+  provenance?: unknown;
+};
+
+/**
+ * provenance 里跟「这次产物来自哪次 vendor 调用」相关的字段(结构对齐 vendor/provenance.TaskProvenance
+ * 的相关子集 + 缓存命中标注)。命中复用时据此把「原始请求 id」换成「来自缓存 + 源 runId」。
+ */
+type ProvenanceLike = {
+  vendorRequestId?: string;
+  /** 命中缓存复用:本节点未发 vendor 请求,产物复用自缓存(诚实标注,别冒充)。 */
+  fromCache?: boolean;
+  /** 被复用资产对应的原始成功 run 的 id(审计可追溯,但不等于本节点的 vendorRequestId)。 */
+  cacheSourceRunId?: string;
+};
+
+/**
+ * 把一份命中结果的 provenance 改写成「缓存复用」语义:抹 vendorRequestId、置 fromCache、
+ * 留 cacheSourceRunId。只在确有 provenance 对象时改——无 provenance 不凭空造一个。
+ * 入参须为已深拷贝的返回副本(调用方保证),改它不会污染缓存原件。
+ */
+function markProvenanceAsCached(result: TaskResultLike): void {
+  if (!result.provenance || typeof result.provenance !== "object") return;
+  const prov = result.provenance as ProvenanceLike;
+  prov.cacheSourceRunId = result.id;
+  prov.fromCache = true;
+  delete prov.vendorRequestId;
+}
+
+const cache = new Map<string, TaskResultLike>();
+
+export function recipeFingerprint(recipe: NormalizedRecipe): string {
+  // params 在 buildNormalizedRecipe 已键排序;顶层字段按固定序列化,同配方恒同指纹。
+  const stable = JSON.stringify({
+    vendorKey: recipe.vendorKey,
+    modelKey: recipe.modelKey,
+    mappingId: recipe.mappingId ?? null,
+    kind: recipe.kind,
+    prompt: recipe.prompt,
+    seed: recipe.seed ?? null,
+    params: recipe.params,
+  });
+  return crypto.createHash("sha256").update(stable).digest("hex").slice(0, 32);
+}
+
+const key = (projectId: string, fingerprint: string) => `${projectId}\0${fingerprint}`;
+
+/** 命中读取:forceRerun(强制重跑)/无 projectId(资产不落项目,缓存路径无意义)→ 不读。 */
+export function readCachedTaskResult(input: {
+  projectId: string;
+  fingerprint: string;
+  nodeId?: string;
+  extras?: Record<string, unknown> | null;
+}): TaskResultLike | null {
+  if (!input.projectId) return null;
+  if (input.extras && input.extras.forceRerun === true) return null;
+  const hit = cache.get(key(input.projectId, input.fingerprint));
+  if (!hit) return null;
+  const result = JSON.parse(JSON.stringify(hit)) as TaskResultLike;
+  // P3 修跨节点 provenance 泄漏:缓存键是 projectId:fingerprint(不含 nodeId,刻意如此——
+  // 同配方跨节点要能复用资产、省 vendor 调用)。但被复用资产的 provenance.vendorRequestId 指向的是
+  // **原始那次** vendor 调用;若原样返回,当前节点会冒称自己发过那次请求(张冠李戴)。资产可复用,
+  // provenance 必须如实:抹掉 vendorRequestId、标 fromCache、把原始 runId 留在 cacheSourceRunId
+  // 供审计追溯。深拷贝已隔离,改的是返回副本,不污染缓存原件。
+  markProvenanceAsCached(result);
+  // 审计投影:命中也入日志(零 vendor 调用的「秒回」必须可观测,不能与真调用混淆)。
+  traceVendorCached(input.projectId, { runId: result.id, nodeId: input.nodeId, fingerprint: input.fingerprint });
+  return result;
+}
+
+/** 只记终态成功且有产物的结果;同键覆盖(强制重跑后的新结果替换旧缓存)。 */
+export function rememberTaskResult(projectId: string, fingerprint: string | undefined, result: TaskResultLike): void {
+  if (!projectId || !fingerprint) return;
+  if (result.status !== "succeeded" || !Array.isArray(result.assets) || result.assets.length === 0) return;
+  cache.set(key(projectId, fingerprint), JSON.parse(JSON.stringify(result)) as TaskResultLike);
+}
+
+export function resetFingerprintCacheForTests(): void {
+  cache.clear();
+}
